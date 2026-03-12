@@ -70,6 +70,19 @@ brew tap librefang/tap
 brew install librefang
 ```
 
+**Or run via Docker:**
+```bash
+docker pull ghcr.io/librefang/librefang:latest
+docker run -d \
+  --name librefang \
+  -p 4545:4545 \
+  -v librefang-data:/data \
+  -e ANTHROPIC_API_KEY=$ANTHROPIC_API_KEY \
+  ghcr.io/librefang/librefang:latest
+```
+
+Dashboard: `http://localhost:4545`
+
 <details>
 <summary><strong>Windows</strong></summary>
 

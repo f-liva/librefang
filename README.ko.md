@@ -61,6 +61,19 @@ brew tap librefang/tap
 brew install librefang
 ```
 
+**또는 Docker로 실행:**
+```bash
+docker pull ghcr.io/librefang/librefang:latest
+docker run -d \
+  --name librefang \
+  -p 4545:4545 \
+  -v librefang-data:/data \
+  -e ANTHROPIC_API_KEY=$ANTHROPIC_API_KEY \
+  ghcr.io/librefang/librefang:latest
+```
+
+대시보드: `http://localhost:4545`
+
 ---
 
 ## 핵심 기능

@@ -29,7 +29,8 @@ cargo build --release -p librefang-cli
 ### Docker
 
 ```bash
-docker run -it librefang/librefang:latest
+docker pull ghcr.io/librefang/librefang:latest
+docker run --rm -it ghcr.io/librefang/librefang:latest --help
 ```
 
 ### Shell installer
