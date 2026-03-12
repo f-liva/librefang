@@ -42,6 +42,13 @@ fn decrypt_aes_cbc(key: &[u8], encrypted_base64: &str) -> Result<Vec<u8>, String
         .decode(encrypted_base64)
         .map_err(|e| format!("base64 decode error: {}", e))?;
 
+    if key.len() != 32 {
+        return Err(format!(
+            "invalid WeCom AES key length: expected 32 bytes, got {}",
+            key.len()
+        ));
+    }
+
     // IV is first 16 bytes of key
     type Aes256CbcDecrypt = cbc::Decryptor<aes::Aes256>;
     let iv = &key[..16];
@@ -363,6 +370,10 @@ impl ChannelAdapter for WeComAdapter {
         let token = self.token.clone();
         let encoding_aes_key = self.encoding_aes_key.clone();
         let mut shutdown_rx = self.shutdown_rx.clone();
+        let addr = std::net::SocketAddr::from(([0, 0, 0, 0], port));
+        let listener = tokio::net::TcpListener::bind(addr)
+            .await
+            .map_err(|e| format!("failed to bind WeCom webhook listener on {addr}: {e}"))?;
 
         tokio::spawn(async move {
             let token = Arc::new(token);
@@ -535,9 +546,6 @@ impl ChannelAdapter for WeComAdapter {
                 }),
             );
 
-            let addr = std::net::SocketAddr::from(([0, 0, 0, 0], port));
-            let listener = tokio::net::TcpListener::bind(addr).await.unwrap();
-
             info!("WeCom webhook server listening on http://0.0.0.0:{}", port);
 
             let server = axum::serve(listener, app);
@@ -670,6 +678,12 @@ mod tests {
         .expect("echostr should decrypt");
 
         assert_eq!(plain, "openfang-wecom-check");
+    }
+
+    #[test]
+    fn test_decode_wecom_payload_rejects_invalid_aes_key_length() {
+        let err = decode_wecom_payload("abcd", "Zm9v").expect_err("invalid key should error");
+        assert!(err.contains("invalid WeCom AES key length"));
     }
 
     #[test]
