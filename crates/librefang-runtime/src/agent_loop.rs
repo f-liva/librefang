@@ -415,6 +415,18 @@ pub async fn run_agent_loop(
     let mut total_usage = TokenUsage::default();
     let final_response;
 
+    // Topic isolation: detect topic shifts and keep only the current topic.
+    // This runs before the safety trim so we get cleaner, topic-focused history.
+    if let Some(ti_val) = manifest.metadata.get("topic_isolation") {
+        if let Ok(ti_config) =
+            serde_json::from_value::<librefang_types::config::TopicIsolationConfig>(ti_val.clone())
+        {
+            messages = crate::topic_isolation::apply_topic_isolation(messages, &ti_config);
+            // Re-validate after topic isolation may have changed boundaries.
+            messages = crate::session_repair::validate_and_repair(&messages);
+        }
+    }
+
     // Safety valve: trim excessively long message histories to prevent context
     // overflow. Cuts at conversation-turn boundaries so ToolUse/ToolResult
     // pairs are never split (fixes "EOF while parsing" from empty API responses).
@@ -1416,6 +1428,16 @@ pub async fn run_agent_loop_streaming(
 
     let mut total_usage = TokenUsage::default();
     let final_response;
+
+    // Topic isolation: detect topic shifts and keep only the current topic.
+    if let Some(ti_val) = manifest.metadata.get("topic_isolation") {
+        if let Ok(ti_config) =
+            serde_json::from_value::<librefang_types::config::TopicIsolationConfig>(ti_val.clone())
+        {
+            messages = crate::topic_isolation::apply_topic_isolation(messages, &ti_config);
+            messages = crate::session_repair::validate_and_repair(&messages);
+        }
+    }
 
     // Safety valve: trim at conversation-turn boundaries (streaming path).
     safe_trim_messages(&mut messages, &manifest.name, user_message);

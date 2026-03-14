@@ -1857,6 +1857,15 @@ impl LibreFangKernel {
             );
         }
 
+        // Inject topic isolation config for the agent loop to read.
+        if self.config.topic_isolation.enabled {
+            if let Ok(ti_val) = serde_json::to_value(&self.config.topic_isolation) {
+                manifest
+                    .metadata
+                    .insert("topic_isolation".to_string(), ti_val);
+            }
+        }
+
         let memory = Arc::clone(&self.memory);
         // Build link context from user message (auto-extract URLs for the agent)
         let message_owned = if let Some(link_ctx) =
@@ -2552,6 +2561,15 @@ impl LibreFangKernel {
                 "prompt_caching".to_string(),
                 serde_json::Value::Bool(self.config.prompt_caching),
             );
+        }
+
+        // Inject topic isolation config for the agent loop to read.
+        if self.config.topic_isolation.enabled {
+            if let Ok(ti_val) = serde_json::to_value(&self.config.topic_isolation) {
+                manifest
+                    .metadata
+                    .insert("topic_isolation".to_string(), ti_val);
+            }
         }
 
         let is_stable = self.config.mode == librefang_types::config::KernelMode::Stable;
