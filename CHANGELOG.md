@@ -5,6 +5,37 @@ All notable changes to LibreFang will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.4.3-beta2] - 2026-03-14
+
+### Added
+
+- Horizontal scroll for long commands on deploy page (#276) (@houko)
+- Add tooltip for truncated commands on deploy page (#275) (@houko)
+- Support multi-bot routing per platform (#240) (@houko)
+
+### Fixed
+
+- Revert wrangler-action to v3 (v4 does not exist) (#274) (@houko)
+- Add explicit Tauri version for MSI compatibility (#272) (@houko)
+- Prevent long commands from stretching deploy cards (#269) (@houko)
+- Remove unnecessary card width constraint on deploy page (#268) (@houko)
+- Consistent card widths on deploy page (#266) (@houko)
+- Use prebuilt GHCR image in docker-compose.yml (#261) (@houko)
+
+### Documentation
+
+- Use docker run across all README translations (#267) (@houko)
+
+### Maintenance
+
+- Add workflow_dispatch to deploy-worker (#273) (@houko)
+- Fix wrangler-action, force Node.js 24 (#271) (@houko)
+- Upgrade wrangler-action to v4 for Node.js 24 (#270) (@houko)
+
+### Other
+
+- V0.4.3-beta-20260314 (#264) (@houko)
+
 ## [0.4.3-beta] - 2026-03-14
 
 ### Added
