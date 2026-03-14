@@ -54,6 +54,31 @@ pub async fn build_router(
         provider_probe_cache: librefang_runtime::provider_health::ProbeCache::new(),
     });
 
+    // Load workflow templates from the bundled templates directory.
+    // Try: <exe_dir>/../workflows/templates, <home_dir>/workflows/templates,
+    // and the repo-relative path for development builds.
+    {
+        let candidates: Vec<std::path::PathBuf> = vec![
+            // Development: repo root relative to the crate
+            std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../workflows/templates"),
+            // User home dir
+            kernel.config.home_dir.join("workflows/templates"),
+        ];
+        for dir in &candidates {
+            if dir.is_dir() {
+                let loaded = kernel.workflow_templates.load_from_directory(dir).await;
+                if loaded > 0 {
+                    info!(
+                        "Loaded {} workflow template(s) from {}",
+                        loaded,
+                        dir.display()
+                    );
+                }
+                break;
+            }
+        }
+    }
+
     // CORS: allow localhost origins by default. If API key is set, the API
     // is protected anyway. For development, permissive CORS is convenient.
     let cors = if state.kernel.config.api_key.trim().is_empty() {
@@ -339,6 +364,19 @@ pub async fn build_router(
         .route(
             "/api/workflows/{id}/save-as-template",
             axum::routing::post(routes::save_workflow_as_template),
+        )
+        // Workflow template marketplace endpoints (alternate paths)
+        .route(
+            "/api/workflow-templates",
+            axum::routing::get(routes::list_workflow_templates_alias),
+        )
+        .route(
+            "/api/workflow-templates/{id}",
+            axum::routing::get(routes::get_workflow_template_alias),
+        )
+        .route(
+            "/api/workflow-templates/{id}/instantiate",
+            axum::routing::post(routes::instantiate_workflow_template),
         )
         // Skills endpoints
         .route("/api/skills", axum::routing::get(routes::list_skills))
