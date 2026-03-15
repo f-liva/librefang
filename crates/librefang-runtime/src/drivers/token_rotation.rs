@@ -319,25 +319,6 @@ mod tests {
         }
     }
 
-    struct FailAfterNDriver {
-        success_count: AtomicU32,
-        max_successes: u32,
-    }
-
-    #[async_trait]
-    impl LlmDriver for FailAfterNDriver {
-        async fn complete(&self, _req: CompletionRequest) -> Result<CompletionResponse, LlmError> {
-            let n = self.success_count.fetch_add(1, Ordering::SeqCst);
-            if n < self.max_successes {
-                Ok(ok_response("ok"))
-            } else {
-                Err(LlmError::RateLimited {
-                    retry_after_ms: 60_000,
-                })
-            }
-        }
-    }
-
     #[tokio::test]
     async fn test_single_key_passes_through() {
         let driver = TokenRotationDriver::new(
