@@ -276,12 +276,12 @@ mod tests {
             Message::assistant("Ownership provides memory safety..."),
             Message::user("New topic: how do I cook pasta perfectly?"),
             Message::assistant("Boil water, add salt..."),
-            Message::user("What sauce goes well with spaghetti?"),
+            Message::user("How long should I cook pasta before it is done?"),
             Message::assistant("Marinara, alfredo, pesto..."),
             // Pad to exceed max_topic_messages threshold
-            Message::user("How long should I cook the pasta in boiling water?"),
+            Message::user("Should I salt the water before I cook pasta?"),
             Message::assistant("Use plenty of water..."),
-            Message::user("Should I add olive oil when cooking pasta?"),
+            Message::user("Any tips for how to cook pasta al dente?"),
             Message::assistant("You're welcome!"),
         ];
         let result = apply_topic_isolation(msgs, &config);
@@ -289,7 +289,7 @@ mod tests {
         let first_user = result.iter().find(|m| m.role == Role::User).unwrap();
         let text = extract_text(first_user);
         assert!(
-            text.contains("cook") || text.contains("pasta") || text.contains("New topic"),
+            text.contains("cook pasta") || text.contains("New topic"),
             "Expected topic isolation to start from cooking topic, got: {}",
             text
         );
