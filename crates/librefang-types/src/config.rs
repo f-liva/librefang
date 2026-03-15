@@ -1212,6 +1212,14 @@ pub struct KernelConfig {
     /// Sidecar channel adapters (external process-based).
     #[serde(default)]
     pub sidecar_channels: Vec<SidecarChannelConfig>,
+    /// Enable LLM provider prompt caching (default: true).
+    ///
+    /// When enabled, the runtime adds provider-specific cache hints to system
+    /// prompts and tool definitions so that repeated prefixes are cached:
+    /// - **Anthropic**: `cache_control: {"type": "ephemeral"}` on system blocks.
+    /// - **OpenAI**: automatic prefix caching (response cache stats are parsed).
+    #[serde(default = "default_prompt_caching")]
+    pub prompt_caching: bool,
 }
 
 /// OAuth client ID overrides for PKCE flows.
@@ -1269,6 +1277,10 @@ impl Default for BudgetConfig {
 
 fn default_max_cron_jobs() -> usize {
     500
+}
+
+fn default_prompt_caching() -> bool {
+    true
 }
 
 /// Configuration entry for an MCP server.
@@ -1461,6 +1473,7 @@ impl Default for KernelConfig {
             provider_api_keys: HashMap::new(),
             oauth: OAuthConfig::default(),
             sidecar_channels: Vec::new(),
+            prompt_caching: default_prompt_caching(),
         }
     }
 }
@@ -3879,8 +3892,10 @@ mod tests {
 
     #[test]
     fn test_stable_prefix_mode_toml_roundtrip() {
-        let mut config = KernelConfig::default();
-        config.stable_prefix_mode = true;
+        let config = KernelConfig {
+            stable_prefix_mode: true,
+            ..Default::default()
+        };
         let toml_str = toml::to_string_pretty(&config).unwrap();
         let back: KernelConfig = toml::from_str(&toml_str).unwrap();
         assert!(back.stable_prefix_mode);

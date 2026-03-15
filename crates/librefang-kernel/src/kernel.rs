@@ -1828,6 +1828,12 @@ impl LibreFangKernel {
                     serde_json::Value::String(cc_msg),
                 );
             }
+
+            // Pass prompt_caching config to the agent loop via metadata.
+            manifest.metadata.insert(
+                "prompt_caching".to_string(),
+                serde_json::Value::Bool(self.config.prompt_caching),
+            );
         }
 
         let memory = Arc::clone(&self.memory);
@@ -2072,6 +2078,7 @@ impl LibreFangKernel {
             total_usage: librefang_types::message::TokenUsage {
                 input_tokens: 0,
                 output_tokens: 0,
+                ..Default::default()
             },
             iterations: 1,
             cost_usd: None,
@@ -2133,6 +2140,7 @@ impl LibreFangKernel {
             total_usage: librefang_types::message::TokenUsage {
                 input_tokens: 0,
                 output_tokens: 0,
+                ..Default::default()
             },
             cost_usd: None,
             iterations: 1,
@@ -2327,6 +2335,7 @@ impl LibreFangKernel {
             total_usage: librefang_types::message::TokenUsage {
                 input_tokens: 0,
                 output_tokens: 0,
+                ..Default::default()
             },
             iterations: result.iterations,
             cost_usd: None,
@@ -2508,6 +2517,12 @@ impl LibreFangKernel {
                     serde_json::Value::String(cc_msg),
                 );
             }
+
+            // Pass prompt_caching config to the agent loop via metadata.
+            manifest.metadata.insert(
+                "prompt_caching".to_string(),
+                serde_json::Value::Bool(self.config.prompt_caching),
+            );
         }
 
         let is_stable = self.config.mode == librefang_types::config::KernelMode::Stable;
@@ -2535,6 +2550,7 @@ impl LibreFangKernel {
                 temperature: manifest.model.temperature,
                 system: Some(manifest.model.system_prompt.clone()),
                 thinking: None,
+                prompt_caching: false,
             };
             let (complexity, routed_model) = router.select_model(&probe);
             info!(

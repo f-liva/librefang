@@ -196,6 +196,17 @@ struct OaiResponseMessage {
 struct OaiUsage {
     prompt_tokens: u64,
     completion_tokens: u64,
+    /// Detailed prompt token breakdown (includes cached token info).
+    #[serde(default)]
+    prompt_tokens_details: Option<OaiPromptTokensDetails>,
+}
+
+/// OpenAI prompt token details (includes cached token count).
+#[derive(Debug, Deserialize, Default)]
+struct OaiPromptTokensDetails {
+    /// Number of prompt tokens served from cache.
+    #[serde(default)]
+    cached_tokens: u64,
 }
 
 #[async_trait]
@@ -656,9 +667,18 @@ impl LlmDriver for OpenAIDriver {
 
             let mut usage = oai_response
                 .usage
-                .map(|u| TokenUsage {
-                    input_tokens: u.prompt_tokens,
-                    output_tokens: u.completion_tokens,
+                .map(|u| {
+                    let cached = u
+                        .prompt_tokens_details
+                        .as_ref()
+                        .map(|d| d.cached_tokens)
+                        .unwrap_or(0);
+                    TokenUsage {
+                        input_tokens: u.prompt_tokens,
+                        output_tokens: u.completion_tokens,
+                        cache_creation_input_tokens: 0,
+                        cache_read_input_tokens: cached,
+                    }
                 })
                 .unwrap_or_default();
 
@@ -1061,15 +1081,16 @@ impl LlmDriver for OpenAIDriver {
                         if let Some(pt) = u["prompt_tokens"].as_u64() {
                             usage.input_tokens = pt;
                         }
-                        if let Some(ct) = u["completion_tokens"].as_u64() {
-                            usage.output_tokens = ct;
-                        }
                         if let Some(cached) = u
                             .get("prompt_tokens_details")
                             .and_then(|d| d.get("cached_tokens"))
                             .and_then(|v| v.as_u64())
                         {
+                            usage.cache_read_input_tokens = cached;
                             cached_prompt_tokens = cached;
+                        }
+                        if let Some(ct) = u["completion_tokens"].as_u64() {
+                            usage.output_tokens = ct;
                         }
                     }
 
@@ -1504,6 +1525,7 @@ fn parse_groq_failed_tool_call(body: &str) -> Option<CompletionResponse> {
                 usage: TokenUsage {
                     input_tokens: 0,
                     output_tokens: 0,
+                    ..Default::default()
                 },
             });
         }
@@ -1517,6 +1539,7 @@ fn parse_groq_failed_tool_call(body: &str) -> Option<CompletionResponse> {
         usage: TokenUsage {
             input_tokens: 0,
             output_tokens: 0,
+            ..Default::default()
         },
     })
 }

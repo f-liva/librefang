@@ -344,6 +344,12 @@ pub async fn run_agent_loop(
         // Strip provider prefix: "openrouter/google/gemini-2.5-flash" → "google/gemini-2.5-flash"
         let api_model = strip_provider_prefix(&manifest.model.model, &manifest.model.provider);
 
+        let prompt_caching = manifest
+            .metadata
+            .get("prompt_caching")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(true);
+
         let request = CompletionRequest {
             model: api_model,
             messages: messages.clone(),
@@ -352,6 +358,7 @@ pub async fn run_agent_loop(
             temperature: manifest.model.temperature,
             system: Some(system_prompt.clone()),
             thinking: None,
+            prompt_caching,
         };
 
         // Notify phase: Thinking
@@ -365,6 +372,8 @@ pub async fn run_agent_loop(
 
         total_usage.input_tokens += response.usage.input_tokens;
         total_usage.output_tokens += response.usage.output_tokens;
+        total_usage.cache_creation_input_tokens += response.usage.cache_creation_input_tokens;
+        total_usage.cache_read_input_tokens += response.usage.cache_read_input_tokens;
 
         // Recover tool calls output as text by models that don't use the tool_calls API field
         // (e.g. Groq/Llama, DeepSeek emit `<function=name>{json}</function>` in text)
@@ -1358,6 +1367,12 @@ pub async fn run_agent_loop_streaming(
         // Strip provider prefix: "openrouter/google/gemini-2.5-flash" → "google/gemini-2.5-flash"
         let api_model = strip_provider_prefix(&manifest.model.model, &manifest.model.provider);
 
+        let prompt_caching = manifest
+            .metadata
+            .get("prompt_caching")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(true);
+
         let request = CompletionRequest {
             model: api_model,
             messages: messages.clone(),
@@ -1366,6 +1381,7 @@ pub async fn run_agent_loop_streaming(
             temperature: manifest.model.temperature,
             system: Some(system_prompt.clone()),
             thinking: None,
+            prompt_caching,
         };
 
         // Notify phase: on first iteration emit Streaming; on subsequent
@@ -1392,6 +1408,8 @@ pub async fn run_agent_loop_streaming(
 
         total_usage.input_tokens += response.usage.input_tokens;
         total_usage.output_tokens += response.usage.output_tokens;
+        total_usage.cache_creation_input_tokens += response.usage.cache_creation_input_tokens;
+        total_usage.cache_read_input_tokens += response.usage.cache_read_input_tokens;
 
         // Recover tool calls output as text (streaming path)
         let mut tools_recovered_from_text = false;
@@ -2737,6 +2755,7 @@ mod tests {
                     usage: TokenUsage {
                         input_tokens: 10,
                         output_tokens: 5,
+                        ..Default::default()
                     },
                 })
             } else {
@@ -2748,6 +2767,7 @@ mod tests {
                     usage: TokenUsage {
                         input_tokens: 10,
                         output_tokens: 0,
+                        ..Default::default()
                     },
                 })
             }
@@ -2771,6 +2791,7 @@ mod tests {
                 usage: TokenUsage {
                     input_tokens: 10,
                     output_tokens: 0,
+                    ..Default::default()
                 },
             })
         }
@@ -2795,6 +2816,7 @@ mod tests {
                 usage: TokenUsage {
                     input_tokens: 10,
                     output_tokens: 8,
+                    ..Default::default()
                 },
             })
         }
@@ -3034,6 +3056,7 @@ mod tests {
                     usage: TokenUsage {
                         input_tokens: 10,
                         output_tokens: 0,
+                        ..Default::default()
                     },
                 })
             } else {
@@ -3048,6 +3071,7 @@ mod tests {
                     usage: TokenUsage {
                         input_tokens: 15,
                         output_tokens: 8,
+                        ..Default::default()
                     },
                 })
             }
@@ -3071,6 +3095,7 @@ mod tests {
                 usage: TokenUsage {
                     input_tokens: 10,
                     output_tokens: 0,
+                    ..Default::default()
                 },
             })
         }
@@ -3918,6 +3943,7 @@ mod tests {
                     usage: TokenUsage {
                         input_tokens: 20,
                         output_tokens: 15,
+                        ..Default::default()
                     },
                 })
             } else {
@@ -3932,6 +3958,7 @@ mod tests {
                     usage: TokenUsage {
                         input_tokens: 30,
                         output_tokens: 12,
+                        ..Default::default()
                     },
                 })
             }
