@@ -86,9 +86,7 @@ impl TokenRotationDriver {
     fn should_rotate(err: &LlmError) -> bool {
         matches!(
             err,
-            LlmError::RateLimited { .. }
-                | LlmError::Overloaded { .. }
-                | LlmError::AuthenticationFailed(_)
+            LlmError::RateLimited { .. } | LlmError::Overloaded { .. }
         ) || matches!(err, LlmError::Api { status, message }
             if *status == 429
                 || *status == 402
@@ -143,8 +141,8 @@ impl TokenRotationDriver {
     }
 
     /// Advance the round-robin index to the next slot.
-    fn advance(&self, len: usize) {
-        let _ = self.current.fetch_add(1, Ordering::Relaxed) % len;
+    fn advance(&self) {
+        self.current.fetch_add(1, Ordering::Relaxed);
     }
 }
 
@@ -178,13 +176,13 @@ impl LlmDriver for TokenRotationDriver {
                 Ok(response) => {
                     // Update the current index for next call
                     self.current.store(idx, Ordering::Relaxed);
-                    self.advance(slot_count);
+                    self.advance();
                     return Ok(response);
                 }
                 Err(err) if Self::should_rotate(&err) => {
                     let cooldown = Self::cooldown_from_error(&err);
                     self.mark_exhausted(idx, cooldown).await;
-                    self.advance(slot_count);
+                    self.advance();
                     last_error = Some(err);
                     tried += 1;
                 }
@@ -234,13 +232,13 @@ impl LlmDriver for TokenRotationDriver {
             match driver.stream(request.clone(), tx.clone()).await {
                 Ok(response) => {
                     self.current.store(idx, Ordering::Relaxed);
-                    self.advance(slot_count);
+                    self.advance();
                     return Ok(response);
                 }
                 Err(err) if Self::should_rotate(&err) => {
                     let cooldown = Self::cooldown_from_error(&err);
                     self.mark_exhausted(idx, cooldown).await;
-                    self.advance(slot_count);
+                    self.advance();
                     last_error = Some(err);
                     tried += 1;
                 }
@@ -319,6 +317,18 @@ mod tests {
         }
     }
 
+    struct CallCountingOkDriver {
+        call_count: AtomicU32,
+    }
+
+    #[async_trait]
+    impl LlmDriver for CallCountingOkDriver {
+        async fn complete(&self, _req: CompletionRequest) -> Result<CompletionResponse, LlmError> {
+            self.call_count.fetch_add(1, Ordering::SeqCst);
+            Ok(ok_response("unused"))
+        }
+    }
+
     #[tokio::test]
     async fn test_single_key_passes_through() {
         let driver = TokenRotationDriver::new(
@@ -382,9 +392,7 @@ mod tests {
         );
 
         let result = driver.complete(test_request()).await;
-        assert!(result.is_err());
-        let err_msg = result.unwrap_err().to_string();
-        assert!(err_msg.contains("Rate limited"));
+        assert!(matches!(result, Err(LlmError::RateLimited { .. })));
     }
 
     #[tokio::test]
@@ -419,6 +427,38 @@ mod tests {
         assert!(matches!(result, Err(LlmError::ModelNotFound(_))));
     }
 
+    #[tokio::test]
+    async fn test_authentication_failed_returns_immediately() {
+        struct AuthFailDriver;
+
+        #[async_trait]
+        impl LlmDriver for AuthFailDriver {
+            async fn complete(
+                &self,
+                _req: CompletionRequest,
+            ) -> Result<CompletionResponse, LlmError> {
+                Err(LlmError::AuthenticationFailed(
+                    "invalid api key".to_string(),
+                ))
+            }
+        }
+
+        let fallback = Arc::new(CallCountingOkDriver {
+            call_count: AtomicU32::new(0),
+        });
+        let driver = TokenRotationDriver::new(
+            vec![
+                (Arc::new(AuthFailDriver), "key-a".to_string()),
+                (fallback.clone(), "key-b".to_string()),
+            ],
+            "test-provider".to_string(),
+        );
+
+        let result = driver.complete(test_request()).await;
+        assert!(matches!(result, Err(LlmError::AuthenticationFailed(_))));
+        assert_eq!(fallback.call_count.load(Ordering::SeqCst), 0);
+    }
+
     #[test]
     fn test_should_rotate_classification() {
         assert!(TokenRotationDriver::should_rotate(&LlmError::RateLimited {
@@ -435,9 +475,16 @@ mod tests {
             status: 402,
             message: "billing issue".to_string()
         }));
+        assert!(TokenRotationDriver::should_rotate(&LlmError::Api {
+            status: 403,
+            message: "credit balance is too low".to_string()
+        }));
         // Non-rotatable errors
         assert!(!TokenRotationDriver::should_rotate(
             &LlmError::ModelNotFound("x".to_string())
+        ));
+        assert!(!TokenRotationDriver::should_rotate(
+            &LlmError::AuthenticationFailed("invalid api key".to_string())
         ));
         assert!(!TokenRotationDriver::should_rotate(&LlmError::Parse(
             "bad json".to_string()
@@ -445,6 +492,10 @@ mod tests {
         assert!(!TokenRotationDriver::should_rotate(&LlmError::Http(
             "connection failed".to_string()
         )));
+        assert!(!TokenRotationDriver::should_rotate(&LlmError::Api {
+            status: 403,
+            message: "invalid api key".to_string()
+        }));
     }
 
     #[test]
