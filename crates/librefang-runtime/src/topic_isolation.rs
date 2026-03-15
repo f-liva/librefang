@@ -279,9 +279,9 @@ mod tests {
             Message::user("What sauce goes well with spaghetti?"),
             Message::assistant("Marinara, alfredo, pesto..."),
             // Pad to exceed max_topic_messages threshold
-            Message::user("Any other pasta tips for beginners?"),
+            Message::user("How long should I cook the pasta in boiling water?"),
             Message::assistant("Use plenty of water..."),
-            Message::user("Thanks for the cooking advice here"),
+            Message::user("Should I add olive oil when cooking pasta?"),
             Message::assistant("You're welcome!"),
         ];
         let result = apply_topic_isolation(msgs, &config);
