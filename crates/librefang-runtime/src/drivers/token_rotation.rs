@@ -384,7 +384,7 @@ mod tests {
         let result = driver.complete(test_request()).await;
         assert!(result.is_err());
         let err_msg = result.unwrap_err().to_string();
-        assert!(err_msg.contains("rate-limited"));
+        assert!(err_msg.contains("Rate limited"));
     }
 
     #[tokio::test]
