@@ -5,6 +5,17 @@ All notable changes to LibreFang will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.5.1] - 2026-03-16
+
+### Fixed
+
+- Improve API version negotiation and local provider detection (#507) (@houko)
+- Inject vault secrets into process env at startup (#509) (@houko)
+
+### Other
+
+- V0.5.0-20260316 (#506) (@houko)
+
 ## [0.5.0] - 2026-03-16
 
 ### Added
