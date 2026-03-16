@@ -3,6 +3,8 @@ name: Update Contributors
 on:
   push:
     branches: [main]
+    paths-ignore:
+      - 'README.md'
   workflow_dispatch:
 
 concurrency:
