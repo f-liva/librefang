@@ -25,6 +25,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Add logging for X-API-Version header insertion failures (#524) (@houko)
 - Fix SDK publishing (PyPI, npm, crates.io, GHCR) (#537) (@houko)
 - Make release creation idempotent (#539) (@houko)
+- Force-push tag in release.sh to handle re-releases (#540) (@houko)
+- Use file instead of ldd to verify static linking (#541) (@houko)
+- Allow re-release to overwrite existing assets (#542) (@houko)
+- Allow desktop re-release to overwrite existing assets (#543) (@houko)
+- Make SDK publishing idempotent for re-releases (#544) (@houko)
+- Re-fetch PREV_TAG after deleting old tag in release.sh (#545) (@houko)
 
 ### Changed
 
