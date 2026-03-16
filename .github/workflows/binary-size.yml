@@ -1,62 +1,38 @@
 name: Binary Size
 
 on:
-  pull_request:
-    branches: [main]
-    paths:
-      - 'crates/**'
-      - 'Cargo.toml'
-      - 'Cargo.lock'
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
 
 permissions:
-  pull-requests: write
+  contents: read
 
 jobs:
   size:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
-        with:
-          ref: main
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
 
-      - name: Build main binary
+      - name: Build release binary
         run: |
           cargo build --release --bin librefang 2>/dev/null
-          MAIN_SIZE=$(stat -c%s target/release/librefang 2>/dev/null || echo 0)
-          echo "main_size=$MAIN_SIZE" >> "$GITHUB_ENV"
+          SIZE_BYTES=$(stat -c%s target/release/librefang 2>/dev/null || echo 0)
 
-      - uses: actions/checkout@v6
-
-      - name: Build PR binary and compare
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          cargo build --release --bin librefang 2>/dev/null
-          PR_SIZE=$(stat -c%s target/release/librefang 2>/dev/null || echo 0)
-          MAIN_SIZE="${{ env.main_size }}"
-
-          if [ "$MAIN_SIZE" -eq 0 ] || [ "$PR_SIZE" -eq 0 ]; then
+          if [ "$SIZE_BYTES" -eq 0 ]; then
             echo "Could not measure binary size"
-            exit 0
+            exit 1
           fi
 
-          DIFF=$((PR_SIZE - MAIN_SIZE))
-          MAIN_MB=$(echo "scale=2; $MAIN_SIZE / 1048576" | bc)
-          PR_MB=$(echo "scale=2; $PR_SIZE / 1048576" | bc)
-          DIFF_KB=$(echo "scale=1; $DIFF / 1024" | bc)
+          SIZE_MB=$(echo "scale=2; $SIZE_BYTES / 1048576" | bc)
 
-          if [ "$DIFF" -gt 524288 ]; then
-            EMOJI="⚠️"
-          elif [ "$DIFF" -lt -524288 ]; then
-            EMOJI="🎉"
-          else
-            EMOJI="✅"
-          fi
-
-          COMMENT="$EMOJI **Binary Size:** ${PR_MB}MB (${DIFF_KB:+${DIFF_KB}}KB vs main ${MAIN_MB}MB)"
-
-          gh pr comment ${{ github.event.pull_request.number }} \
-            --repo ${{ github.repository }} \
-            --body "$COMMENT"
+          {
+            echo "## Binary Size"
+            echo ""
+            echo "- Ref: \`${GITHUB_REF_NAME}\`"
+            echo "- Binary: \`librefang\`"
+            echo "- Size: ${SIZE_MB} MB (${SIZE_BYTES} bytes)"
+          } >> "$GITHUB_STEP_SUMMARY"
