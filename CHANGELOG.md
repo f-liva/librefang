@@ -5,6 +5,40 @@ All notable changes to LibreFang will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.5.5] - 2026-03-17
+
+### Added
+
+- Add Telegram reply-to-message context (#553) (@SenZhangAI)
+- Enrich Ollama model discovery with metadata (#554) (@SenZhangAI)
+- Add GET /api/peers/{id} endpoint (#557) (@SenZhangAI)
+
+### Fixed
+
+- Improve Telegram markdown formatting for headings, lists, code blocks and blockquotes (#405) (@houko)
+- Normalize OpenRouter model IDs to prevent 400 errors (#408) (@houko)
+- Improve python3 detection and Chromium sandbox handling for Linux (#410) (@houko)
+- Prevent Mastodon adapter from re-delivering old notifications and posting errors publicly (#411) (@houko)
+- Replace unsafe pointer mutation with OnceLock for peer_registry/peer_node (#414) (@houko)
+- Raise main_lane default concurrency from 1 to 3 (#552) (@SenZhangAI)
+- Update static linking check to match static-pie binaries (#558) (@houko)
+
+### Performance
+
+- Optimize channel hot-path with reduced allocations and Criterion benchmarks (#451) (@houko)
+
+### Documentation
+
+- Update contributors (#555) (@houko)
+
+### Maintenance
+
+- Auto-cancel old release runs when tag is re-pushed (#547) (@houko)
+
+### Other
+
+- V0.5.4-20260317 (#546) (@houko)
+
 ## [0.5.4] - 2026-03-17
 
 ### Added
