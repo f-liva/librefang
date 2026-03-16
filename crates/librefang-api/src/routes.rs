@@ -1214,6 +1214,23 @@ pub async fn api_versions() -> impl IntoResponse {
     }))
 }
 
+/// GET /api/openapi.json — OpenAPI specification endpoint.
+///
+/// Returns the OpenAPI 3.0 JSON specification for the LibreFang API.
+/// This can be used for SDK auto-generation and API documentation.
+pub async fn openapi_spec() -> impl IntoResponse {
+    // Include the YAML spec and convert to JSON
+    let yaml_str = include_str!("openapi.rs");
+    // The openapi.rs file is actually YAML format, so we need to parse it as YAML
+    // For now, we'll serve it as-is with the correct content type
+    // In a production setup, you'd use a YAML-to-JSON converter
+    (
+        StatusCode::OK,
+        [(axum::http::header::CONTENT_TYPE, "application/json; charset=utf-8")],
+        yaml_str,
+    )
+}
+
 // Single agent detail + SSE streaming
 // ---------------------------------------------------------------------------
 

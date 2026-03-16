@@ -656,6 +656,8 @@ pub async fn build_router(
         )
         // API version discovery endpoint (not versioned itself)
         .route("/api/versions", axum::routing::get(routes::api_versions))
+        // OpenAPI spec endpoint
+        .route("/api/openapi.json", axum::routing::get(routes::openapi_spec))
         // Mount v1 routes at /api/v1 (explicit version)
         .nest("/api/v1", v1_routes.clone())
         // Mount the same routes at /api (latest version alias for backward compat)
