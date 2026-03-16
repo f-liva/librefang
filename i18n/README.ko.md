@@ -271,9 +271,11 @@ MIT 라이선스. LICENSE 파일을 참조하세요.
 
 LibreFang에 기여해 주신 모든 분들께 감사드립니다!
 
-<a href="https://github.com/librefang/librefang/graphs/contributors">
-  <img src="https://contrib.rocks/image?repo=librefang/librefang&max=100&columns=12" />
-</a>
+<!-- CONTRIBUTORS-START -->
+<a href="https://github.com/houko"><img src="https://github.com/houko.png" width="50" height="50" alt="houko" /></a>
+<a href="https://github.com/jaberjaber23"><img src="https://github.com/jaberjaber23.png" width="50" height="50" alt="jaberjaber23" /></a>
+<a href="https://github.com/TJUEZ"><img src="https://github.com/TJUEZ.png" width="50" height="50" alt="TJUEZ" /></a>
+<!-- CONTRIBUTORS-END -->
 
 > 참여하고 싶으신가요? [기여 가이드](../CONTRIBUTING.md)를 확인하세요 — 많은 작업이 Rust 경험 없이도 가능합니다.
 
