@@ -115,7 +115,7 @@ impl TokenRotationDriver {
         let start = self.current.load(Ordering::Relaxed);
 
         for offset in 0..len {
-            let idx = (start + offset) % len;
+            let idx = start.wrapping_add(offset) % len;
             if Some(idx) == skip_index {
                 continue;
             }

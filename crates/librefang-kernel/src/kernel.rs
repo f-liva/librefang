@@ -61,11 +61,22 @@ impl LlmDriver for StubDriver {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 struct RotationKeySpec {
     name: String,
     api_key: String,
     use_primary_driver: bool,
+}
+
+/// Custom Debug impl that redacts the API key to prevent accidental log leakage.
+impl std::fmt::Debug for RotationKeySpec {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RotationKeySpec")
+            .field("name", &self.name)
+            .field("api_key", &"<redacted>")
+            .field("use_primary_driver", &self.use_primary_driver)
+            .finish()
+    }
 }
 
 fn collect_rotation_key_specs(
