@@ -327,28 +327,36 @@ impl LoopGuard {
         }
     }
 
+    /// Known command keywords that indicate a polling/status-check operation.
+    const POLL_KEYWORDS: &'static [&'static str] = &[
+        "status",
+        "poll",
+        "wait",
+        "watch",
+        "tail",
+        "ps ",
+        "jobs",
+        "pgrep",
+        "docker ps",
+        "kubectl get",
+    ];
+
     /// Check if a tool call looks like a polling operation.
     ///
     /// Poll tools (like `shell_exec` for status checks) are expected to be
     /// called repeatedly and get relaxed loop detection thresholds.
+    ///
+    /// Detection is content-based: for known poll tools we check whether the
+    /// command contains any recognised polling keyword. For all other tools we
+    /// fall back to checking the serialised params for generic poll words.
+    /// This replaces the previous `cmd.len() < 50` length heuristic which was
+    /// fragile and could cause false positives/negatives.
     fn is_poll_call(tool_name: &str, params: &serde_json::Value) -> bool {
-        // Known poll tools with short commands that look like status checks
+        // Known poll tools — match on command content keywords
         if POLL_TOOLS.contains(&tool_name) {
             if let Some(cmd) = params.get("command").and_then(|v| v.as_str()) {
                 let cmd_lower = cmd.to_lowercase();
-                // Short commands that explicitly check status/wait/poll
-                if cmd.len() < 50
-                    && (cmd_lower.contains("status")
-                        || cmd_lower.contains("poll")
-                        || cmd_lower.contains("wait")
-                        || cmd_lower.contains("watch")
-                        || cmd_lower.contains("tail")
-                        || cmd_lower.contains("ps ")
-                        || cmd_lower.contains("jobs")
-                        || cmd_lower.contains("pgrep")
-                        || cmd_lower.contains("docker ps")
-                        || cmd_lower.contains("kubectl get"))
-                {
+                if Self::POLL_KEYWORDS.iter().any(|kw| cmd_lower.contains(kw)) {
                     return true;
                 }
             }
@@ -767,10 +775,17 @@ mod tests {
             &serde_json::json!({"command": "echo hi"})
         ));
 
-        // shell_exec with long command — NOT a poll
+        // shell_exec with long command but NO poll keywords — NOT a poll
         assert!(!LoopGuard::is_poll_call(
             "shell_exec",
             &serde_json::json!({"command": "this is a very long command that definitely exceeds fifty characters in length"})
+        ));
+
+        // shell_exec with long command that DOES contain poll keywords — IS a poll
+        // (previously this was a false negative due to the cmd.len() < 50 heuristic)
+        assert!(LoopGuard::is_poll_call(
+            "shell_exec",
+            &serde_json::json!({"command": "kubectl get pods --namespace=my-very-long-namespace-name-that-goes-on-and-on --output wide"})
         ));
 
         // Non-poll tool with no poll keywords
