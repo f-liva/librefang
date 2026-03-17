@@ -165,30 +165,13 @@ jobs:
           # Build post text (max 300 graphemes for Bluesky)
           RELEASE_URL="https://github.com/librefang/librefang/releases/tag/$TAG"
           BSKY_CHANGES=$(echo "$CHANGES" | head -5 | sed 's/^- /- /')
-          BSKY_TEXT="LibreFang v${VERSION} released!
-
-${BSKY_CHANGES}
-
-${RELEASE_URL}"
+          BSKY_TEXT=$(printf 'LibreFang v%s released!\n\n%s\n\n%s' "$VERSION" "$BSKY_CHANGES" "$RELEASE_URL")
 
           # Truncate to 300 graphemes (cut on valid UTF-8 boundary using python)
-          BSKY_TEXT=$(python3 -c "
-import sys
-t = sys.stdin.read()
-if len(t) > 300:
-    t = t[:297] + '...'
-print(t, end='')" <<< "$BSKY_TEXT")
+          BSKY_TEXT=$(python3 -c "import sys; t=sys.stdin.read(); print(t[:297]+'...' if len(t)>300 else t, end='')" <<< "$BSKY_TEXT")
 
           # Detect link facet for the URL (byte offsets for UTF-8)
-          URL_START=$(python3 -c "
-import sys
-text = sys.argv[1]
-url = sys.argv[2]
-idx = text.find(url)
-if idx < 0:
-    print(-1)
-else:
-    print(len(text[:idx].encode('utf-8')))" "$BSKY_TEXT" "$RELEASE_URL")
+          URL_START=$(python3 -c "import sys; t,u=sys.argv[1],sys.argv[2]; i=t.find(u); print(len(t[:i].encode('utf-8')) if i>=0 else -1)" "$BSKY_TEXT" "$RELEASE_URL")
           URL_END=$((URL_START + $(echo -n "$RELEASE_URL" | wc -c)))
 
           # Build facets JSON only if URL was found in text
