@@ -209,7 +209,7 @@ ARTICLE_EOF
         # Polish article with Claude CLI if available
         if command -v claude &>/dev/null; then
             echo "  Polishing with Claude..."
-            POLISHED=$(unset CLAUDECODE; claude -p --model claude-haiku-4-5-20251001 --output-format text "You are writing a Dev.to release announcement for LibreFang, an open-source Agent OS built in Rust.
+            POLISHED=$(env -u CLAUDECODE claude -p --model claude-haiku-4-5-20251001 --output-format text "You are writing a Dev.to release announcement for LibreFang, an open-source Agent OS built in Rust.
 Rewrite the article body to be more engaging and developer-friendly.
 Group related changes, highlight the most impactful ones, and add a brief intro.
 Keep the same front matter (--- block), Install/Upgrade section, and Links section exactly as-is.

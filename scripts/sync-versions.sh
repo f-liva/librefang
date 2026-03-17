@@ -78,7 +78,7 @@ fi
 RS_README="$REPO_ROOT/sdk/rust/README.md"
 if [ -f "$RS_README" ]; then
     MAJOR_MINOR=$(echo "$VERSION" | cut -d. -f1,2)
-    sed -i.bak 's/librefang = "[^"]*"/librefang = "'"$MAJOR_MINOR"'"/' "$RS_README" && rm -f "$RS_README.bak"
+    sed -i.bak '/^\[dependencies\]/,/^```/ s/librefang = "[^"]*"/librefang = "'"$MAJOR_MINOR"'"/' "$RS_README" && rm -f "$RS_README.bak"
     echo "  Updated sdk/rust/README.md"
 fi
 

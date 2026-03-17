@@ -159,40 +159,60 @@ jobs:
             exit 0
           fi
 
-          # Build post text (max 300 chars for Bluesky)
+          # Build post text (max 300 graphemes for Bluesky)
           RELEASE_URL="https://github.com/librefang/librefang/releases/tag/$TAG"
-          BSKY_TEXT="🚀 LibreFang v${VERSION} released!
+          BSKY_TEXT="LibreFang v${VERSION} released!
 
-$(echo "$CHANGES" | head -5 | sed 's/^- /• /')
+$(echo "$CHANGES" | head -5 | sed 's/^- /- /')
 
-📦 $RELEASE_URL"
+$RELEASE_URL"
 
-          # Truncate to 300 graphemes
-          BSKY_TEXT=$(echo "$BSKY_TEXT" | head -c 296)
+          # Truncate to 300 graphemes (cut on valid UTF-8 boundary using python)
+          BSKY_TEXT=$(python3 -c "
+import sys
+t = sys.stdin.read()
+if len(t) > 300:
+    t = t[:297] + '...'
+print(t, end='')" <<< "$BSKY_TEXT")
 
-          # Detect link facet for the URL
-          URL_START=$(echo "$BSKY_TEXT" | grep -b -o "$RELEASE_URL" | head -1 | cut -d: -f1)
-          URL_END=$((URL_START + ${#RELEASE_URL}))
+          # Detect link facet for the URL (byte offsets for UTF-8)
+          URL_START=$(python3 -c "
+import sys
+text = sys.argv[1]
+url = sys.argv[2]
+idx = text.find(url)
+if idx < 0:
+    print(-1)
+else:
+    print(len(text[:idx].encode('utf-8')))" "$BSKY_TEXT" "$RELEASE_URL")
+          URL_END=$((URL_START + $(echo -n "$RELEASE_URL" | wc -c)))
+
+          # Build facets JSON only if URL was found in text
+          if [ "$URL_START" -ge 0 ]; then
+            FACETS_ARG=$(jq -n \
+              --arg url "$RELEASE_URL" \
+              --argjson start "$URL_START" \
+              --argjson end "$URL_END" \
+              '[{ index: { byteStart: $start, byteEnd: $end }, features: [{ "$type": "app.bsky.richtext.facet#link", uri: $url }] }]')
+          else
+            FACETS_ARG='[]'
+          fi
 
           # Create post
           NOW=$(date -u +%Y-%m-%dT%H:%M:%S.000Z)
           BSKY_PAYLOAD=$(jq -n \
             --arg text "$BSKY_TEXT" \
             --arg now "$NOW" \
-            --arg url "$RELEASE_URL" \
-            --argjson start "${URL_START:-0}" \
-            --argjson end "${URL_END:-0}" \
+            --arg did "$BSKY_DID" \
+            --argjson facets "$FACETS_ARG" \
             '{
-              repo: "'"$BSKY_DID"'",
+              repo: $did,
               collection: "app.bsky.feed.post",
               record: {
                 "$type": "app.bsky.feed.post",
                 text: $text,
                 createdAt: $now,
-                facets: [{
-                  index: { byteStart: $start, byteEnd: $end },
-                  features: [{ "$type": "app.bsky.richtext.facet#link", uri: $url }]
-                }]
+                facets: $facets
               }
             }')
 
