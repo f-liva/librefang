@@ -158,6 +158,78 @@ if command -v cargo &>/dev/null; then
     cargo update --workspace 2>/dev/null || echo "Warning: cargo update failed, continuing"
 fi
 
+# --- Generate Dev.to release article ---
+
+ARTICLE="$REPO_ROOT/articles/release-${VERSION}.md"
+if [ ! -f "$ARTICLE" ]; then
+    CHANGES=$(awk '/^## \['"$VERSION"'\]/{found=1; next} found && /^## \[/{exit} found{print}' "$REPO_ROOT/CHANGELOG.md")
+    if [ -n "$CHANGES" ]; then
+        echo "Generating Dev.to article..."
+        cat > "$ARTICLE" <<ARTICLE_EOF
+---
+title: "LibreFang $VERSION Released"
+published: true
+description: "LibreFang v${VERSION} release notes — open-source Agent OS built in Rust"
+tags: rust, ai, opensource, release
+canonical_url: https://github.com/librefang/librefang/releases/tag/${TAG}
+cover_image: https://raw.githubusercontent.com/librefang/librefang/main/public/assets/logo.png
+---
+
+# LibreFang $VERSION Released
+
+We're excited to announce **LibreFang v${VERSION}**! Here's what's new:
+
+${CHANGES}
+
+## Install / Upgrade
+
+\`\`\`bash
+# Binary
+curl -fsSL https://get.librefang.ai | sh
+
+# Rust SDK
+cargo add librefang
+
+# JavaScript SDK
+npm install librefang-sdk
+
+# Python SDK
+pip install librefang-sdk
+\`\`\`
+
+## Links
+
+- [Full Changelog](https://github.com/librefang/librefang/blob/main/CHANGELOG.md)
+- [GitHub Release](https://github.com/librefang/librefang/releases/tag/${TAG})
+- [GitHub](https://github.com/librefang/librefang)
+- [Discord](https://discord.gg/DzTYqAZZmc)
+- [Contributing Guide](https://github.com/librefang/librefang/blob/main/CONTRIBUTING.md)
+ARTICLE_EOF
+
+        # Polish article with Claude CLI if available
+        if command -v claude &>/dev/null; then
+            echo "  Polishing with Claude..."
+            POLISHED=$(unset CLAUDECODE; claude -p --model claude-haiku-4-5-20251001 --output-format text "You are writing a Dev.to release announcement for LibreFang, an open-source Agent OS built in Rust.
+Rewrite the article body to be more engaging and developer-friendly.
+Group related changes, highlight the most impactful ones, and add a brief intro.
+Keep the same front matter (--- block), Install/Upgrade section, and Links section exactly as-is.
+Only rewrite the content between the front matter and the Install section.
+Output the COMPLETE article (front matter + body + install + links), ready to save as-is.
+
+Current article:
+$(cat "$ARTICLE")" 2>/dev/null) || true
+            if [ -n "$POLISHED" ]; then
+                echo "$POLISHED" > "$ARTICLE"
+                echo "  ✓ AI polished"
+            else
+                echo "  ⚠ AI polish failed, using raw changelog"
+            fi
+        fi
+
+        echo "  Generated $ARTICLE"
+    fi
+fi
+
 # --- Commit and tag ---
 
 git -C "$REPO_ROOT" add \
@@ -167,6 +239,7 @@ git -C "$REPO_ROOT" add \
     sdk/python/setup.py \
     packages/whatsapp-gateway/package.json \
     crates/librefang-desktop/tauri.conf.json
+[ -f "$ARTICLE" ] && git -C "$REPO_ROOT" add "$ARTICLE"
 git -C "$REPO_ROOT" commit -m "chore: bump version to $TAG"
 git -C "$REPO_ROOT" tag "$TAG"
 
