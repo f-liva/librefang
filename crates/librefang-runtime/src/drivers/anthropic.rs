@@ -579,13 +579,13 @@ impl LlmDriver for AnthropicDriver {
 /// When a tool has no parameters the value may be `null` (e.g. from
 /// `Value::default()` or a missing field); this helper normalises it to `{}`.
 fn ensure_object(v: serde_json::Value) -> serde_json::Value {
-    if v.is_object() {
-        v
-    } else {
-        if !v.is_null() {
-            warn!(value = ?v, "Tool input was not an object or null, replacing with empty object");
+    match &v {
+        serde_json::Value::Object(_) => v,
+        serde_json::Value::Null => serde_json::json!({}),
+        other => {
+            warn!(value = ?other, "Tool input was not an object or null, replacing with empty object");
+            serde_json::json!({})
         }
-        serde_json::json!({})
     }
 }
 
@@ -781,6 +781,13 @@ mod tests {
         let input = serde_json::json!({"query": "rust lang"});
         let result = ensure_object(input.clone());
         assert_eq!(result, input);
+    }
+
+    #[test]
+    fn test_ensure_object_non_object_becomes_empty_object() {
+        assert_eq!(ensure_object(serde_json::json!("string")), serde_json::json!({}));
+        assert_eq!(ensure_object(serde_json::json!(42)), serde_json::json!({}));
+        assert_eq!(ensure_object(serde_json::json!([1, 2, 3])), serde_json::json!({}));
     }
 
     #[test]
