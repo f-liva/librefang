@@ -90,6 +90,11 @@ fn collect_rotation_key_specs(
 
     for profile in sorted_profiles {
         let Ok(api_key) = std::env::var(&profile.api_key_env) else {
+            warn!(
+                profile = %profile.name,
+                env_var = %profile.api_key_env,
+                "Auth profile env var not set — skipping"
+            );
             continue;
         };
         if api_key.is_empty() || !seen_keys.insert(api_key.clone()) {

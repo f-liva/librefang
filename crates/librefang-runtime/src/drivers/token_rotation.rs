@@ -108,7 +108,7 @@ impl TokenRotationDriver {
 
     /// Find the next available key slot index, skipping cooled-down keys.
     /// Returns None if all keys are in cooldown.
-    async fn next_available(&self, skip_index: Option<usize>) -> Option<usize> {
+    async fn next_available(&self) -> Option<usize> {
         let slots = self.slots.read().await;
         let len = slots.len();
         let now = Self::now_ms();
@@ -116,9 +116,6 @@ impl TokenRotationDriver {
 
         for offset in 0..len {
             let idx = start.wrapping_add(offset) % len;
-            if Some(idx) == skip_index {
-                continue;
-            }
             if slots[idx].cooldown_until <= now {
                 return Some(idx);
             }
@@ -155,7 +152,7 @@ impl LlmDriver for TokenRotationDriver {
 
         // Try each available slot up to the total number of slots.
         while tried < slot_count {
-            let idx = match self.next_available(None).await {
+            let idx = match self.next_available().await {
                 Some(i) => i,
                 None => break, // All keys in cooldown
             };
@@ -212,7 +209,7 @@ impl LlmDriver for TokenRotationDriver {
         let mut tried: usize = 0;
 
         while tried < slot_count {
-            let idx = match self.next_available(None).await {
+            let idx = match self.next_available().await {
                 Some(i) => i,
                 None => break,
             };
@@ -274,6 +271,7 @@ mod tests {
             temperature: 0.0,
             system: None,
             thinking: None,
+            prompt_caching: false,
         }
     }
 
