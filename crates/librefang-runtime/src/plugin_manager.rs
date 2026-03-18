@@ -645,13 +645,19 @@ async fn download_github_entry(
 
 /// Check that all declared hook scripts exist on disk and are within the plugin directory.
 fn check_hooks_exist(plugin_dir: &Path, manifest: &PluginManifest) -> bool {
+    // Canonicalize plugin_dir first so the starts_with check works even when
+    // the input path contains symlinks (e.g. /tmp → /private/tmp on macOS).
+    let canonical_dir = match plugin_dir.canonicalize() {
+        Ok(d) => d,
+        Err(_) => return false,
+    };
     let check = |rel_path: &str| -> bool {
-        let joined = plugin_dir.join(rel_path);
+        let joined = canonical_dir.join(rel_path);
         // Canonicalize to resolve any `..` and verify the resolved path
         // stays inside the plugin directory. If canonicalize fails (file
         // doesn't exist), the hook is missing.
         match joined.canonicalize() {
-            Ok(abs) => abs.starts_with(plugin_dir),
+            Ok(abs) => abs.starts_with(&canonical_dir),
             Err(_) => false,
         }
     };
@@ -797,9 +803,7 @@ after_turn = "hooks/after_turn.py"
     #[test]
     fn test_check_hooks_exist() {
         let tmp = tempfile::tempdir().unwrap();
-        // Canonicalize because check_hooks_exist uses canonicalize internally
-        // (on macOS /tmp → /private/tmp)
-        let plugin_dir = tmp.path().canonicalize().unwrap();
+        let plugin_dir = tmp.path().to_path_buf();
         std::fs::create_dir_all(plugin_dir.join("hooks")).unwrap();
         std::fs::write(plugin_dir.join("hooks/ingest.py"), "").unwrap();
 
