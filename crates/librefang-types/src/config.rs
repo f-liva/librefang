@@ -1166,6 +1166,52 @@ impl Default for QueueConcurrencyConfig {
     }
 }
 
+/// Context engine hook script paths.
+///
+/// Each field points to a Python script that overrides a lifecycle method.
+/// Scripts use JSON stdin/stdout protocol.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ContextEngineHooks {
+    /// Python script for the `ingest` hook.
+    pub ingest: Option<String>,
+    /// Python script for the `after_turn` hook.
+    pub after_turn: Option<String>,
+}
+
+/// Plugin manifest — parsed from `~/.librefang/plugins/<name>/plugin.toml`.
+///
+/// # Example
+/// ```toml
+/// name = "qdrant-recall"
+/// version = "0.1.0"
+/// description = "Vector recall via Qdrant"
+/// author = "librefang"
+///
+/// [hooks]
+/// ingest = "hooks/ingest.py"
+/// after_turn = "hooks/after_turn.py"
+/// ```
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PluginManifest {
+    /// Plugin name (must match directory name).
+    pub name: String,
+    /// Semver version string.
+    pub version: String,
+    /// Human-readable description.
+    #[serde(default)]
+    pub description: Option<String>,
+    /// Plugin author.
+    #[serde(default)]
+    pub author: Option<String>,
+    /// Hook script paths, relative to the plugin directory.
+    #[serde(default)]
+    pub hooks: ContextEngineHooks,
+    /// Python dependencies file (relative to plugin dir).
+    #[serde(default)]
+    pub requirements: Option<String>,
+}
+
 /// Top-level kernel configuration.
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(default)]
