@@ -1995,6 +1995,7 @@ mod tests {
                         provider_metadata: None,
                     },
                 ]),
+                pinned: false,
             },
         ];
 
