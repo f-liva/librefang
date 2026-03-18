@@ -839,4 +839,54 @@ after_turn = "hooks/after_turn.py"
         };
         assert!(!check_hooks_exist(&plugin_dir, &manifest_escape));
     }
+
+    /// Integration test: install from GitHub registry, run hook, then remove.
+    /// Ignored by default — requires network access.
+    #[tokio::test]
+    #[ignore]
+    async fn test_registry_install_run_remove() {
+        // 1. Install echo-memory from registry
+        let source = PluginSource::Registry {
+            name: "echo-memory".to_string(),
+        };
+        let info = install_plugin(&source)
+            .await
+            .expect("registry install failed");
+        assert_eq!(info.manifest.name, "echo-memory");
+        assert_eq!(info.manifest.version, "0.1.0");
+        assert!(info.hooks_valid);
+
+        // 2. List should include it
+        let plugins = list_plugins();
+        assert!(plugins.iter().any(|p| p.manifest.name == "echo-memory"));
+
+        // 3. Run ingest hook
+        let ingest_path = info.path.join("hooks/ingest.py");
+        assert!(ingest_path.exists());
+
+        let mut child = tokio::process::Command::new("python3")
+            .arg(&ingest_path)
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .spawn()
+            .expect("python3 should be available");
+
+        {
+            use tokio::io::AsyncWriteExt;
+            let stdin = child.stdin.as_mut().unwrap();
+            stdin
+                .write_all(br#"{"type":"ingest","agent_id":"test-001","message":"Hello world"}"#)
+                .await
+                .unwrap();
+        }
+        child.stdin.take(); // close stdin
+        let out = child.wait_with_output().await.unwrap();
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        assert!(stdout.contains("ingest_result"), "got: {stdout}");
+        assert!(stdout.contains("echo-memory"), "got: {stdout}");
+
+        // 4. Remove
+        remove_plugin("echo-memory").expect("remove failed");
+        assert!(get_plugin_info("echo-memory").is_err());
+    }
 }
