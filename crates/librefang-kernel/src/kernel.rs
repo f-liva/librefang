@@ -79,6 +79,10 @@ impl LlmDriver for StubDriver {
                 .to_string(),
         ))
     }
+
+    fn is_configured(&self) -> bool {
+        false
+    }
 }
 
 #[derive(Clone, PartialEq, Eq)]
@@ -264,6 +268,8 @@ pub struct LibreFangKernel {
     pub context_engine: Option<Box<dyn librefang_runtime::context_engine::ContextEngine>>,
     /// Weak self-reference for trigger dispatch (set after Arc wrapping).
     self_handle: OnceLock<Weak<LibreFangKernel>>,
+    /// Whether we've already logged the "no provider" audit entry (prevents spam).
+    pub provider_unconfigured_logged: std::sync::atomic::AtomicBool,
 }
 
 /// Bounded in-memory delivery receipt tracker.
@@ -1228,6 +1234,7 @@ impl LibreFangKernel {
             hand_desc_embeddings: tokio::sync::RwLock::new(None),
             context_engine,
             self_handle: OnceLock::new(),
+            provider_unconfigured_logged: std::sync::atomic::AtomicBool::new(false),
         };
 
         // Initialize proactive memory system (mem0-style) from config.
@@ -1855,6 +1862,21 @@ impl LibreFangKernel {
                         .insert(agent_id, result.decision_traces.clone());
                 }
 
+                if result.provider_not_configured {
+                    if !self
+                        .provider_unconfigured_logged
+                        .swap(true, std::sync::atomic::Ordering::Relaxed)
+                    {
+                        self.audit_log.record(
+                            agent_id.to_string(),
+                            librefang_runtime::audit::AuditAction::AgentMessage,
+                            "agent loop skipped",
+                            "No LLM provider configured — configure via dashboard settings",
+                        );
+                    }
+                    return Ok(result);
+                }
+
                 // SECURITY: Record successful message in audit trail
                 self.audit_log.record(
                     agent_id.to_string(),
@@ -2440,6 +2462,7 @@ impl LibreFangKernel {
             memories_saved: Vec::new(),
             memories_used: Vec::new(),
             memory_conflicts: Vec::new(),
+            provider_not_configured: false,
         })
     }
 
@@ -2505,6 +2528,7 @@ impl LibreFangKernel {
             memories_saved: Vec::new(),
             memories_used: Vec::new(),
             memory_conflicts: Vec::new(),
+            provider_not_configured: false,
         })
     }
 
@@ -2972,6 +2996,7 @@ impl LibreFangKernel {
             memories_saved: result.memories_saved,
             memories_used: result.memories_used,
             memory_conflicts: result.memory_conflicts,
+            provider_not_configured: result.provider_not_configured,
         }
     }
 
@@ -6557,6 +6582,31 @@ async fn cron_deliver_response(
                     }
                 }
             }
+        }
+    }
+}
+
+impl LibreFangKernel {
+    /// Mark all active Hands' cron jobs as due-now so the next scheduler tick fires them.
+    /// Called after a provider is first configured so Hands resume immediately.
+    pub fn trigger_all_hands(&self) {
+        let hand_agents: Vec<AgentId> = self
+            .hand_registry
+            .list_instances()
+            .into_iter()
+            .filter(|inst| inst.status == librefang_hands::HandStatus::Active)
+            .filter_map(|inst| inst.agent_id)
+            .collect();
+
+        for agent_id in &hand_agents {
+            self.cron_scheduler.mark_due_now_by_agent(*agent_id);
+        }
+
+        if !hand_agents.is_empty() {
+            info!(
+                count = hand_agents.len(),
+                "Marked active hands as due for immediate execution"
+            );
         }
     }
 }
