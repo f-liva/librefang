@@ -2447,10 +2447,14 @@ args = ["-y", "@modelcontextprotocol/server-filesystem", "/path"]</pre>
     <!-- Page: Plugins -->
     <template x-if="page === 'plugins'">
       <div x-data="{
+        tab: 'installed',
         plugins: [],
         pluginsDir: '',
         loading: true,
         error: '',
+        registryPlugins: [],
+        registryLoading: false,
+        registryError: '',
         showInstall: false,
         showScaffold: false,
         installSource: 'registry',
@@ -2463,7 +2467,7 @@ args = ["-y", "@modelcontextprotocol/server-filesystem", "/path"]</pre>
         actionLoading: false,
         actionResult: '',
 
-        async init() { await this.loadPlugins(); },
+        async init() { await this.loadPlugins(); await this.loadRegistry(); },
 
         async loadPlugins() {
           this.loading = true;
@@ -2477,6 +2481,46 @@ args = ["-y", "@modelcontextprotocol/server-filesystem", "/path"]</pre>
             this.error = 'Failed to load plugins: ' + e.message;
           }
           this.loading = false;
+        },
+
+        async loadRegistry() {
+          this.registryLoading = true;
+          this.registryError = '';
+          try {
+            const resp = await fetch('https://api.github.com/repos/librefang/plugin-registry/contents/plugins', { headers: { 'Accept': 'application/vnd.github.v3+json' } });
+            if (!resp.ok) throw new Error('HTTP ' + resp.status);
+            const dirs = await resp.json();
+            const installedNames = this.plugins.map(p => p.name);
+            const results = [];
+            for (const dir of dirs) {
+              if (dir.type !== 'dir') continue;
+              try {
+                const mResp = await fetch('https://raw.githubusercontent.com/librefang/plugin-registry/main/plugins/' + dir.name + '/plugin.toml');
+                if (!mResp.ok) { results.push({ name: dir.name, version: '?', description: '', installed: installedNames.includes(dir.name) }); continue; }
+                const toml = await mResp.text();
+                const version = (toml.match(/version\s*=\s*"([^"]+)"/) || [])[1] || '?';
+                const description = (toml.match(/description\s*=\s*"([^"]+)"/) || [])[1] || '';
+                const author = (toml.match(/author\s*=\s*"([^"]+)"/) || [])[1] || '';
+                results.push({ name: dir.name, version, description, author, installed: installedNames.includes(dir.name) });
+              } catch (e) { results.push({ name: dir.name, version: '?', description: '', installed: installedNames.includes(dir.name) }); }
+            }
+            this.registryPlugins = results;
+          } catch (e) {
+            this.registryError = 'Failed to load registry: ' + e.message;
+          }
+          this.registryLoading = false;
+        },
+
+        async installFromRegistry(name) {
+          this.actionLoading = true;
+          this.actionResult = '';
+          try {
+            const resp = await fetch('/api/plugins/install', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ source: 'registry', name }) });
+            const data = await resp.json();
+            if (resp.ok) { this.actionResult = 'Installed ' + name; await this.loadPlugins(); await this.loadRegistry(); }
+            else this.actionResult = 'Error: ' + (data.error || resp.statusText);
+          } catch (e) { this.actionResult = 'Error: ' + e.message; }
+          this.actionLoading = false;
         },
 
         async installPlugin() {
@@ -2536,6 +2580,12 @@ args = ["-y", "@modelcontextprotocol/server-filesystem", "/path"]</pre>
         </div>
 
         <div class="page-body">
+          <!-- Tabs: Installed / Registry -->
+          <div class="tab-bar" style="margin-bottom:16px">
+            <button class="tab-btn" :class="{ active: tab === 'installed' }" @click="tab = 'installed'">Installed (<span x-text="plugins.length"></span>)</button>
+            <button class="tab-btn" :class="{ active: tab === 'registry' }" @click="tab = 'registry'">Registry (<span x-text="registryPlugins.length"></span>)</button>
+          </div>
+
           <!-- Action result banner -->
           <div x-show="actionResult" class="info-card" x-text="actionResult" style="margin-bottom:12px"></div>
 
@@ -2574,53 +2624,100 @@ args = ["-y", "@modelcontextprotocol/server-filesystem", "/path"]</pre>
             </div>
           </div>
 
-          <!-- Loading -->
-          <div x-show="loading" class="loading-spinner"></div>
+          <!-- ===== Installed Tab ===== -->
+          <div x-show="tab === 'installed'">
+            <!-- Loading -->
+            <div x-show="loading" class="loading-spinner"></div>
 
-          <!-- Error -->
-          <div x-show="error" class="info-card" x-text="error" style="color:var(--danger)"></div>
+            <!-- Error -->
+            <div x-show="error" class="info-card" x-text="error" style="color:var(--danger)"></div>
 
-          <!-- Empty state -->
-          <div x-show="!loading && !error && plugins.length === 0" class="info-card">
-            <p>No plugins installed. Click <strong>+ Install</strong> to install from the registry, or <strong>+ New Plugin</strong> to create one from a template.</p>
-            <p style="margin-top:8px;opacity:0.7">Plugins directory: <code x-text="pluginsDir"></code></p>
+            <!-- Empty state -->
+            <div x-show="!loading && !error && plugins.length === 0" class="info-card">
+              <p>No plugins installed. Browse the <a href="#" @click.prevent="tab = 'registry'">Registry</a> to find plugins, or click <strong>+ New Plugin</strong> to create one from a template.</p>
+              <p style="margin-top:8px;opacity:0.7">Plugins directory: <code x-text="pluginsDir"></code></p>
+            </div>
+
+            <!-- Plugin list -->
+            <div x-show="!loading && plugins.length > 0">
+              <table class="data-table">
+                <thead>
+                  <tr>
+                    <th>Name</th>
+                    <th>Version</th>
+                    <th>Description</th>
+                    <th>Hooks</th>
+                    <th>Size</th>
+                    <th>Actions</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  <template x-for="p in plugins" :key="p.name">
+                    <tr>
+                      <td><strong x-text="p.name"></strong></td>
+                      <td x-text="p.version"></td>
+                      <td x-text="p.description || '—'"></td>
+                      <td>
+                        <span x-show="p.hooks_valid" style="color:var(--success)" title="All hook scripts found">&#10003;</span>
+                        <span x-show="!p.hooks_valid" style="color:var(--danger)" title="Some hook scripts missing">&#10007;</span>
+                        <span x-show="p.hooks?.ingest" class="badge" title="ingest hook">ingest</span>
+                        <span x-show="p.hooks?.after_turn" class="badge" title="after_turn hook">after_turn</span>
+                      </td>
+                      <td x-text="formatBytes(p.size_bytes)"></td>
+                      <td>
+                        <button class="btn btn-sm" @click="installDeps(p.name)" title="Install Python deps">Deps</button>
+                        <button class="btn btn-sm btn-danger" @click="uninstallPlugin(p.name)" title="Remove plugin">Remove</button>
+                      </td>
+                    </tr>
+                  </template>
+                </tbody>
+              </table>
+              <p style="margin-top:8px;opacity:0.7">Plugins directory: <code x-text="pluginsDir"></code></p>
+            </div>
           </div>
 
-          <!-- Plugin list -->
-          <div x-show="!loading && plugins.length > 0">
-            <table class="data-table">
-              <thead>
-                <tr>
-                  <th>Name</th>
-                  <th>Version</th>
-                  <th>Description</th>
-                  <th>Hooks</th>
-                  <th>Size</th>
-                  <th>Actions</th>
-                </tr>
-              </thead>
-              <tbody>
-                <template x-for="p in plugins" :key="p.name">
+          <!-- ===== Registry Tab ===== -->
+          <div x-show="tab === 'registry'">
+            <div x-show="registryLoading" class="loading-spinner"></div>
+            <div x-show="registryError" class="info-card" x-text="registryError" style="color:var(--danger)"></div>
+
+            <div x-show="!registryLoading && !registryError && registryPlugins.length === 0" class="info-card">
+              <p>No plugins found in the registry.</p>
+            </div>
+
+            <div x-show="!registryLoading && registryPlugins.length > 0">
+              <p style="margin-bottom:12px;opacity:0.7">Available plugins from <a href="https://github.com/librefang/plugin-registry" target="_blank">librefang/plugin-registry</a></p>
+              <table class="data-table">
+                <thead>
                   <tr>
-                    <td><strong x-text="p.name"></strong></td>
-                    <td x-text="p.version"></td>
-                    <td x-text="p.description || '—'"></td>
-                    <td>
-                      <span x-show="p.hooks_valid" style="color:var(--success)" title="All hook scripts found">&#10003;</span>
-                      <span x-show="!p.hooks_valid" style="color:var(--danger)" title="Some hook scripts missing">&#10007;</span>
-                      <span x-show="p.hooks?.ingest" class="badge" title="ingest hook">ingest</span>
-                      <span x-show="p.hooks?.after_turn" class="badge" title="after_turn hook">after_turn</span>
-                    </td>
-                    <td x-text="formatBytes(p.size_bytes)"></td>
-                    <td>
-                      <button class="btn btn-sm" @click="installDeps(p.name)" title="Install Python deps">Deps</button>
-                      <button class="btn btn-sm btn-danger" @click="uninstallPlugin(p.name)" title="Remove plugin">Remove</button>
-                    </td>
+                    <th>Name</th>
+                    <th>Version</th>
+                    <th>Description</th>
+                    <th>Author</th>
+                    <th>Status</th>
+                    <th>Action</th>
                   </tr>
-                </template>
-              </tbody>
-            </table>
-            <p style="margin-top:8px;opacity:0.7">Plugins directory: <code x-text="pluginsDir"></code></p>
+                </thead>
+                <tbody>
+                  <template x-for="p in registryPlugins" :key="p.name">
+                    <tr>
+                      <td><strong x-text="p.name"></strong></td>
+                      <td x-text="p.version"></td>
+                      <td x-text="p.description || '—'"></td>
+                      <td x-text="p.author || '—'"></td>
+                      <td>
+                        <span x-show="p.installed" class="badge" style="background:var(--success);color:#fff">Installed</span>
+                        <span x-show="!p.installed" class="badge">Available</span>
+                      </td>
+                      <td>
+                        <button class="btn btn-primary btn-sm" x-show="!p.installed" @click="installFromRegistry(p.name)" :disabled="actionLoading">Install</button>
+                        <button class="btn btn-sm btn-danger" x-show="p.installed" @click="uninstallPlugin(p.name)" :disabled="actionLoading">Remove</button>
+                      </td>
+                    </tr>
+                  </template>
+                </tbody>
+              </table>
+            </div>
           </div>
         </div>
       </div>
