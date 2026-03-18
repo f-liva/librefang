@@ -1115,7 +1115,7 @@ impl LibreFangKernel {
             Some(librefang_runtime::context_engine::build_context_engine(
                 &config.context_engine,
                 ce_config,
-                Arc::new(memory.clone()),
+                memory.clone(),
                 emb_arc,
             ))
         };
