@@ -2078,6 +2078,7 @@ impl LibreFangKernel {
                 ctx_window,
                 Some(&kernel_clone.process_manager),
                 None, // content_blocks (streaming path uses text only for now)
+                None, // context_engine
             )
             .await;
 
@@ -2787,6 +2788,7 @@ impl LibreFangKernel {
             ctx_window,
             Some(&self.process_manager),
             content_blocks,
+            None, // context_engine
         )
         .await
         .map_err(KernelError::LibreFang)?;
