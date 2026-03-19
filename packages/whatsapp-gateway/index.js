@@ -138,12 +138,13 @@ const senderBuffers = new Map(); // senderJid → { entries: [], timer, replyJid
 function debounceMessage(senderJid, msgData) {
   let buf = senderBuffers.get(senderJid);
   if (!buf) {
-    buf = { entries: [], timer: null, replyJid: null, isGroup: false, groupJid: null, wasMentioned: false };
+    buf = { entries: [], msgIds: [], timer: null, replyJid: null, isGroup: false, groupJid: null, wasMentioned: false };
     senderBuffers.set(senderJid, buf);
   }
 
   // Each entry is either a resolved string or a Promise<string> (for pending media downloads)
   buf.entries.push(msgData.textOrPromise);
+  if (msgData.msgId) buf.msgIds.push(msgData.msgId);
   buf.replyJid = msgData.replyJid;
   buf.isGroup = msgData.isGroup;
   buf.groupJid = msgData.groupJid;
@@ -178,6 +179,8 @@ async function flushSenderBuffer(senderJid) {
 
   try {
     await handleIncoming(combinedText, buf.phone, buf.pushName, buf.replyJid, buf.isGroup, buf.groupJid, buf.wasMentioned);
+    // Mark all batched messages as processed only after successful handling
+    for (const id of buf.msgIds) markProcessed(id);
   } catch (err) {
     log('error', `Debounce flush failed for ${buf.pushName}: ${err.message}`);
   }
@@ -317,11 +320,16 @@ async function startConnection() {
       }
 
       for (const msg of messages) {
-        if (msg.key.fromMe) {
-          log('info', `Skipping own message ${msg.key.id}`);
+        if (msg.key.remoteJid === 'status@broadcast') continue;
+
+        const remoteJid = msg.key.remoteJid || '';
+        const isGroup = remoteJid.endsWith('@g.us');
+
+        // In groups, skip own messages; in DMs, allow self-chat (Notes to Self)
+        if (msg.key.fromMe && isGroup) {
+          log('info', `Skipping own message in group ${msg.key.id}`);
           continue;
         }
-        if (msg.key.remoteJid === 'status@broadcast') continue;
 
         // --- Deduplication: skip already-processed messages ---
         const msgId = msg.key.id;
@@ -329,9 +337,6 @@ async function startConnection() {
           log('info', `Skipping duplicate message ${msgId}`);
           continue;
         }
-
-        const remoteJid = msg.key.remoteJid || '';
-        const isGroup = remoteJid.endsWith('@g.us');
 
         // In groups, the actual sender is in msg.key.participant;
         // in DMs, the sender is remoteJid itself.
@@ -344,6 +349,7 @@ async function startConnection() {
           msg.message?.extendedTextMessage?.text ||
           msg.message?.imageMessage?.caption ||
           msg.message?.videoMessage?.caption ||
+          msg.message?.documentWithCaptionMessage?.message?.documentMessage?.caption ||
           '';
 
         // Detect if this is a media message that needs async download
@@ -394,9 +400,6 @@ async function startConnection() {
           continue;
         }
 
-        // Mark as processed BEFORE forwarding (prevents re-processing on decrypt retry)
-        markProcessed(msgId);
-
         const phone = '+' + sender.replace(/@.*$/, '');
         const pushName = msg.pushName || phone;
 
@@ -429,7 +432,7 @@ async function startConnection() {
         // Debounce: accumulate rapid messages from same sender, flush after 5s of silence.
         // For media messages, pass the download promise so debounce starts NOW (not after download).
         const textOrPromise = mediaPromise || text;
-        debounceMessage(sender, { textOrPromise, phone, pushName, replyJid, isGroup, groupJid: remoteJid, wasMentioned });
+        debounceMessage(sender, { textOrPromise, phone, pushName, replyJid, isGroup, groupJid: remoteJid, wasMentioned, msgId });
       }
     }
   });
