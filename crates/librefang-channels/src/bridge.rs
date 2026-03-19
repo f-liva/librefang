@@ -503,9 +503,11 @@ fn content_to_text(content: &ChannelContent) -> String {
         ChannelContent::Voice {
             url,
             duration_seconds,
-        } => {
-            format!("[Voice message ({duration_seconds}s): {url}]")
-        }
+            caption,
+        } => match caption {
+            Some(c) => format!("[Voice message ({duration_seconds}s): {url}]\n{c}"),
+            None => format!("[Voice message ({duration_seconds}s): {url}]"),
+        },
         ChannelContent::Video {
             url,
             caption,
