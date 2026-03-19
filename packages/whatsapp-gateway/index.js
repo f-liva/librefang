@@ -11,6 +11,11 @@ const PORT = parseInt(process.env.WHATSAPP_GATEWAY_PORT || '3009', 10);
 const LIBREFANG_URL = (process.env.LIBREFANG_URL || 'http://127.0.0.1:4545').replace(/\/+$/, '');
 const DEFAULT_AGENT = process.env.LIBREFANG_DEFAULT_AGENT || 'assistant';
 
+// Owner routing: responses to external DMs go to the owner, not back to the sender.
+// Set WHATSAPP_OWNER_JID to the owner's phone number (e.g. "393760105565").
+const OWNER_JID_RAW = process.env.WHATSAPP_OWNER_JID || '';
+const OWNER_JID = OWNER_JID_RAW ? OWNER_JID_RAW.replace(/^\+/, '') + '@s.whatsapp.net' : '';
+
 // ---------------------------------------------------------------------------
 // State
 // ---------------------------------------------------------------------------
@@ -268,9 +273,21 @@ async function startConnection() {
       try {
         const response = await forwardToLibreFang(text, phone, pushName);
         if (response && sock) {
-          // Send agent response back to WhatsApp
-          await sock.sendMessage(sender, { text: response });
-          console.log(`[gateway] Replied to ${pushName}`);
+          // Owner routing: for DMs from external contacts, send the agent's
+          // response to the owner instead of back to the external contact.
+          // This prevents the bot from accidentally replying to shops/services
+          // with messages meant for the owner (e.g. "Signore, X ha risposto...").
+          const isGroup = sender.endsWith('@g.us');
+          let replyJid = sender;
+          if (!isGroup && OWNER_JID && sender !== OWNER_JID) {
+            replyJid = OWNER_JID;
+            console.log(`[gateway] Owner routing: redirecting response from ${pushName} (${phone}) -> owner`);
+          }
+
+          await sock.sendMessage(replyJid, { text: response });
+          const target = replyJid === OWNER_JID && replyJid !== sender
+            ? `owner (via ${pushName})` : pushName;
+          console.log(`[gateway] Replied to ${target}`);
         }
       } catch (err) {
         console.error(`[gateway] Forward/reply failed:`, err.message);
