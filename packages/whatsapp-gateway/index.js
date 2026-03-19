@@ -591,7 +591,8 @@ async function resolveAgentUUID(nameOrUUID) {
       res.on('data', (chunk) => (body += chunk));
       res.on('end', () => {
         try {
-          const agents = JSON.parse(body);
+          const parsed = JSON.parse(body);
+          const agents = Array.isArray(parsed) ? parsed : (parsed.items || []);
           const agent = agents.find((a) => a.name === nameOrUUID);
           if (agent) {
             AGENT_UUID_CACHE.set(nameOrUUID, agent.id);
