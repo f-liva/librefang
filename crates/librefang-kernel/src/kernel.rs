@@ -2189,8 +2189,6 @@ impl LibreFangKernel {
                 sender_display_name: None,
                 sender_user_id: None,
                 channel_type: None,
-                sender_user_id: None,
-                sender_display_name: None,
                 is_subagent: manifest
                     .metadata
                     .get("is_subagent")
