@@ -37,15 +37,22 @@ RUN curl -fsSL https://deb.nodesource.com/setup_22.x | bash - && \
     apt-get install -y nodejs && \
     npm install -g @anthropic-ai/claude-code @qwen-code/qwen-code && \
     rm -rf /var/lib/apt/lists/*
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    pkg-config \
+    libssl-dev \
+    && rm -rf /var/lib/apt/lists/*
 RUN useradd -m -s /bin/bash librefang && echo "librefang ALL=(ALL) NOPASSWD:ALL" > /etc/sudoers.d/librefang
 USER librefang
+RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
+ENV PATH="/home/librefang/.cargo/bin:${PATH}"
 RUN NONINTERACTIVE=1 /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"
 RUN eval "$(/home/linuxbrew/.linuxbrew/bin/brew shellenv)" && brew install steipete/tap/gogcli
 USER root
 RUN echo 'eval "$(/home/linuxbrew/.linuxbrew/bin/brew shellenv)"' >> /home/librefang/.bashrc && \
     echo 'eval "$(/home/linuxbrew/.linuxbrew/bin/brew shellenv)"' >> /root/.bashrc && \
     echo 'export PATH="/data/npm-global/bin:$PATH"' >> /home/librefang/.bashrc && \
-    echo 'export PATH="/data/npm-global/bin:$PATH"' >> /root/.bashrc
+    echo 'export PATH="/data/npm-global/bin:$PATH"' >> /root/.bashrc && \
+    echo 'source /home/librefang/.cargo/env 2>/dev/null' >> /home/librefang/.bashrc
 COPY --from=builder /usr/local/bin/librefang /usr/local/bin/
 COPY --from=builder /build/agents /opt/librefang/agents
 COPY --from=builder /build/packages /opt/librefang/packages
