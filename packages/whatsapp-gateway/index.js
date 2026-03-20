@@ -16,6 +16,16 @@ const DEFAULT_AGENT = process.env.LIBREFANG_DEFAULT_AGENT || 'assistant';
 const OWNER_JID_RAW = process.env.WHATSAPP_OWNER_JID || '';
 const OWNER_JID = OWNER_JID_RAW ? OWNER_JID_RAW.replace(/^\+/, '') + '@s.whatsapp.net' : '';
 
+// Validate OWNER_JID format at startup
+if (OWNER_JID_RAW) {
+  const digits = OWNER_JID_RAW.replace(/^\+/, '');
+  if (!/^\d{7,15}$/.test(digits)) {
+    console.error(`[gateway] WARNING: WHATSAPP_OWNER_JID="${OWNER_JID_RAW}" looks invalid (expected 7-15 digits, optionally prefixed with +). Owner routing may not work.`);
+  } else {
+    console.log(`[gateway] Owner routing enabled → ${OWNER_JID}`);
+  }
+}
+
 // ---------------------------------------------------------------------------
 // State
 // ---------------------------------------------------------------------------
@@ -279,12 +289,22 @@ async function startConnection() {
           // with messages meant for the owner (e.g. "Signore, X ha risposto...").
           const isGroup = sender.endsWith('@g.us');
           let replyJid = sender;
+          let replyText = response;
           if (!isGroup && OWNER_JID && sender !== OWNER_JID) {
             replyJid = OWNER_JID;
+            // Prefix with sender context so the owner knows who triggered it
+            replyText = `[Da ${pushName} (${phone})]\n${response}`;
             console.log(`[gateway] Owner routing: redirecting response from ${pushName} (${phone}) -> owner`);
+
+            // Send a brief ack to the external sender so they know the message was received
+            try {
+              await sock.sendMessage(sender, { text: 'Messaggio ricevuto, grazie.' });
+            } catch (ackErr) {
+              console.error(`[gateway] Failed to send ack to ${pushName}:`, ackErr.message);
+            }
           }
 
-          await sock.sendMessage(replyJid, { text: response });
+          await sock.sendMessage(replyJid, { text: replyText });
           const target = replyJid === OWNER_JID && replyJid !== sender
             ? `owner (via ${pushName})` : pushName;
           console.log(`[gateway] Replied to ${target}`);
