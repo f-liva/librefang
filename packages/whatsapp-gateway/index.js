@@ -2,35 +2,92 @@
 'use strict';
 
 const http = require('node:http');
+const fs = require('node:fs');
 const { randomUUID } = require('node:crypto');
 
 // ---------------------------------------------------------------------------
-// Config from environment
+// Read config.toml — the gateway reads its own config directly
+// ---------------------------------------------------------------------------
+const CONFIG_PATH = process.env.LIBREFANG_CONFIG || '/data/config.toml';
+
+function readWhatsAppConfig(configPath) {
+  const defaults = { default_agent: 'assistant', owner_numbers: [], conversation_ttl_hours: 24 };
+  try {
+    const content = fs.readFileSync(configPath, 'utf8');
+    const lines = content.split('\n');
+    let inWhatsApp = false;
+    const cfg = { ...defaults };
+
+    for (const line of lines) {
+      const trimmed = line.trim();
+      // Detect section headers
+      if (/^\[/.test(trimmed)) {
+        inWhatsApp = trimmed === '[channels.whatsapp]';
+        continue;
+      }
+      if (!inWhatsApp) continue;
+
+      const m = trimmed.match(/^(\w+)\s*=\s*(.+)$/);
+      if (!m) continue;
+      const [, key, rawVal] = m;
+
+      if (key === 'default_agent') {
+        cfg.default_agent = rawVal.replace(/^["']|["']$/g, '');
+      } else if (key === 'owner_numbers') {
+        // Parse TOML array: ["393760105565", "393407682386"]
+        const arrMatch = rawVal.match(/\[([^\]]*)\]/);
+        if (arrMatch) {
+          cfg.owner_numbers = arrMatch[1]
+            .split(',')
+            .map(s => s.trim().replace(/^["']|["']$/g, ''))
+            .filter(Boolean);
+        }
+      } else if (key === 'conversation_ttl_hours') {
+        cfg.conversation_ttl_hours = parseInt(rawVal, 10) || defaults.conversation_ttl_hours;
+      }
+    }
+    console.log(`[gateway] Read config from ${configPath}: default_agent="${cfg.default_agent}", owner_numbers=${JSON.stringify(cfg.owner_numbers)}, conversation_ttl_hours=${cfg.conversation_ttl_hours}`);
+    return cfg;
+  } catch (err) {
+    console.warn(`[gateway] Could not read ${configPath}: ${err.message} — using defaults/env vars`);
+    return defaults;
+  }
+}
+
+const tomlConfig = readWhatsAppConfig(CONFIG_PATH);
+
+// ---------------------------------------------------------------------------
+// Config: config.toml is the source of truth, env vars override if set
 // ---------------------------------------------------------------------------
 const PORT = parseInt(process.env.WHATSAPP_GATEWAY_PORT || '3009', 10);
 const LIBREFANG_URL = (process.env.LIBREFANG_URL || 'http://127.0.0.1:4545').replace(/\/+$/, '');
-const DEFAULT_AGENT = process.env.LIBREFANG_DEFAULT_AGENT || 'assistant';
-
-// Step A: Agent name from config — no hardcoded values
+const DEFAULT_AGENT = process.env.LIBREFANG_DEFAULT_AGENT || tomlConfig.default_agent;
 const AGENT_NAME = DEFAULT_AGENT;
 
-// Owner routing: responses to external DMs go to the owner, not back to the sender.
-// Set WHATSAPP_OWNER_JID to the owner's phone number (e.g. "393760105565").
-const OWNER_JID_RAW = process.env.WHATSAPP_OWNER_JID || '';
-const OWNER_JID = OWNER_JID_RAW ? OWNER_JID_RAW.replace(/^\+/, '') + '@s.whatsapp.net' : '';
+// Owner routing: build OWNER_JIDs set from config.toml owner_numbers
+const ownerNumbersFromEnv = process.env.WHATSAPP_OWNER_JID ? [process.env.WHATSAPP_OWNER_JID] : [];
+const OWNER_NUMBERS = ownerNumbersFromEnv.length > 0 ? ownerNumbersFromEnv : tomlConfig.owner_numbers;
+const OWNER_JIDS = new Set(
+  OWNER_NUMBERS.map(n => n.replace(/^\+/, '') + '@s.whatsapp.net')
+);
+// Primary owner JID for sending messages to the owner
+const OWNER_JID = OWNER_JIDS.size > 0 ? [...OWNER_JIDS][0] : '';
 
-// Step B: Conversation TTL from config (default 24 hours)
-const CONVERSATION_TTL_HOURS = parseInt(process.env.CONVERSATION_TTL_HOURS || '24', 10);
+// Conversation TTL from config.toml (default 24 hours)
+const CONVERSATION_TTL_HOURS = parseInt(process.env.CONVERSATION_TTL_HOURS || String(tomlConfig.conversation_ttl_hours), 10);
 const CONVERSATION_TTL_MS = CONVERSATION_TTL_HOURS * 3600 * 1000;
 
-// Validate OWNER_JID format at startup
-if (OWNER_JID_RAW) {
-  const digits = OWNER_JID_RAW.replace(/^\+/, '');
-  if (!/^\d{7,15}$/.test(digits)) {
-    console.error(`[gateway] WARNING: WHATSAPP_OWNER_JID="${OWNER_JID_RAW}" looks invalid (expected 7-15 digits, optionally prefixed with +). Owner routing may not work.`);
-  } else {
-    console.log(`[gateway] Owner routing enabled → ${OWNER_JID}`);
+// Validate owner numbers at startup
+if (OWNER_NUMBERS.length > 0) {
+  for (const num of OWNER_NUMBERS) {
+    const digits = num.replace(/^\+/, '');
+    if (!/^\d{7,15}$/.test(digits)) {
+      console.error(`[gateway] WARNING: owner number "${num}" looks invalid (expected 7-15 digits). Owner routing may not work.`);
+    }
   }
+  console.log(`[gateway] Owner routing enabled → ${[...OWNER_JIDS].join(', ')}`);
+} else {
+  console.log('[gateway] Owner routing disabled (no owner_numbers configured)');
 }
 
 // ---------------------------------------------------------------------------
@@ -441,8 +498,8 @@ async function startConnection() {
 
       // Determine if this is from the owner or a stranger
       const isGroup = sender.endsWith('@g.us');
-      const isOwner = OWNER_JID && sender === OWNER_JID;
-      const isStranger = !isGroup && OWNER_JID && !isOwner;
+      const isOwner = OWNER_JIDS.size > 0 && OWNER_JIDS.has(sender);
+      const isStranger = !isGroup && OWNER_JIDS.size > 0 && !isOwner;
 
       // Forward to LibreFang agent
       try {
