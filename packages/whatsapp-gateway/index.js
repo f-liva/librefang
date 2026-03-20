@@ -26,6 +26,21 @@ const LIBREFANG_URL = (process.env.LIBREFANG_URL || 'http://127.0.0.1:4545').rep
 const DEFAULT_AGENT = process.env.LIBREFANG_DEFAULT_AGENT || 'assistant';
 const AGENT_UUID_CACHE = new Map();
 
+// Owner routing: responses to external DMs go to the owner, not back to the sender.
+// Set WHATSAPP_OWNER_JID to the owner's phone number (e.g. "393760105565").
+const OWNER_JID_RAW = process.env.WHATSAPP_OWNER_JID || '';
+const OWNER_JID = OWNER_JID_RAW ? OWNER_JID_RAW.replace(/^\+/, '') + '@s.whatsapp.net' : '';
+
+// Validate OWNER_JID format at startup
+if (OWNER_JID_RAW) {
+  const digits = OWNER_JID_RAW.replace(/^\+/, '');
+  if (!/^\d{7,15}$/.test(digits)) {
+    console.error(`[gateway] WARNING: WHATSAPP_OWNER_JID="${OWNER_JID_RAW}" looks invalid (expected 7-15 digits, optionally prefixed with +). Owner routing may not work.`);
+  } else {
+    console.log(`[gateway] Owner routing enabled → ${OWNER_JID}`);
+  }
+}
+
 // ---------------------------------------------------------------------------
 // State
 // ---------------------------------------------------------------------------
@@ -537,11 +552,32 @@ async function handleIncoming(text, phone, pushName, replyJid, isGroup, groupJid
   // Convert markdown formatting to WhatsApp-native formatting
   response = markdownToWhatsApp(response);
 
+  // Owner routing: for DMs from external contacts, redirect the response
+  // to the owner and prefix it with sender context.
+  let actualReplyJid = replyJid;
+  let replyText = response;
+  const senderJid = phone.replace(/^\+/, '') + '@s.whatsapp.net';
+  if (!isGroup && OWNER_JID && senderJid !== OWNER_JID) {
+    actualReplyJid = OWNER_JID;
+    replyText = `[Da ${pushName} (${phone})]\n${response}`;
+    log('info', `Owner routing: redirecting response from ${pushName} (${phone}) -> owner`);
+
+    // Send a brief ack to the external sender so they don't think the bot is broken
+    if (sock && connStatus === 'connected') {
+      try {
+        await sock.sendMessage(replyJid, { text: 'Messaggio ricevuto, grazie.' });
+      } catch (ackErr) {
+        log('error', `Failed to send ack to ${pushName}: ${ackErr.message}`);
+      }
+    }
+  }
+
   if (sock && connStatus === 'connected') {
     try {
-      await sock.sendMessage(replyJid, { text: response });
-      const target = isGroup ? `group ${groupJid}` : pushName;
-      log('info', `Replied to ${target} (${response.length} chars)`);
+      await sock.sendMessage(actualReplyJid, { text: replyText });
+      const target = isGroup ? `group ${groupJid}`
+        : actualReplyJid !== replyJid ? `owner (via ${pushName})` : pushName;
+      log('info', `Replied to ${target} (${replyText.length} chars)`);
       return;
     } catch (err) {
       log('error', `Send failed for ${pushName}: ${err.message}`);
@@ -549,7 +585,7 @@ async function handleIncoming(text, phone, pushName, replyJid, isGroup, groupJid
   }
 
   log('info', `Buffering reply for ${pushName}`);
-  pendingReplies.set(replyJid, { text: response, timestamp: Date.now() });
+  pendingReplies.set(actualReplyJid, { text: replyText, timestamp: Date.now() });
 }
 
 // ---------------------------------------------------------------------------
