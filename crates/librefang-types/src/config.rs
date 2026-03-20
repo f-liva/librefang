@@ -2529,6 +2529,15 @@ pub struct WhatsAppConfig {
     pub account_id: Option<String>,
     /// Default agent name to route messages to.
     pub default_agent: Option<String>,
+    /// Owner phone numbers for owner-routing mode (digits only, no '+' prefix).
+    /// When set, messages from non-owner numbers are forwarded to the first
+    /// owner number with sender context, and the sender receives an auto-ack.
+    #[serde(default, deserialize_with = "deserialize_string_or_int_vec")]
+    pub owner_numbers: Vec<String>,
+    /// How long (in hours) an inactive stranger conversation stays active
+    /// before being evicted from the in-memory tracker. Default: 24.
+    #[serde(default = "default_conversation_ttl_hours")]
+    pub conversation_ttl_hours: u32,
     /// Per-channel behavior overrides.
     #[serde(default)]
     pub overrides: ChannelOverrides,
@@ -2545,6 +2554,8 @@ impl Default for WhatsAppConfig {
             allowed_users: vec![],
             account_id: None,
             default_agent: None,
+            owner_numbers: vec![],
+            conversation_ttl_hours: default_conversation_ttl_hours(),
             overrides: ChannelOverrides::default(),
         }
     }
@@ -3214,6 +3225,10 @@ pub struct FeishuConfig {
     /// Per-channel behavior overrides.
     #[serde(default)]
     pub overrides: ChannelOverrides,
+}
+
+fn default_conversation_ttl_hours() -> u32 {
+    24
 }
 
 fn default_receive_mode() -> String {
