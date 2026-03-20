@@ -559,13 +559,16 @@ async function handleIncoming(text, phone, pushName, replyJid, isGroup, groupJid
   const senderJid = phone.replace(/^\+/, '') + '@s.whatsapp.net';
   if (!isGroup && OWNER_JID && senderJid !== OWNER_JID) {
     actualReplyJid = OWNER_JID;
-    replyText = `[Da ${pushName} (${phone})]\n${response}`;
+    replyText = `[From ${pushName} (${phone})]\n${response}`;
     log('info', `Owner routing: redirecting response from ${pushName} (${phone}) -> owner`);
 
-    // Send a brief ack to the external sender so they don't think the bot is broken
+    // Send a brief LLM-generated ack to the external sender in their language
     if (sock && connStatus === 'connected') {
       try {
-        await sock.sendMessage(replyJid, { text: 'Messaggio ricevuto, grazie.' });
+        const ack = await generateSenderAck(text, pushName);
+        if (ack) {
+          await sock.sendMessage(replyJid, { text: ack });
+        }
       } catch (ackErr) {
         log('error', `Failed to send ack to ${pushName}: ${ackErr.message}`);
       }
@@ -641,6 +644,65 @@ async function resolveAgentUUID(nameOrUUID) {
         }
       });
     }).on('error', reject);
+  });
+}
+
+// ---------------------------------------------------------------------------
+// Generate a brief ack for external senders via LLM (language-aware)
+// ---------------------------------------------------------------------------
+async function generateSenderAck(originalMessage, pushName) {
+  const agentId = await resolveAgentUUID(DEFAULT_AGENT);
+  const prompt = [
+    `[SYSTEM-ACK] An external contact named "${pushName}" just sent a WhatsApp message.`,
+    `Their message: "${(originalMessage || '').substring(0, 300)}"`,
+    `Generate a very brief, warm acknowledgment (1-2 sentences max) in the SAME language as their message.`,
+    `Do NOT answer their question or address the content — just confirm receipt and that their message has been forwarded.`,
+    `Be natural and friendly, not robotic. Do not include any prefix or label.`,
+  ].join('\n');
+  return new Promise((resolve) => {
+    const body = JSON.stringify({
+      message: prompt,
+      sender_id: 'system-ack',
+      sender_name: 'System',
+      channel_type: 'internal',
+    });
+    const url = new URL(`${LIBREFANG_URL}/api/agents/${agentId}/message`);
+    const req = http.request(
+      {
+        hostname: url.hostname,
+        port: url.port || 4545,
+        path: url.pathname,
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'Content-Length': Buffer.byteLength(body),
+        },
+        timeout: 30_000,
+      },
+      (res) => {
+        let data = '';
+        res.on('data', (chunk) => (data += chunk));
+        res.on('end', () => {
+          try {
+            const parsed = JSON.parse(data);
+            resolve(parsed.response || parsed.message || parsed.text || '');
+          } catch {
+            resolve(data.trim() || '');
+          }
+        });
+      },
+    );
+    req.on('error', (err) => {
+      log('error', `generateSenderAck failed: ${err.message}`);
+      resolve('');
+    });
+    req.on('timeout', () => {
+      req.destroy();
+      log('error', 'generateSenderAck timeout');
+      resolve('');
+    });
+    req.write(body);
+    req.end();
   });
 }
 
