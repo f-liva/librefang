@@ -606,9 +606,21 @@ async function startConnection() {
       }
 
       const sender = msg.key.remoteJid || '';
-
-      // Extract text from various message types.
       const innerMsg = msg.message || {};
+
+      // --- FASE 4: Handle reactions ---
+      if (innerMsg.reactionMessage) {
+        const emoji = innerMsg.reactionMessage.text;
+        const reactedMsgId = innerMsg.reactionMessage.key?.id || '';
+        if (emoji) {
+          console.log(`[gateway] Reaction ${emoji} from ${msg.pushName || sender} on msg ${reactedMsgId}`);
+          // Only forward non-empty reactions (empty = reaction removed)
+          // For now, skip reactions — they don't need agent processing
+        }
+        continue;
+      }
+
+      // --- Extract text from various message types ---
       const text = innerMsg.conversation
         || innerMsg.extendedTextMessage?.text
         || innerMsg.imageMessage?.caption
@@ -616,14 +628,52 @@ async function startConnection() {
         || innerMsg.documentWithCaptionMessage?.message?.documentMessage?.caption
         || '';
 
-      // Bug fix: Non-text media handling — generate descriptors instead of silently dropping
+      // Check for downloadable media
+      const downloadableMedia = getDownloadableMedia(innerMsg);
+      // Legacy fallback descriptor for non-downloadable media or download failures
       const mediaDescriptor = getMediaDescriptor(innerMsg, msg.pushName || sender);
 
-      if (!text && !mediaDescriptor) continue;
+      // --- FASE 4: Improved location handling ---
+      if (innerMsg.locationMessage || innerMsg.liveLocationMessage) {
+        const loc = innerMsg.locationMessage || innerMsg.liveLocationMessage;
+        const lat = loc.degreesLatitude;
+        const lon = loc.degreesLongitude;
+        const locName = loc.name || loc.address || '';
+        const locLabel = locName ? `${locName} — ` : '';
+        // Override mediaDescriptor with enriched location text
+        const locationText = `[Posizione: ${locLabel}${lat}, ${lon} — https://maps.google.com/?q=${lat},${lon}]`;
+        // Fall through to normal message processing with this text
+        innerMsg._overrideMediaText = locationText;
+      }
 
-      // Extract real phone number:
-      // - For @lid JIDs, use senderPn (the real phone number) if available
-      // - For @s.whatsapp.net JIDs, extract from the JID directly
+      // --- FASE 4: Improved contact handling ---
+      if (innerMsg.contactMessage) {
+        const vcard = innerMsg.contactMessage.vcard || '';
+        let contactName = innerMsg.contactMessage.displayName || '';
+        let contactPhone = '';
+        // Parse vCard for phone number
+        const telMatch = vcard.match(/TEL[^:]*:([+\d\s-]+)/i);
+        if (telMatch) contactPhone = telMatch[1].trim();
+        const fnMatch = vcard.match(/FN:(.+)/i);
+        if (fnMatch && !contactName) contactName = fnMatch[1].trim();
+        innerMsg._overrideMediaText = `[Contatto condiviso: ${contactName}${contactPhone ? ' ' + contactPhone : ''}]`;
+      }
+      if (innerMsg.contactsArrayMessage) {
+        const contacts = innerMsg.contactsArrayMessage.contacts || [];
+        const parsed = contacts.map(c => {
+          const vcard = c.vcard || '';
+          const name = c.displayName || '';
+          const telMatch = vcard.match(/TEL[^:]*:([+\d\s-]+)/i);
+          const phone = telMatch ? telMatch[1].trim() : '';
+          return `${name}${phone ? ' ' + phone : ''}`;
+        });
+        innerMsg._overrideMediaText = `[Contatti condivisi: ${parsed.join(', ')}]`;
+      }
+
+      // Skip if there's nothing to process
+      if (!text && !downloadableMedia && !mediaDescriptor && !innerMsg._overrideMediaText) continue;
+
+      // Extract real phone number
       const isLidJid = sender.endsWith('@lid');
       const senderPn = msg.key.senderPn || msg.key.participant || '';
       let phone;
@@ -634,27 +684,101 @@ async function startConnection() {
       }
       const pushName = msg.pushName || phone;
 
-      // Use text if available, otherwise use media descriptor
-      const messageText = text || mediaDescriptor;
-
-      console.log(`[gateway] Incoming from ${pushName} (${phone}): ${messageText.substring(0, 80)}`);
-
-      // Determine if this is from the owner or a stranger
-      // Check both the remoteJid AND senderPn against owner JIDs (handles @lid format)
+      // Determine sender type
       const isGroup = sender.endsWith('@g.us');
       const senderPnJid = senderPn ? senderPn.replace(/@.*$/, '') + '@s.whatsapp.net' : '';
       const isOwner = OWNER_JIDS.size > 0 && (OWNER_JIDS.has(sender) || (senderPnJid && OWNER_JIDS.has(senderPnJid)));
       const isStranger = !isGroup && OWNER_JIDS.size > 0 && !isOwner;
 
-      // Bug fix: Rate limiting for strangers
+      // Rate limiting for strangers
       if (isStranger && isRateLimited(sender)) {
         console.log(`[gateway] Rate limited: ${pushName} (${phone}) — dropping message`);
         continue;
       }
 
+      // --- Resolve agent ID early (needed for media upload) ---
+      if (!cachedAgentId) {
+        try {
+          await resolveAgentId();
+        } catch (err) {
+          console.error(`[gateway] Agent resolution failed: ${err.message}`);
+          continue;
+        }
+      }
+
+      // --- FASE 1: Process media (download + upload to LibreFang) ---
+      let attachments = [];
+      let messageText = text;
+      let transcriptionText = '';
+
+      if (downloadableMedia) {
+        const result = await processMediaMessage(msg, innerMsg, cachedAgentId);
+        if (result && result.attachment) {
+          attachments.push(result.attachment);
+          if (result.transcription) {
+            transcriptionText = result.transcription;
+          }
+          // If no text caption, generate a default message
+          if (!messageText) {
+            if (transcriptionText) {
+              // Audio with transcription: use transcription as message text
+              const ptt = innerMsg.audioMessage?.ptt;
+              messageText = `[${ptt ? 'Vocale' : 'Audio'} trascritto]: ${transcriptionText}`;
+            } else {
+              messageText = innerMsg._overrideMediaText || getMediaFilename(downloadableMedia.type, downloadableMedia.msg);
+            }
+          }
+        } else if (result && result.fallbackText) {
+          // File too large
+          messageText = result.fallbackText;
+        } else {
+          // Download/upload failed — fall back to text descriptor
+          console.warn(`[gateway] Media processing failed, falling back to text descriptor`);
+          messageText = messageText || innerMsg._overrideMediaText || mediaDescriptor || '[Media non processabile]';
+        }
+      } else if (innerMsg._overrideMediaText) {
+        // Location or contact — no downloadable media, just enriched text
+        messageText = innerMsg._overrideMediaText;
+      } else if (!messageText && mediaDescriptor) {
+        // Fallback for unknown media types
+        messageText = mediaDescriptor;
+      }
+
+      if (!messageText && attachments.length === 0) continue;
+
+      // --- FASE 2: Reply context (quotedMessage) ---
+      const contextSources = [
+        innerMsg.extendedTextMessage?.contextInfo,
+        innerMsg.imageMessage?.contextInfo,
+        innerMsg.videoMessage?.contextInfo,
+        innerMsg.audioMessage?.contextInfo,
+        innerMsg.documentMessage?.contextInfo,
+        innerMsg.stickerMessage?.contextInfo,
+      ];
+      const contextInfo = contextSources.find(c => c) || null;
+
+      if (contextInfo?.quotedMessage) {
+        const quoted = contextInfo.quotedMessage;
+        const quotedText = quoted.conversation
+          || quoted.extendedTextMessage?.text
+          || quoted.imageMessage?.caption
+          || quoted.videoMessage?.caption
+          || '';
+        if (quotedText) {
+          messageText = `[In risposta a: "${quotedText.substring(0, 200)}"]\n${messageText}`;
+        }
+      }
+
+      // --- FASE 2: Forwarded message context ---
+      if (contextInfo?.isForwarded) {
+        messageText = `[Messaggio inoltrato]\n${messageText}`;
+      }
+
+      console.log(`[gateway] Incoming from ${pushName} (${phone}): ${messageText.substring(0, 80)}${attachments.length ? ` [+${attachments.length} attachment(s)]` : ''}`);
+
       // Forward to LibreFang agent
       try {
-        // Step B: Track stranger messages
+        // Track stranger messages
         if (isStranger) {
           trackMessage(sender, pushName, phone, messageText, 'inbound');
         }
@@ -664,23 +788,19 @@ async function startConnection() {
         let systemPrefix = '';
 
         if (isGroup) {
-          // Groups: never inject stranger/relay context — just forward the plain message
           messageToSend = messageText;
         } else if (isStranger) {
-          // Step C: Inject stranger context prefix (factual only)
           const strangerContext = buildStrangerContext(pushName, phone, sender);
           messageToSend = strangerContext + messageText;
         } else if (isOwner && activeConversations.size > 0) {
-          // Step D: Inject active conversations context for owner
           const context = buildConversationsContext();
-          // Step E: Include relay system instruction (separate from user text)
           systemPrefix = buildRelaySystemInstruction();
           messageToSend = context + '\n\n[OWNER_MESSAGE]\n' + messageText;
         } else {
           messageToSend = messageText;
         }
 
-        const response = await forwardToLibreFang(messageToSend, systemPrefix, phone, pushName, isOwner);
+        const response = await forwardToLibreFang(messageToSend, systemPrefix, phone, pushName, isOwner, attachments);
 
         if (response && sock) {
           if (isStranger) {
@@ -795,6 +915,196 @@ function getMediaDescriptor(innerMsg, senderName) {
 }
 
 // ---------------------------------------------------------------------------
+// Media processing: download from WhatsApp, upload to LibreFang
+// ---------------------------------------------------------------------------
+const MAX_MEDIA_SIZE = 50 * 1024 * 1024; // 50MB limit
+const MEDIA_DOWNLOAD_TIMEOUT = 30_000;   // 30 seconds
+
+// Cached Baileys downloadMediaMessage function (loaded on first use)
+let _downloadMediaMessage = null;
+
+async function getDownloadMediaFn() {
+  if (!_downloadMediaMessage) {
+    const baileys = await import('@whiskeysockets/baileys');
+    _downloadMediaMessage = baileys.downloadMediaMessage;
+  }
+  return _downloadMediaMessage;
+}
+
+/**
+ * Detect which media type key is present in the message.
+ * Returns { type, msg } where msg is the inner media message object,
+ * or null if no downloadable media is found.
+ */
+function getDownloadableMedia(innerMsg) {
+  if (innerMsg.imageMessage)    return { type: 'imageMessage',    msg: innerMsg.imageMessage };
+  if (innerMsg.videoMessage)    return { type: 'videoMessage',    msg: innerMsg.videoMessage };
+  if (innerMsg.audioMessage)    return { type: 'audioMessage',    msg: innerMsg.audioMessage };
+  if (innerMsg.stickerMessage)  return { type: 'stickerMessage',  msg: innerMsg.stickerMessage };
+  if (innerMsg.documentMessage) return { type: 'documentMessage', msg: innerMsg.documentMessage };
+  if (innerMsg.documentWithCaptionMessage?.message?.documentMessage) {
+    return { type: 'documentMessage', msg: innerMsg.documentWithCaptionMessage.message.documentMessage };
+  }
+  return null;
+}
+
+/**
+ * Determine MIME type for a media message.
+ */
+function getMediaMimeType(mediaType, mediaMsg) {
+  // Most Baileys media objects carry a `mimetype` field
+  if (mediaMsg.mimetype) return mediaMsg.mimetype;
+  // Fallbacks by type
+  const defaults = {
+    imageMessage: 'image/jpeg',
+    videoMessage: 'video/mp4',
+    audioMessage: 'audio/ogg; codecs=opus',
+    stickerMessage: 'image/webp',
+    documentMessage: 'application/octet-stream',
+  };
+  return defaults[mediaType] || 'application/octet-stream';
+}
+
+/**
+ * Determine a human-readable filename for a media message.
+ */
+function getMediaFilename(mediaType, mediaMsg) {
+  if (mediaMsg.fileName) return mediaMsg.fileName;
+  const extensions = {
+    'image/jpeg': '.jpg', 'image/png': '.png', 'image/webp': '.webp',
+    'video/mp4': '.mp4', 'audio/ogg; codecs=opus': '.ogg', 'audio/mpeg': '.mp3',
+    'audio/ogg': '.ogg', 'application/pdf': '.pdf',
+  };
+  const mime = getMediaMimeType(mediaType, mediaMsg);
+  const ext = extensions[mime] || '';
+  const prefixes = {
+    imageMessage: 'photo', videoMessage: 'video', audioMessage: 'audio',
+    stickerMessage: 'sticker', documentMessage: 'document',
+  };
+  return (prefixes[mediaType] || 'file') + ext;
+}
+
+/**
+ * Download media from a WhatsApp message with retry and timeout.
+ * Returns a Buffer or throws on failure.
+ */
+async function downloadMedia(fullMsg) {
+  const downloadFn = await getDownloadMediaFn();
+
+  async function attempt() {
+    return new Promise((resolve, reject) => {
+      const timer = setTimeout(() => reject(new Error('Media download timeout')), MEDIA_DOWNLOAD_TIMEOUT);
+      downloadFn(fullMsg, 'buffer', {})
+        .then(buf => { clearTimeout(timer); resolve(buf); })
+        .catch(err => { clearTimeout(timer); reject(err); });
+    });
+  }
+
+  try {
+    return await attempt();
+  } catch (firstErr) {
+    // Retry once after 2 seconds
+    console.warn(`[gateway] Media download failed (attempt 1): ${firstErr.message} — retrying in 2s`);
+    await new Promise(r => setTimeout(r, 2000));
+    return await attempt();
+  }
+}
+
+/**
+ * Upload a buffer to LibreFang via POST /api/agents/{id}/upload.
+ * Returns { file_id, filename, content_type, size, transcription? } or throws.
+ */
+async function uploadToLibreFang(agentId, buffer, contentType, filename) {
+  async function attempt() {
+    return new Promise((resolve, reject) => {
+      const url = new URL(`${LIBREFANG_URL}/api/agents/${encodeURIComponent(agentId)}/upload`);
+      const req = http.request(
+        {
+          hostname: url.hostname,
+          port: url.port || 4545,
+          path: url.pathname,
+          method: 'POST',
+          headers: {
+            'Content-Type': contentType,
+            'X-Filename': filename,
+            'Content-Length': buffer.length,
+          },
+          timeout: 60_000,
+        },
+        (res) => {
+          let body = '';
+          res.on('data', chunk => body += chunk);
+          res.on('end', () => {
+            if (res.statusCode >= 400) {
+              return reject(new Error(`Upload failed (${res.statusCode}): ${body}`));
+            }
+            try {
+              resolve(JSON.parse(body));
+            } catch (e) {
+              reject(new Error(`Upload response parse error: ${e.message}`));
+            }
+          });
+        }
+      );
+      req.on('error', reject);
+      req.on('timeout', () => { req.destroy(); reject(new Error('Upload timeout')); });
+      req.write(buffer);
+      req.end();
+    });
+  }
+
+  try {
+    return await attempt();
+  } catch (firstErr) {
+    // Retry once
+    console.warn(`[gateway] Upload failed (attempt 1): ${firstErr.message} — retrying`);
+    await new Promise(r => setTimeout(r, 1000));
+    return await attempt();
+  }
+}
+
+/**
+ * Process a media message: download from WhatsApp, upload to LibreFang.
+ * Returns { attachment, transcription? } on success, or null on failure.
+ * On failure, logs the error (caller should fall back to text descriptor).
+ */
+async function processMediaMessage(fullMsg, innerMsg, agentId) {
+  const media = getDownloadableMedia(innerMsg);
+  if (!media) return null;
+
+  const mimeType = getMediaMimeType(media.type, media.msg);
+  const filename = getMediaFilename(media.type, media.msg);
+
+  try {
+    const buffer = await downloadMedia(fullMsg);
+
+    // Size check
+    if (buffer.length > MAX_MEDIA_SIZE) {
+      console.warn(`[gateway] Media too large: ${(buffer.length / 1024 / 1024).toFixed(1)}MB > ${MAX_MEDIA_SIZE / 1024 / 1024}MB`);
+      return { fallbackText: `[File troppo grande: ${(buffer.length / 1024 / 1024).toFixed(0)}MB, limite ${MAX_MEDIA_SIZE / 1024 / 1024}MB]` };
+    }
+
+    const startTime = Date.now();
+    const uploadResult = await uploadToLibreFang(agentId, buffer, mimeType, filename);
+    const elapsed = Date.now() - startTime;
+
+    console.log(`[gateway] Media processed: ${filename} (${mimeType}, ${(buffer.length / 1024).toFixed(0)}KB, upload ${elapsed}ms) → file_id=${uploadResult.file_id}`);
+
+    return {
+      attachment: {
+        file_id: uploadResult.file_id,
+        filename: uploadResult.filename || filename,
+        content_type: uploadResult.content_type || mimeType,
+      },
+      transcription: uploadResult.transcription || null,
+    };
+  } catch (err) {
+    console.error(`[gateway] Media processing failed for ${filename}: ${err.message}`);
+    return null; // Caller will fall back to text descriptor
+  }
+}
+
+// ---------------------------------------------------------------------------
 // Build relay system instruction (Step E — separate from user text)
 // ---------------------------------------------------------------------------
 function buildRelaySystemInstruction() {
@@ -821,7 +1131,7 @@ function buildRelaySystemInstruction() {
 // ---------------------------------------------------------------------------
 // Forward incoming message to LibreFang API, return agent response
 // ---------------------------------------------------------------------------
-async function forwardToLibreFang(text, systemPrefix, phone, pushName, isOwner) {
+async function forwardToLibreFang(text, systemPrefix, phone, pushName, isOwner, attachments) {
   // Resolve agent UUID if not cached (or if invalidated on reconnect)
   if (!cachedAgentId) {
     try {
@@ -832,11 +1142,6 @@ async function forwardToLibreFang(text, systemPrefix, phone, pushName, isOwner) 
     }
   }
 
-  // Prompt injection mitigation: system prefix uses clearly delimited tags
-  // (e.g. [SYSTEM_INSTRUCTION_WHATSAPP_RELAY]...[/...]) and is prepended
-  // separately from user text, not concatenated as raw strings.
-  // The LibreFang API currently only supports a single `message` field, so we
-  // prepend with delimiter tags to keep system instructions visually separated.
   const fullMessage = systemPrefix ? systemPrefix + text : text;
 
   const payload = {
@@ -845,6 +1150,11 @@ async function forwardToLibreFang(text, systemPrefix, phone, pushName, isOwner) 
     sender_id: phone,
     sender_name: pushName,
   };
+
+  // Include attachments if present
+  if (attachments && attachments.length > 0) {
+    payload.attachments = attachments;
+  }
 
   const payloadStr = JSON.stringify(payload);
 
@@ -873,7 +1183,7 @@ async function forwardToLibreFang(text, systemPrefix, phone, pushName, isOwner) 
             cachedAgentId = null;
             // Retry once with fresh UUID
             resolveAgentId()
-              .then(() => forwardToLibreFang(text, systemPrefix, phone, pushName, isOwner))
+              .then(() => forwardToLibreFang(text, systemPrefix, phone, pushName, isOwner, attachments))
               .then(resolve)
               .catch(reject);
             return;
