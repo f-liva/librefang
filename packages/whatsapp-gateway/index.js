@@ -705,11 +705,7 @@ async function startConnection() {
               // Mark conversation as escalated
               if (convo) convo.escalated = true;
 
-              const ownerNotif = [
-                `📩 Notification from conversation with ${pushName} (${phone})`,
-                `Reason: ${notif.reason}`,
-                notif.summary ? `Summary: ${notif.summary}` : '',
-              ].filter(Boolean).join('\n');
+              const ownerNotif = notif.summary || `[${pushName}] ${notif.reason}`;
 
               // Bug fix: Send to ALL owner JIDs (or use primary)
               await sock.sendMessage(OWNER_JID, { text: ownerNotif });
@@ -730,14 +726,14 @@ async function startConnection() {
             // Build owner confirmation message
             let ownerReply = cleanedText;
 
-            // Append relay delivery confirmations
+            // Log relay results (don't append technical details to owner message)
             for (let i = 0; i < relayResults.length; i++) {
               const r = relayResults[i];
               if (r.success) {
-                const confirmLine = `\n✓ Message delivered to ${r.recipient} (${r.phone})`;
-                ownerReply = ownerReply ? ownerReply + confirmLine : confirmLine.trim();
+                console.log(`[gateway] Relay delivered to ${r.recipient} (${r.phone})`);
               } else {
-                const failLine = `\n✗ Relay failed: ${r.error}`;
+                console.error(`[gateway] Relay failed: ${r.error}`);
+                const failLine = `\n✗ Invio fallito: ${r.error}`;
                 ownerReply = ownerReply ? ownerReply + failLine : failLine.trim();
               }
             }
