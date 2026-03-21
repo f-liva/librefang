@@ -70,7 +70,7 @@ const OWNER_NUMBERS = ownerNumbersFromEnv.length > 0 ? ownerNumbersFromEnv : tom
 const OWNER_JIDS = new Set(
   OWNER_NUMBERS.map(n => n.replace(/^\+/, '') + '@s.whatsapp.net')
 );
-// Primary owner JID for sending messages to the owner
+// Primary owner JID for unsolicited/scheduled messages only
 const OWNER_JID = OWNER_JIDS.size > 0 ? [...OWNER_JIDS][0] : '';
 
 // Conversation TTL from config.toml (default 24 hours)
@@ -126,11 +126,19 @@ const MAX_CONVERSATION_MESSAGES = 20;
 function trackMessage(strangerJid, pushName, phone, text, direction) {
   let convo = activeConversations.get(strangerJid);
   if (!convo) {
-    convo = { pushName, phone, messages: [], lastActivity: Date.now() };
+    convo = {
+      pushName,
+      phone,
+      messages: [],
+      lastActivity: Date.now(),
+      messageCount: 0,
+      escalated: false,
+    };
     activeConversations.set(strangerJid, convo);
   }
   convo.pushName = pushName || convo.pushName;
   convo.lastActivity = Date.now();
+  convo.messageCount += 1;
   convo.messages.push({
     text: (text || '').substring(0, 500),
     timestamp: Date.now(),
@@ -159,21 +167,70 @@ function evictExpiredConversations() {
 setInterval(evictExpiredConversations, 15 * 60 * 1000);
 
 // ---------------------------------------------------------------------------
+// Step F: Rate limiting — per-JID for strangers
+// ---------------------------------------------------------------------------
+const rateLimitMap = new Map(); // Map<jid, { timestamps: number[] }>
+const RATE_LIMIT_MAX = 3;       // max messages per window
+const RATE_LIMIT_WINDOW_MS = 60_000; // 1 minute window
+
+function isRateLimited(jid) {
+  const now = Date.now();
+  let entry = rateLimitMap.get(jid);
+  if (!entry) {
+    entry = { timestamps: [] };
+    rateLimitMap.set(jid, entry);
+  }
+  // Remove timestamps outside the window
+  entry.timestamps = entry.timestamps.filter(t => now - t < RATE_LIMIT_WINDOW_MS);
+  if (entry.timestamps.length >= RATE_LIMIT_MAX) {
+    return true;
+  }
+  entry.timestamps.push(now);
+  return false;
+}
+
+// Cleanup rate limit entries every 5 minutes
+setInterval(() => {
+  const now = Date.now();
+  for (const [jid, entry] of rateLimitMap) {
+    entry.timestamps = entry.timestamps.filter(t => now - t < RATE_LIMIT_WINDOW_MS);
+    if (entry.timestamps.length === 0) rateLimitMap.delete(jid);
+  }
+}, 5 * 60 * 1000);
+
+// ---------------------------------------------------------------------------
+// Step F: Escalation deduplication — debounce NOTIFY_OWNER per stranger
+// ---------------------------------------------------------------------------
+const lastEscalationTime = new Map(); // Map<stranger_jid, timestamp>
+const ESCALATION_DEBOUNCE_MS = 5 * 60 * 1000; // 5 minutes
+
+function shouldDebounceEscalation(strangerJid) {
+  const last = lastEscalationTime.get(strangerJid);
+  if (last && Date.now() - last < ESCALATION_DEBOUNCE_MS) {
+    return true;
+  }
+  lastEscalationTime.set(strangerJid, Date.now());
+  return false;
+}
+
+// ---------------------------------------------------------------------------
 // Step D: Build active conversations context block for owner messages
 // ---------------------------------------------------------------------------
 function buildConversationsContext() {
   if (activeConversations.size === 0) return '';
 
-  const lines = ['[ACTIVE STRANGER CONVERSATIONS]'];
+  const lines = ['[ACTIVE_STRANGER_CONVERSATIONS]'];
   let idx = 1;
   for (const [jid, convo] of activeConversations) {
     const lastMsg = convo.messages[convo.messages.length - 1];
     const agoMs = Date.now() - (lastMsg?.timestamp || convo.lastActivity);
     const agoStr = formatTimeAgo(agoMs);
     const lastText = lastMsg ? `"${lastMsg.text.substring(0, 100)}"` : '(no messages)';
-    lines.push(`${idx}. ${convo.pushName} (${convo.phone}) [JID: ${jid}] — last: ${lastText} (${agoStr})`);
+    const escalatedTag = convo.escalated ? ' [ESCALATED]' : '';
+    lines.push(`${idx}. ${convo.pushName} (${convo.phone}) [JID: ${jid}] — last: ${lastText} (${agoStr})${escalatedTag}`);
     idx++;
   }
+  lines.push('[/ACTIVE_STRANGER_CONVERSATIONS]');
   return lines.join('\n');
 }
 
@@ -186,6 +243,56 @@ function formatTimeAgo(ms) {
   if (hours < 24) return `${hours}h ago`;
   const days = Math.floor(hours / 24);
   return `${days}d ago`;
+}
+
+// ---------------------------------------------------------------------------
+// Step C: Build stranger context prefix (factual only, no personality)
+// ---------------------------------------------------------------------------
+function buildStrangerContext(pushName, phone, strangerJid) {
+  const convo = activeConversations.get(strangerJid);
+  const messageCount = convo ? convo.messageCount : 1;
+  const firstMessageAt = convo && convo.messages.length > 0
+    ? new Date(convo.messages[0].timestamp).toISOString()
+    : new Date().toISOString();
+
+  return [
+    '[WHATSAPP_STRANGER_CONTEXT]',
+    `Incoming WhatsApp message from: ${pushName} (${phone})`,
+    'This person is NOT the owner. They are an external contact.',
+    `Active conversation: ${messageCount} messages, started ${firstMessageAt}`,
+    '',
+    'Available routing tags:',
+    '- [NOTIFY_OWNER]{"reason": "...", "summary": "..."}[/NOTIFY_OWNER] — sends a notification to the owner',
+    '[/WHATSAPP_STRANGER_CONTEXT]',
+    '',
+  ].join('\n');
+}
+
+// ---------------------------------------------------------------------------
+// Step C: Parse NOTIFY_OWNER tags from agent response
+// ---------------------------------------------------------------------------
+const NOTIFY_OWNER_REGEX = /\[NOTIFY_OWNER\]\s*(\{[\s\S]*?\})\s*\[\/NOTIFY_OWNER\]/g;
+
+function extractNotifyOwner(responseText) {
+  const notifications = [];
+  let match;
+  while ((match = NOTIFY_OWNER_REGEX.exec(responseText)) !== null) {
+    try {
+      const parsed = JSON.parse(match[1]);
+      notifications.push({
+        reason: parsed.reason || 'unknown',
+        summary: parsed.summary || '',
+      });
+    } catch {
+      console.error('[gateway] Failed to parse NOTIFY_OWNER JSON:', match[1]);
+    }
+  }
+  NOTIFY_OWNER_REGEX.lastIndex = 0;
+
+  const cleanedText = responseText.replace(NOTIFY_OWNER_REGEX, '').trim();
+  NOTIFY_OWNER_REGEX.lastIndex = 0;
+
+  return { notifications, cleanedText };
 }
 
 // ---------------------------------------------------------------------------
@@ -406,8 +513,7 @@ async function startConnection() {
         if (fs.existsSync(authPath)) {
           fs.rmSync(authPath, { recursive: true, force: true });
         }
-      } else if (statusCode === DisconnectReason.loggedOut ||
-                 statusCode === DisconnectReason.forbidden) {
+      } else if (statusCode === DisconnectReason.forbidden) {
         // Non-recoverable — don't auto-reconnect
         connStatus = 'disconnected';
         statusMessage = `Disconnected: ${reason}. Use POST /login/start to reconnect.`;
@@ -415,9 +521,7 @@ async function startConnection() {
         sock = null;
         ownJid = null;
       } else {
-        // All other disconnect reasons are treated as recoverable:
-        // restartRequired, timedOut, connectionClosed, connectionLost,
-        // connectionReplaced, multideviceMismatch, badSession, etc.
+        // All other disconnect reasons are treated as recoverable
         reconnectAttempts += 1;
         if (reconnectAttempts >= MAX_RECONNECT_ATTEMPTS) {
           console.error(`[gateway] Max reconnection attempts (${MAX_RECONNECT_ATTEMPTS}) reached. Manual restart required.`);
@@ -468,8 +572,6 @@ async function startConnection() {
       if (msg.key.remoteJid === 'status@broadcast') continue;
 
       // Handle self-chat ("Notes to Self"): fromMe messages to own JID.
-      // Normal messages from others have fromMe=false.
-      // Self-chat messages have fromMe=true AND remoteJid === own JID.
       if (msg.key.fromMe) {
         const isSelfChat = ownJid && msg.key.remoteJid === ownJid;
         if (!isSelfChat) continue; // Skip regular outgoing messages
@@ -478,8 +580,6 @@ async function startConnection() {
       const sender = msg.key.remoteJid || '';
 
       // Extract text from various message types.
-      // Baileys decrypts E2EE internally; these fields are already plaintext.
-      // Protocol messages (key distribution, receipts) have no user text.
       const innerMsg = msg.message || {};
       const text = innerMsg.conversation
         || innerMsg.extendedTextMessage?.text
@@ -488,53 +588,94 @@ async function startConnection() {
         || innerMsg.documentWithCaptionMessage?.message?.documentMessage?.caption
         || '';
 
-      if (!text) continue;
+      // Bug fix: Non-text media handling — generate descriptors instead of silently dropping
+      const mediaDescriptor = getMediaDescriptor(innerMsg, msg.pushName || sender);
 
-      // Extract phone number from JID (e.g. "1234567890@s.whatsapp.net" → "+1234567890")
+      if (!text && !mediaDescriptor) continue;
+
+      // Extract phone number from JID
       const phone = '+' + sender.replace(/@.*$/, '');
       const pushName = msg.pushName || phone;
 
-      console.log(`[gateway] Incoming from ${pushName} (${phone}): ${text.substring(0, 80)}`);
+      // Use text if available, otherwise use media descriptor
+      const messageText = text || mediaDescriptor;
+
+      console.log(`[gateway] Incoming from ${pushName} (${phone}): ${messageText.substring(0, 80)}`);
 
       // Determine if this is from the owner or a stranger
       const isGroup = sender.endsWith('@g.us');
       const isOwner = OWNER_JIDS.size > 0 && OWNER_JIDS.has(sender);
       const isStranger = !isGroup && OWNER_JIDS.size > 0 && !isOwner;
 
+      // Bug fix: Rate limiting for strangers
+      if (isStranger && isRateLimited(sender)) {
+        console.log(`[gateway] Rate limited: ${pushName} (${phone}) — dropping message`);
+        continue;
+      }
+
       // Forward to LibreFang agent
       try {
         // Step B: Track stranger messages
         if (isStranger) {
-          trackMessage(sender, pushName, phone, text, 'inbound');
+          trackMessage(sender, pushName, phone, messageText, 'inbound');
         }
 
-        // Step D: If owner is messaging, inject active conversations context
-        let messageToSend = text;
-        if (isOwner && activeConversations.size > 0) {
+        // Build the message to send to the agent
+        let messageToSend;
+        let systemPrefix = '';
+
+        if (isStranger) {
+          // Step C: Inject stranger context prefix (factual only)
+          const strangerContext = buildStrangerContext(pushName, phone, sender);
+          messageToSend = strangerContext + messageText;
+        } else if (isOwner && activeConversations.size > 0) {
+          // Step D: Inject active conversations context for owner
           const context = buildConversationsContext();
-          messageToSend = `${context}\n\n[OWNER MESSAGE]\n${text}`;
+          // Step E: Include relay system instruction (separate from user text)
+          systemPrefix = buildRelaySystemInstruction();
+          messageToSend = context + '\n\n[OWNER_MESSAGE]\n' + messageText;
+        } else {
+          messageToSend = messageText;
         }
 
-        const response = await forwardToLibreFang(messageToSend, phone, pushName, isOwner);
+        const response = await forwardToLibreFang(messageToSend, systemPrefix, phone, pushName, isOwner);
 
         if (response && sock) {
           if (isStranger) {
-            // Owner routing: redirect agent response to owner with sender context
-            const replyText = `[From ${pushName} (${phone})]\n${response}`;
-            console.log(`[gateway] Owner routing: redirecting response from ${pushName} (${phone}) -> owner`);
+            // Step C: Agent response goes to STRANGER, not owner
+            const { notifications, cleanedText } = extractNotifyOwner(response);
 
-            // Step C: Send isolated ack to stranger
-            try {
-              const ack = await generateSenderAck(text, pushName);
-              if (ack) {
-                await sock.sendMessage(sender, { text: ack });
-              }
-            } catch (ackErr) {
-              console.error(`[gateway] Failed to send ack to ${pushName}:`, ackErr.message);
+            // Send cleaned response to the stranger
+            if (cleanedText) {
+              await sock.sendMessage(sender, { text: cleanedText });
+              console.log(`[gateway] Replied to stranger ${pushName} (${phone})`);
+
+              // Track outbound message
+              trackMessage(sender, pushName, phone, cleanedText, 'outbound');
             }
 
-            await sock.sendMessage(OWNER_JID, { text: replyText });
-            console.log(`[gateway] Replied to owner (via ${pushName})`);
+            // Step C + F: If NOTIFY_OWNER tags found, send notification to owner
+            for (const notif of notifications) {
+              const convo = activeConversations.get(sender);
+              // F: Escalation deduplication
+              if (shouldDebounceEscalation(sender)) {
+                console.log(`[gateway] Debounced escalation for ${pushName} — skipping duplicate notification`);
+                continue;
+              }
+
+              // Mark conversation as escalated
+              if (convo) convo.escalated = true;
+
+              const ownerNotif = [
+                `📩 Notification from conversation with ${pushName} (${phone})`,
+                `Reason: ${notif.reason}`,
+                notif.summary ? `Summary: ${notif.summary}` : '',
+              ].filter(Boolean).join('\n');
+
+              // Bug fix: Send to ALL owner JIDs (or use primary)
+              await sock.sendMessage(OWNER_JID, { text: ownerNotif });
+              console.log(`[gateway] NOTIFY_OWNER sent for ${pushName}: ${notif.reason}`);
+            }
 
           } else if (isOwner) {
             // Step E: Check for relay commands in the agent response
@@ -563,8 +704,9 @@ async function startConnection() {
             }
 
             if (ownerReply) {
-              await sock.sendMessage(OWNER_JID, { text: ownerReply });
-              console.log(`[gateway] Replied to owner`);
+              // Bug fix: Reply to the SENDER's JID, not always OWNER_JID[0]
+              await sock.sendMessage(sender, { text: ownerReply });
+              console.log(`[gateway] Replied to owner (${sender})`);
             }
 
           } else {
@@ -584,9 +726,64 @@ async function startConnection() {
 }
 
 // ---------------------------------------------------------------------------
+// Bug fix: Non-text media descriptor — don't silently drop media messages
+// ---------------------------------------------------------------------------
+function getMediaDescriptor(innerMsg, senderName) {
+  if (innerMsg.imageMessage) {
+    return `[Photo from ${senderName}]`;
+  }
+  if (innerMsg.videoMessage) {
+    return `[Video from ${senderName}]`;
+  }
+  if (innerMsg.audioMessage) {
+    const ptt = innerMsg.audioMessage.ptt;
+    return ptt ? `[Voice message from ${senderName}]` : `[Audio from ${senderName}]`;
+  }
+  if (innerMsg.stickerMessage) {
+    return `[Sticker from ${senderName}]`;
+  }
+  if (innerMsg.locationMessage || innerMsg.liveLocationMessage) {
+    const loc = innerMsg.locationMessage || innerMsg.liveLocationMessage;
+    return `[Location from ${senderName}: ${loc.degreesLatitude}, ${loc.degreesLongitude}]`;
+  }
+  if (innerMsg.contactMessage || innerMsg.contactsArrayMessage) {
+    return `[Contact card from ${senderName}]`;
+  }
+  if (innerMsg.documentMessage) {
+    const fileName = innerMsg.documentMessage.fileName || 'unknown';
+    return `[Document from ${senderName}: ${fileName}]`;
+  }
+  return null;
+}
+
+// ---------------------------------------------------------------------------
+// Build relay system instruction (Step E — separate from user text)
+// ---------------------------------------------------------------------------
+function buildRelaySystemInstruction() {
+  return [
+    '[SYSTEM_INSTRUCTION_WHATSAPP_RELAY]',
+    'You are acting as a bridge between the owner and external contacts.',
+    'When the owner wants to reply to a stranger, you MUST:',
+    '1. Determine which stranger the owner is addressing (from the active conversations list above)',
+    '2. Reformulate the message appropriately (never forward the raw owner message)',
+    '3. Wrap the outgoing message in this exact format:',
+    '[RELAY_TO_STRANGER]{"jid":"<stranger_jid>","message":"<your reformulated message>"}[/RELAY_TO_STRANGER]',
+    '',
+    'RULES:',
+    '- The "jid" MUST be one from the [ACTIVE_STRANGER_CONVERSATIONS] list',
+    '- The "message" MUST be a reformulated, polished version — never copy the owner\'s raw words',
+    '- If the intended recipient is ambiguous, ask the owner to clarify instead of guessing',
+    '- If the owner is talking to you (the agent) and NOT replying to a stranger, respond normally without any relay block',
+    '- You can include both a relay block AND a confirmation message to the owner in the same response',
+    '[/SYSTEM_INSTRUCTION_WHATSAPP_RELAY]',
+    '',
+  ].join('\n');
+}
+
+// ---------------------------------------------------------------------------
 // Forward incoming message to LibreFang API, return agent response
 // ---------------------------------------------------------------------------
-async function forwardToLibreFang(text, phone, pushName, isOwner) {
+async function forwardToLibreFang(text, systemPrefix, phone, pushName, isOwner) {
   // Resolve agent UUID if not cached (or if invalidated on reconnect)
   if (!cachedAgentId) {
     try {
@@ -597,42 +794,23 @@ async function forwardToLibreFang(text, phone, pushName, isOwner) {
     }
   }
 
-  // Step E: When forwarding owner messages with active conversations,
-  // include system instruction for the relay tool format
-  let systemPrefix = '';
-  if (isOwner && activeConversations.size > 0) {
-    systemPrefix = [
-      '[SYSTEM INSTRUCTION — WHATSAPP RELAY]',
-      'You are acting as a bridge between the owner and external contacts.',
-      'When the owner wants to reply to a stranger, you MUST:',
-      '1. Determine which stranger the owner is addressing (from the active conversations list above)',
-      '2. Reformulate the message appropriately (never forward the raw owner message)',
-      '3. Wrap the outgoing message in this exact format:',
-      '[RELAY_TO_STRANGER]{"jid":"<stranger_jid>","message":"<your reformulated message>"}[/RELAY_TO_STRANGER]',
-      '',
-      'RULES:',
-      '- The "jid" MUST be one from the [ACTIVE STRANGER CONVERSATIONS] list',
-      '- The "message" MUST be a reformulated, polished version — never copy the owner\'s raw words',
-      '- If the intended recipient is ambiguous, ask the owner to clarify instead of guessing',
-      '- If the owner is talking to you (the agent) and NOT replying to a stranger, respond normally without any relay block',
-      '- You can include both a relay block AND a confirmation message to the owner in the same response',
-      '[/SYSTEM INSTRUCTION]',
-      '',
-    ].join('\n');
-  }
+  // Prompt injection mitigation: system prefix uses clearly delimited tags
+  // (e.g. [SYSTEM_INSTRUCTION_WHATSAPP_RELAY]...[/...]) and is prepended
+  // separately from user text, not concatenated as raw strings.
+  // The LibreFang API currently only supports a single `message` field, so we
+  // prepend with delimiter tags to keep system instructions visually separated.
+  const fullMessage = systemPrefix ? systemPrefix + text : text;
 
-  const fullMessage = systemPrefix + text;
+  const payload = {
+    message: fullMessage,
+    channel_type: 'whatsapp',
+    sender_id: phone,
+    sender_name: pushName,
+  };
+
+  const payloadStr = JSON.stringify(payload);
 
   return new Promise((resolve, reject) => {
-    const payload = JSON.stringify({
-      message: fullMessage,
-      metadata: {
-        channel: 'whatsapp',
-        sender: phone,
-        sender_name: pushName,
-      },
-    });
-
     const url = new URL(`${LIBREFANG_URL}/api/agents/${encodeURIComponent(cachedAgentId)}/message`);
 
     const req = http.request(
@@ -643,7 +821,7 @@ async function forwardToLibreFang(text, phone, pushName, isOwner) {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
-          'Content-Length': Buffer.byteLength(payload),
+          'Content-Length': Buffer.byteLength(payloadStr),
         },
         timeout: 120_000, // LLM calls can be slow
       },
@@ -657,7 +835,7 @@ async function forwardToLibreFang(text, phone, pushName, isOwner) {
             cachedAgentId = null;
             // Retry once with fresh UUID
             resolveAgentId()
-              .then(() => forwardToLibreFang(text, phone, pushName, isOwner))
+              .then(() => forwardToLibreFang(text, systemPrefix, phone, pushName, isOwner))
               .then(resolve)
               .catch(reject);
             return;
@@ -679,73 +857,7 @@ async function forwardToLibreFang(text, phone, pushName, isOwner) {
       req.destroy();
       reject(new Error('LibreFang API timeout'));
     });
-    req.write(payload);
-    req.end();
-  });
-}
-
-// ---------------------------------------------------------------------------
-// Step C: Generate a brief ack for external senders — ISOLATED from main agent
-// Uses a one-shot LLM call with sender_name='system-ack' to avoid polluting
-// the main agent conversation context.
-// ---------------------------------------------------------------------------
-async function generateSenderAck(originalMessage, pushName) {
-  if (!cachedAgentId) {
-    try { await resolveAgentId(); } catch { return ''; }
-  }
-
-  // Step A + C: Use AGENT_NAME from config, isolated prompt
-  const prompt = [
-    `[SYSTEM-ACK] An external contact named "${pushName}" just sent a WhatsApp message.`,
-    `Their message: "${(originalMessage || '').substring(0, 300)}"`,
-    `Generate a very brief, warm acknowledgment (1-2 sentences max) in the SAME language as their message.`,
-    `Do NOT answer their question. Just confirm receipt and say someone will get back to them.`,
-    `Do NOT mention being an AI or bot. Sign off as "${AGENT_NAME}".`,
-  ].join(' ');
-
-  return new Promise((resolve) => {
-    const payload = JSON.stringify({
-      message: prompt,
-      metadata: { channel: 'whatsapp', sender: 'system', sender_name: 'system-ack' },
-    });
-
-    const url = new URL(`${LIBREFANG_URL}/api/agents/${encodeURIComponent(cachedAgentId)}/message`);
-
-    const req = http.request(
-      {
-        hostname: url.hostname,
-        port: url.port || 4545,
-        path: url.pathname,
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          'Content-Length': Buffer.byteLength(payload),
-        },
-        timeout: 30_000,
-      },
-      (res) => {
-        let body = '';
-        res.on('data', (chunk) => (body += chunk));
-        res.on('end', () => {
-          try {
-            const data = JSON.parse(body);
-            resolve(data.response || data.message || data.text || '');
-          } catch {
-            resolve(body.trim() || '');
-          }
-        });
-      },
-    );
-    req.on('error', (err) => {
-      console.error(`[gateway] generateSenderAck failed: ${err.message}`);
-      resolve('');
-    });
-    req.on('timeout', () => {
-      req.destroy();
-      console.error('[gateway] generateSenderAck timeout');
-      resolve('');
-    });
-    req.write(payload);
+    req.write(payloadStr);
     req.end();
   });
 }
@@ -867,8 +979,9 @@ const server = http.createServer(async (req, res) => {
           jid,
           pushName: convo.pushName,
           phone: convo.phone,
-          messageCount: convo.messages.length,
+          messageCount: convo.messageCount,
           lastActivity: convo.lastActivity,
+          escalated: convo.escalated,
           lastMessage: convo.messages[convo.messages.length - 1] || null,
         });
       }
