@@ -397,9 +397,10 @@ function resolveAgentId() {
         res.on('data', (chunk) => (body += chunk));
         res.on('end', () => {
           try {
-            const agents = JSON.parse(body);
-            if (!Array.isArray(agents)) {
-              return reject(new Error('Unexpected /api/agents response'));
+            const parsed = JSON.parse(body);
+            const agents = Array.isArray(parsed) ? parsed : (parsed.items || []);
+            if (!agents.length) {
+              return reject(new Error('No agents returned from /api/agents'));
             }
             // Match by name (case-insensitive)
             const match = agents.find(
