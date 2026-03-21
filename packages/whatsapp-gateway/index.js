@@ -663,7 +663,10 @@ async function startConnection() {
         let messageToSend;
         let systemPrefix = '';
 
-        if (isStranger) {
+        if (isGroup) {
+          // Groups: never inject stranger/relay context — just forward the plain message
+          messageToSend = messageText;
+        } else if (isStranger) {
           // Step C: Inject stranger context prefix (factual only)
           const strangerContext = buildStrangerContext(pushName, phone, sender);
           messageToSend = strangerContext + messageText;
@@ -712,8 +715,8 @@ async function startConnection() {
               console.log(`[gateway] NOTIFY_OWNER sent for ${pushName}: ${notif.reason}`);
             }
 
-          } else if (isOwner) {
-            // Step E: Check for relay commands in the agent response
+          } else if (isOwner && !isGroup) {
+            // Step E: Check for relay commands in the agent response (DMs only, never groups)
             const { relays, cleanedText } = extractRelayCommands(response);
 
             // Execute any relay commands
