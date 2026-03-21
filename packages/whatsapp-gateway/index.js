@@ -199,6 +199,27 @@ setInterval(() => {
 }, 5 * 60 * 1000);
 
 // ---------------------------------------------------------------------------
+// Message deduplication — Baileys can deliver the same message multiple times
+// ---------------------------------------------------------------------------
+const recentMessageIds = new Map(); // Map<msgId, timestamp>
+const DEDUP_WINDOW_MS = 60_000; // 1 minute
+
+function isDuplicate(msgId) {
+  if (!msgId) return false;
+  if (recentMessageIds.has(msgId)) return true;
+  recentMessageIds.set(msgId, Date.now());
+  return false;
+}
+
+// Cleanup dedup cache every 2 minutes
+setInterval(() => {
+  const now = Date.now();
+  for (const [id, ts] of recentMessageIds) {
+    if (now - ts > DEDUP_WINDOW_MS) recentMessageIds.delete(id);
+  }
+}, 2 * 60 * 1000);
+
+// ---------------------------------------------------------------------------
 // Step F: Escalation deduplication — debounce NOTIFY_OWNER per stranger
 // ---------------------------------------------------------------------------
 const lastEscalationTime = new Map(); // Map<stranger_jid, timestamp>
@@ -572,6 +593,12 @@ async function startConnection() {
       // Skip status broadcasts
       if (msg.key.remoteJid === 'status@broadcast') continue;
 
+      // Deduplication: skip if we've already processed this message ID
+      if (isDuplicate(msg.key.id)) {
+        console.log(`[gateway] Skipping duplicate message: ${msg.key.id}`);
+        continue;
+      }
+
       // Handle self-chat ("Notes to Self"): fromMe messages to own JID.
       if (msg.key.fromMe) {
         const isSelfChat = ownJid && msg.key.remoteJid === ownJid;
@@ -594,8 +621,17 @@ async function startConnection() {
 
       if (!text && !mediaDescriptor) continue;
 
-      // Extract phone number from JID
-      const phone = '+' + sender.replace(/@.*$/, '');
+      // Extract real phone number:
+      // - For @lid JIDs, use senderPn (the real phone number) if available
+      // - For @s.whatsapp.net JIDs, extract from the JID directly
+      const isLidJid = sender.endsWith('@lid');
+      const senderPn = msg.key.senderPn || msg.key.participant || '';
+      let phone;
+      if (isLidJid && senderPn) {
+        phone = '+' + senderPn.replace(/@.*$/, '');
+      } else {
+        phone = '+' + sender.replace(/@.*$/, '');
+      }
       const pushName = msg.pushName || phone;
 
       // Use text if available, otherwise use media descriptor
@@ -604,8 +640,10 @@ async function startConnection() {
       console.log(`[gateway] Incoming from ${pushName} (${phone}): ${messageText.substring(0, 80)}`);
 
       // Determine if this is from the owner or a stranger
+      // Check both the remoteJid AND senderPn against owner JIDs (handles @lid format)
       const isGroup = sender.endsWith('@g.us');
-      const isOwner = OWNER_JIDS.size > 0 && OWNER_JIDS.has(sender);
+      const senderPnJid = senderPn ? senderPn.replace(/@.*$/, '') + '@s.whatsapp.net' : '';
+      const isOwner = OWNER_JIDS.size > 0 && (OWNER_JIDS.has(sender) || (senderPnJid && OWNER_JIDS.has(senderPnJid)));
       const isStranger = !isGroup && OWNER_JIDS.size > 0 && !isOwner;
 
       // Bug fix: Rate limiting for strangers
