@@ -1452,9 +1452,39 @@ impl LibreFangKernel {
                         .scheduler
                         .register(agent_id, entry.manifest.resources.clone());
 
-                    // Re-register in the in-memory registry (set state back to Running)
+                    // Re-register in the in-memory registry
                     let mut restored_entry = entry;
-                    restored_entry.state = AgentState::Running;
+
+                    // Check enabled flag — also do a direct TOML read as fallback
+                    let mut is_enabled = restored_entry.manifest.enabled;
+                    if is_enabled {
+                        // Double-check: read directly from hands/agents TOML in case DB is stale
+                        for dir in &["agents", "hands"] {
+                            let check_path = kernel
+                                .config
+                                .home_dir
+                                .join(dir)
+                                .join(&name)
+                                .join("agent.toml");
+                            if check_path.exists() {
+                                if let Ok(content) = std::fs::read_to_string(&check_path) {
+                                    if content.contains("enabled = false")
+                                        || content.contains("enabled=false")
+                                    {
+                                        is_enabled = false;
+                                        restored_entry.manifest.enabled = false;
+                                    }
+                                }
+                                break;
+                            }
+                        }
+                    }
+                    if is_enabled {
+                        restored_entry.state = AgentState::Running;
+                    } else {
+                        restored_entry.state = AgentState::Suspended;
+                        info!(agent = %name, "Agent disabled in config — starting as Suspended");
+                    }
 
                     // Inherit kernel exec_policy for agents that lack one
                     if restored_entry.manifest.exec_policy.is_none() {
@@ -1959,6 +1989,12 @@ system_prompt = "You are a helpful assistant."
         let entry = self.registry.get(agent_id).ok_or_else(|| {
             KernelError::LibreFang(LibreFangError::AgentNotFound(agent_id.to_string()))
         })?;
+
+        // Skip suspended agents — cron/triggers should not dispatch to them
+        if entry.state == AgentState::Suspended {
+            tracing::debug!(agent_id = %agent_id, "Skipping message to suspended agent");
+            return Ok(AgentLoopResult::default());
+        }
 
         // Dispatch based on module type
         let result = match entry.manifest.module.as_str() {
@@ -3927,6 +3963,85 @@ system_prompt = "You are a helpful assistant."
         }
     }
 
+    /// Suspend an agent — sets state to Suspended, persists enabled=false to TOML.
+    pub fn suspend_agent(&self, agent_id: AgentId) -> KernelResult<()> {
+        use librefang_types::agent::AgentState;
+        let entry = self.registry.get(agent_id).ok_or_else(|| {
+            KernelError::LibreFang(LibreFangError::AgentNotFound(agent_id.to_string()))
+        })?;
+        let _ = self.registry.set_state(agent_id, AgentState::Suspended);
+        // Also stop any active run
+        if let Some((_, handle)) = self.running_tasks.remove(&agent_id) {
+            handle.abort();
+        }
+        // Persist enabled=false to agent.toml
+        self.persist_agent_enabled(agent_id, &entry.name, false);
+        info!(agent_id = %agent_id, "Agent suspended");
+        Ok(())
+    }
+
+    /// Resume a suspended agent — sets state back to Running, persists enabled=true.
+    pub fn resume_agent(&self, agent_id: AgentId) -> KernelResult<()> {
+        use librefang_types::agent::AgentState;
+        let entry = self.registry.get(agent_id).ok_or_else(|| {
+            KernelError::LibreFang(LibreFangError::AgentNotFound(agent_id.to_string()))
+        })?;
+        let _ = self.registry.set_state(agent_id, AgentState::Running);
+        // Persist enabled=true to agent.toml
+        self.persist_agent_enabled(agent_id, &entry.name, true);
+        info!(agent_id = %agent_id, "Agent resumed");
+        Ok(())
+    }
+
+    /// Write enabled flag to agent's TOML file.
+    fn persist_agent_enabled(&self, _agent_id: AgentId, name: &str, enabled: bool) {
+        // Check both agents/ and hands/ directories
+        let agents_path = self
+            .config
+            .home_dir
+            .join("agents")
+            .join(name)
+            .join("agent.toml");
+        let hands_path = self
+            .config
+            .home_dir
+            .join("hands")
+            .join(name)
+            .join("agent.toml");
+        let toml_path = if agents_path.exists() {
+            agents_path
+        } else if hands_path.exists() {
+            hands_path
+        } else {
+            return;
+        };
+        match std::fs::read_to_string(&toml_path) {
+            Ok(content) => {
+                // Simple: replace or append enabled field
+                let new_content = if content.contains("enabled =") || content.contains("enabled=") {
+                    content
+                        .lines()
+                        .map(|line| {
+                            if line.trim_start().starts_with("enabled") && line.contains('=') {
+                                format!("enabled = {enabled}")
+                            } else {
+                                line.to_string()
+                            }
+                        })
+                        .collect::<Vec<_>>()
+                        .join("\n")
+                } else {
+                    // Append after [agent] section or at end
+                    format!("{content}\nenabled = {enabled}\n")
+                };
+                if let Err(e) = std::fs::write(&toml_path, new_content) {
+                    warn!("Failed to persist enabled={enabled} for {name}: {e}");
+                }
+            }
+            Err(e) => warn!("Failed to read agent TOML for {name}: {e}"),
+        }
+    }
+
     /// Compact an agent's session using LLM-based summarization.
     ///
     /// Replaces the existing text-truncation compaction with an intelligent
@@ -4168,6 +4283,18 @@ system_prompt = "You are a helpful assistant."
         } else {
             def.agent.model.clone()
         };
+        // When using default provider, also inherit the default api_key_env and base_url
+        let hand_api_key_env = if def.agent.provider == "default" && def.agent.api_key_env.is_none()
+        {
+            Some(self.config.default_model.api_key_env.clone())
+        } else {
+            def.agent.api_key_env.clone()
+        };
+        let hand_base_url = if def.agent.provider == "default" && def.agent.base_url.is_none() {
+            self.config.default_model.base_url.clone()
+        } else {
+            def.agent.base_url.clone()
+        };
 
         let mut manifest = AgentManifest {
             name: def.agent.name.clone(),
@@ -4179,8 +4306,8 @@ system_prompt = "You are a helpful assistant."
                 max_tokens: def.agent.max_tokens,
                 temperature: def.agent.temperature,
                 system_prompt: def.agent.system_prompt.clone(),
-                api_key_env: def.agent.api_key_env.clone(),
-                base_url: def.agent.base_url.clone(),
+                api_key_env: hand_api_key_env,
+                base_url: hand_base_url,
             },
             capabilities: ManifestCapabilities {
                 tools: def.tools.clone(),
@@ -4729,6 +4856,23 @@ system_prompt = "You are a helpful assistant."
         if !saved_hands.is_empty() {
             info!("Restoring {} persisted hand(s)", saved_hands.len());
             for (hand_id, config, old_agent_id) in saved_hands {
+                // Check if hand's agent.toml has enabled=false — skip reactivation
+                let hand_agent_name = format!("{}-hand", hand_id);
+                let hand_toml = self
+                    .config
+                    .home_dir
+                    .join("hands")
+                    .join(&hand_agent_name)
+                    .join("agent.toml");
+                if hand_toml.exists() {
+                    if let Ok(content) = std::fs::read_to_string(&hand_toml) {
+                        if content.contains("enabled = false") || content.contains("enabled=false")
+                        {
+                            info!(hand = %hand_id, "Hand disabled in config — skipping reactivation");
+                            continue;
+                        }
+                    }
+                }
                 match self.activate_hand(&hand_id, config) {
                     Ok(inst) => {
                         info!(hand = %hand_id, instance = %inst.instance_id, "Hand restored");
