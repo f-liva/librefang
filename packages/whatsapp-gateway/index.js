@@ -489,7 +489,7 @@ async function startConnection() {
     version,
     auth: state,
     logger,
-    printQRInTerminal: true,
+    // printQRInTerminal removed (deprecated in Baileys v6+)
     browser: ['LibreFang', 'Desktop', '1.0.0'],
   });
 
