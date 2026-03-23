@@ -13,14 +13,15 @@ use std::sync::Mutex;
 use tracing::{info, warn};
 use uuid::Uuid;
 
-/// Entry from persisted hand state: (hand_id, config, old_agent_ids, status).
-pub type HandStateEntry = (
-    String,
-    HashMap<String, serde_json::Value>,
-    BTreeMap<String, AgentId>,
-    Option<String>,
-    HandStatus,
-);
+/// Entry from persisted hand state used during daemon restart.
+#[derive(Debug, Clone)]
+pub struct HandStateEntry {
+    pub hand_id: String,
+    pub config: HashMap<String, serde_json::Value>,
+    pub old_agent_ids: BTreeMap<String, AgentId>,
+    pub coordinator_role: Option<String>,
+    pub status: HandStatus,
+}
 
 // ─── Settings availability types ────────────────────────────────────────────
 
@@ -187,7 +188,13 @@ impl HandRegistry {
                     e.get("coordinator_role").and_then(|v| v.as_str()),
                 );
 
-                Some((hand_id, config, old_agent_ids, coordinator_role, status))
+                Some(HandStateEntry {
+                    hand_id,
+                    config,
+                    old_agent_ids,
+                    coordinator_role,
+                    status,
+                })
             })
             .collect()
     }
@@ -846,8 +853,8 @@ system_prompt = "Test prompt"
 
         let saved = HandRegistry::load_state(&state_path);
         assert_eq!(saved.len(), 1);
-        assert_eq!(saved[0].0, "clip");
-        assert!(matches!(saved[0].4, HandStatus::Paused));
+        assert_eq!(saved[0].hand_id, "clip");
+        assert!(matches!(saved[0].status, HandStatus::Paused));
     }
 
     #[test]
@@ -887,7 +894,7 @@ system_prompt = "Test prompt"
 
         let saved = HandRegistry::load_state(&state_path);
         assert_eq!(saved.len(), 1);
-        assert_eq!(saved[0].3.as_deref(), Some("planner"));
+        assert_eq!(saved[0].coordinator_role.as_deref(), Some("planner"));
     }
 
     #[test]
@@ -1064,8 +1071,8 @@ system_prompt = "Test prompt"
         let _ = std::fs::remove_file(&path);
 
         assert_eq!(restored.len(), 1);
-        assert_eq!(restored[0].0, "lead");
-        assert!(matches!(restored[0].4, HandStatus::Paused));
+        assert_eq!(restored[0].hand_id, "lead");
+        assert!(matches!(restored[0].status, HandStatus::Paused));
     }
 
     #[test]

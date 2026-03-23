@@ -5927,7 +5927,14 @@ system_prompt = "You are a helpful assistant."
         let saved_hands = librefang_hands::registry::HandRegistry::load_state(&state_path);
         if !saved_hands.is_empty() {
             info!("Restoring {} persisted hand(s)", saved_hands.len());
-            for (hand_id, config, old_agent_id, _coordinator_role, status) in saved_hands {
+            for saved_hand in saved_hands {
+                let hand_id = saved_hand.hand_id;
+                let config = saved_hand.config;
+                let old_agent_id = saved_hand.old_agent_ids;
+                let status = saved_hand.status;
+                // The persisted coordinator role is informational here.
+                // `activate_hand` always re-derives the coordinator from the
+                // latest hand definition before spawning agents.
                 // Check if hand's agent.toml has enabled=false — skip reactivation
                 let hand_agent_name = format!("{}-hand", hand_id);
                 let hand_toml = self
