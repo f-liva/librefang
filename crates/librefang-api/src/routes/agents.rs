@@ -139,7 +139,8 @@ pub fn router() -> axum::Router<std::sync::Arc<AppState>> {
         )
         .route(
             "/agents/{id}/upload",
-            axum::routing::post(upload_file),
+            axum::routing::post(upload_file)
+                .layer(axum::extract::DefaultBodyLimit::max(50 * 1024 * 1024)),
         )
         .route("/agents/{id}/ws", axum::routing::get(crate::ws::agent_ws))
         .route(
