@@ -70,6 +70,11 @@ describe('markdownToWhatsApp', () => {
     assert.equal(markdownToWhatsApp(undefined), undefined);
   });
 
+  it('does not corrupt stars inside bold placeholders (placeholder collision)', () => {
+    // **some *nested* text** should keep bold wrapper, not let italic regex match inside
+    assert.equal(markdownToWhatsApp('**some *nested* text**'), '*some *nested* text*');
+  });
+
   it('does not mangle plain text', () => {
     const plain = 'Just a normal message with no formatting.';
     assert.equal(markdownToWhatsApp(plain), plain);
