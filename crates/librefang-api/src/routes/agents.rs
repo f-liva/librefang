@@ -138,11 +138,13 @@ pub fn router() -> axum::Router<std::sync::Arc<AppState>> {
             axum::routing::get(get_agent_deliveries),
         )
         .route("/agents/{id}/ws", axum::routing::get(crate::ws::agent_ws))
-        // Upload route in a nested router so DefaultBodyLimit applies correctly
+        // Upload route: disable the global RequestBodyLimitLayer (1MB) so that
+        // large media files can reach the handler, which enforces its own
+        // configurable max_upload_size_bytes limit (default 10MB).
         .merge(
             axum::Router::new()
                 .route("/agents/{id}/upload", axum::routing::post(upload_file))
-                .layer(axum::extract::DefaultBodyLimit::max(50 * 1024 * 1024)),
+                .layer(axum::extract::DefaultBodyLimit::disable()),
         )
         .route(
             "/uploads/{file_id}",
