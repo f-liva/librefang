@@ -1711,6 +1711,14 @@ pub async fn send_message_stream(
             .into_response();
     }
 
+    // Resolve file attachments into image content blocks (same as non-streaming)
+    if !req.attachments.is_empty() {
+        let image_blocks = resolve_attachments(&req.attachments);
+        if !image_blocks.is_empty() {
+            inject_attachments_into_session(&state.kernel, agent_id, image_blocks);
+        }
+    }
+
     let kernel_handle: Arc<dyn KernelHandle> = state.kernel.clone() as Arc<dyn KernelHandle>;
     let (rx, _handle) = match state
         .kernel
