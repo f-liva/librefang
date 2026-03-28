@@ -252,12 +252,14 @@ function markdownToWhatsApp(text) {
   if (!text) return text;
   // Bold: **text** or __text__ → placeholder, then restore as *text* (WhatsApp bold)
   // Using placeholder avoids the italic regex from re-matching converted bold.
-  text = text.replace(/\*\*(.+?)\*\*/g, '\x01BOLD$1BOLD\x01');
-  text = text.replace(/__(.+?)__/g, '\x01BOLD$1BOLD\x01');
+  // Any literal `*` inside bold content is escaped to \x02 so the italic regex
+  // cannot match across placeholder boundaries, then restored after italic runs.
+  text = text.replace(/\*\*(.+?)\*\*/g, (_, inner) => '\x01BOLD' + inner.replace(/\*/g, '\x02') + 'BOLD\x01');
+  text = text.replace(/__(.+?)__/g, (_, inner) => '\x01BOLD' + inner.replace(/\*/g, '\x02') + 'BOLD\x01');
   // Italic: *text* → _text_ (WhatsApp italic) — only matches remaining single-star
   text = text.replace(/(?<!\*)\*(?!\*)(.+?)(?<!\*)\*(?!\*)/g, '_$1_');
-  // Restore bold placeholders → *text* (WhatsApp bold)
-  text = text.replace(/\x01BOLD(.+?)BOLD\x01/g, '*$1*');
+  // Restore bold placeholders → *text* (WhatsApp bold), and unescape \x02 → *
+  text = text.replace(/\x01BOLD(.+?)BOLD\x01/g, (_, inner) => '*' + inner.replace(/\x02/g, '*') + '*');
   // Strikethrough: ~~text~~ → ~text~
   text = text.replace(/~~(.+?)~~/g, '~$1~');
   // Inline code: `text` → ```text``` (WhatsApp monospace)
