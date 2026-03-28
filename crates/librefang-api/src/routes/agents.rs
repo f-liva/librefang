@@ -137,12 +137,13 @@ pub fn router() -> axum::Router<std::sync::Arc<AppState>> {
             "/agents/{id}/deliveries",
             axum::routing::get(get_agent_deliveries),
         )
-        .route(
-            "/agents/{id}/upload",
-            axum::routing::post(upload_file)
+        .route("/agents/{id}/ws", axum::routing::get(crate::ws::agent_ws))
+        // Upload route in a nested router so DefaultBodyLimit applies correctly
+        .merge(
+            axum::Router::new()
+                .route("/agents/{id}/upload", axum::routing::post(upload_file))
                 .layer(axum::extract::DefaultBodyLimit::max(50 * 1024 * 1024)),
         )
-        .route("/agents/{id}/ws", axum::routing::get(crate::ws::agent_ws))
         .route(
             "/uploads/{file_id}",
             axum::routing::get(serve_upload),
