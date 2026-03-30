@@ -52,7 +52,13 @@ const SENSITIVE_ENV_EXACT: &[&str] = &[
 const SENSITIVE_SUFFIXES: &[&str] = &["_SECRET", "_TOKEN", "_PASSWORD"];
 
 /// Default subprocess timeout in seconds (5 minutes).
+/// Used as the wall-clock timeout for non-streaming `complete()` calls.
 const DEFAULT_MESSAGE_TIMEOUT_SECS: u64 = 300;
+
+/// Default inactivity timeout for streaming calls (2 minutes).
+/// The timer resets every time the CLI produces output. A truly stuck process
+/// (no output for this long) is killed, but an active one can run indefinitely.
+const DEFAULT_INACTIVITY_TIMEOUT_SECS: u64 = 120;
 
 /// LLM driver that delegates to the Claude Code CLI.
 pub struct ClaudeCodeDriver {
@@ -61,8 +67,10 @@ pub struct ClaudeCodeDriver {
     /// Active subprocess PIDs keyed by a caller-provided label (e.g. agent name).
     /// Allows external code to check if a subprocess is running and kill it.
     active_pids: Arc<DashMap<String, u32>>,
-    /// Message timeout in seconds. CLI subprocesses that exceed this are killed.
+    /// Wall-clock timeout in seconds for non-streaming calls.
     message_timeout_secs: u64,
+    /// Inactivity timeout in seconds for streaming calls. Resets on each chunk.
+    inactivity_timeout_secs: u64,
 }
 
 impl ClaudeCodeDriver {
@@ -87,10 +95,11 @@ impl ClaudeCodeDriver {
             skip_permissions,
             active_pids: Arc::new(DashMap::new()),
             message_timeout_secs: DEFAULT_MESSAGE_TIMEOUT_SECS,
+            inactivity_timeout_secs: DEFAULT_INACTIVITY_TIMEOUT_SECS,
         }
     }
 
-    /// Create a new Claude Code driver with a custom timeout.
+    /// Create a new Claude Code driver with custom timeouts.
     pub fn with_timeout(
         cli_path: Option<String>,
         skip_permissions: bool,
@@ -99,6 +108,12 @@ impl ClaudeCodeDriver {
         let mut driver = Self::new(cli_path, skip_permissions);
         driver.message_timeout_secs = timeout_secs;
         driver
+    }
+
+    /// Set the inactivity timeout for streaming calls (seconds).
+    /// The timer resets every time the CLI produces output.
+    pub fn set_inactivity_timeout(&mut self, secs: u64) {
+        self.inactivity_timeout_secs = secs;
     }
 
     /// Get a snapshot of active subprocess PIDs.
@@ -602,83 +617,100 @@ impl LlmDriver for ClaudeCodeDriver {
             ..Default::default()
         };
 
-        let timeout_duration = std::time::Duration::from_secs(self.message_timeout_secs);
-        let stream_result = tokio::time::timeout(timeout_duration, async {
-            while let Ok(Some(line)) = lines.next_line().await {
-                if line.trim().is_empty() {
-                    continue;
-                }
+        // Inactivity-based timeout: reset the deadline every time we receive
+        // output.  A truly stuck process (no output for `inactivity_timeout_secs`)
+        // is killed, but an actively-producing task can run as long as it needs.
+        let inactivity = std::time::Duration::from_secs(self.inactivity_timeout_secs);
+        let mut timed_out = false;
 
-                match serde_json::from_str::<ClaudeStreamEvent>(&line) {
-                    Ok(event) => {
-                        match event.r#type.as_str() {
-                            "content" | "text" | "assistant" | "content_block_delta" => {
-                                if let Some(ref content) = event.content {
-                                    full_text.push_str(content);
-                                    let _ = tx
-                                        .send(StreamEvent::TextDelta {
-                                            text: content.clone(),
-                                        })
-                                        .await;
-                                }
-                            }
-                            "result" | "done" | "complete" => {
-                                if let Some(ref result) = event.result {
-                                    if full_text.is_empty() {
-                                        full_text = result.clone();
+        loop {
+            match tokio::time::timeout(inactivity, lines.next_line()).await {
+                Ok(Ok(Some(line))) => {
+                    // Got a line — process it, timeout resets automatically on next iteration
+                    if line.trim().is_empty() {
+                        continue;
+                    }
+
+                    match serde_json::from_str::<ClaudeStreamEvent>(&line) {
+                        Ok(event) => {
+                            match event.r#type.as_str() {
+                                "content" | "text" | "assistant" | "content_block_delta" => {
+                                    if let Some(ref content) = event.content {
+                                        full_text.push_str(content);
                                         let _ = tx
                                             .send(StreamEvent::TextDelta {
-                                                text: result.clone(),
+                                                text: content.clone(),
                                             })
                                             .await;
                                     }
                                 }
-                                if let Some(usage) = event.usage {
-                                    final_usage = TokenUsage {
-                                        input_tokens: usage.input_tokens,
-                                        output_tokens: usage.output_tokens,
-                                        ..Default::default()
-                                    };
+                                "result" | "done" | "complete" => {
+                                    if let Some(ref result) = event.result {
+                                        if full_text.is_empty() {
+                                            full_text = result.clone();
+                                            let _ = tx
+                                                .send(StreamEvent::TextDelta {
+                                                    text: result.clone(),
+                                                })
+                                                .await;
+                                        }
+                                    }
+                                    if let Some(usage) = event.usage {
+                                        final_usage = TokenUsage {
+                                            input_tokens: usage.input_tokens,
+                                            output_tokens: usage.output_tokens,
+                                            ..Default::default()
+                                        };
+                                    }
                                 }
-                            }
-                            _ => {
-                                // Unknown event type — try content field as fallback
-                                if let Some(ref content) = event.content {
-                                    full_text.push_str(content);
-                                    let _ = tx
-                                        .send(StreamEvent::TextDelta {
-                                            text: content.clone(),
-                                        })
-                                        .await;
+                                _ => {
+                                    // Unknown event type — try content field as fallback
+                                    if let Some(ref content) = event.content {
+                                        full_text.push_str(content);
+                                        let _ = tx
+                                            .send(StreamEvent::TextDelta {
+                                                text: content.clone(),
+                                            })
+                                            .await;
+                                    }
                                 }
                             }
                         }
-                    }
-                    Err(e) => {
-                        // Not valid JSON — treat as raw text
-                        warn!(line = %line, error = %e, "Non-JSON line from Claude CLI");
-                        full_text.push_str(&line);
-                        let _ = tx.send(StreamEvent::TextDelta { text: line }).await;
+                        Err(e) => {
+                            // Not valid JSON — treat as raw text
+                            warn!(line = %line, error = %e, "Non-JSON line from Claude CLI");
+                            full_text.push_str(&line);
+                            let _ = tx.send(StreamEvent::TextDelta { text: line }).await;
+                        }
                     }
                 }
+                Ok(Ok(None)) => break, // EOF — process finished
+                Ok(Err(e)) => {
+                    warn!(error = %e, "Error reading Claude CLI stdout");
+                    break;
+                }
+                Err(_) => {
+                    // Inactivity timeout — no output for `inactivity_timeout_secs`
+                    timed_out = true;
+                    break;
+                }
             }
-        })
-        .await;
+        }
 
         // Clear PID tracking
         self.active_pids.remove(&pid_label);
 
-        if stream_result.is_err() {
+        if timed_out {
             warn!(
-                timeout_secs = self.message_timeout_secs,
+                inactivity_timeout_secs = self.inactivity_timeout_secs,
                 model = %pid_label,
-                "Claude Code CLI streaming subprocess timed out, killing process"
+                "Claude Code CLI streaming subprocess timed out due to inactivity, killing process"
             );
             let _ = child.kill().await;
             prepared.cleanup();
             return Err(LlmError::Http(format!(
-                "Claude Code CLI streaming subprocess timed out after {}s — process killed",
-                self.message_timeout_secs
+                "Claude Code CLI streaming subprocess timed out after {}s of inactivity — process killed",
+                self.inactivity_timeout_secs
             )));
         }
 

@@ -675,10 +675,21 @@ fn create_driver_from_entry(
         ApiFormat::OpenAI => Ok(Arc::new(openai::OpenAIDriver::new(api_key, base_url))),
         ApiFormat::Anthropic => Ok(Arc::new(anthropic::AnthropicDriver::new(api_key, base_url))),
         ApiFormat::Gemini => Ok(Arc::new(gemini::GeminiDriver::new(api_key, base_url))),
-        ApiFormat::ClaudeCode => Ok(Arc::new(claude_code::ClaudeCodeDriver::new(
-            config.base_url.clone(),
-            config.skip_permissions,
-        ))),
+        ApiFormat::ClaudeCode => {
+            let mut driver = if let Some(timeout) = config.message_timeout_secs {
+                claude_code::ClaudeCodeDriver::with_timeout(
+                    config.base_url.clone(),
+                    config.skip_permissions,
+                    timeout,
+                )
+            } else {
+                claude_code::ClaudeCodeDriver::new(config.base_url.clone(), config.skip_permissions)
+            };
+            if let Some(inactivity) = config.inactivity_timeout_secs {
+                driver.set_inactivity_timeout(inactivity);
+            }
+            Ok(Arc::new(driver))
+        }
         ApiFormat::QwenCode => Ok(Arc::new(qwen_code::QwenCodeDriver::new(
             config.base_url.clone(),
             config.skip_permissions,
@@ -949,6 +960,7 @@ mod tests {
             vertex_ai: librefang_types::config::VertexAiConfig::default(),
             azure_openai: librefang_types::config::AzureOpenAiConfig::default(),
             skip_permissions: true,
+            ..Default::default()
         };
         let driver = create_driver(&config);
         assert!(driver.is_ok());
@@ -963,6 +975,7 @@ mod tests {
             vertex_ai: librefang_types::config::VertexAiConfig::default(),
             azure_openai: librefang_types::config::AzureOpenAiConfig::default(),
             skip_permissions: true,
+            ..Default::default()
         };
         let driver = create_driver(&config);
         assert!(driver.is_err());
@@ -1074,6 +1087,7 @@ mod tests {
             vertex_ai: librefang_types::config::VertexAiConfig::default(),
             azure_openai: librefang_types::config::AzureOpenAiConfig::default(),
             skip_permissions: true,
+            ..Default::default()
         };
         let driver = create_driver(&config);
         assert!(
@@ -1093,6 +1107,7 @@ mod tests {
             vertex_ai: librefang_types::config::VertexAiConfig::default(),
             azure_openai: librefang_types::config::AzureOpenAiConfig::default(),
             skip_permissions: true,
+            ..Default::default()
         };
         let driver = create_driver(&config);
         assert!(driver.is_err());
@@ -1114,6 +1129,7 @@ mod tests {
             vertex_ai: librefang_types::config::VertexAiConfig::default(),
             azure_openai: librefang_types::config::AzureOpenAiConfig::default(),
             skip_permissions: true,
+            ..Default::default()
         };
         let result = create_driver(&config);
         assert!(result.is_err());
@@ -1144,6 +1160,7 @@ mod tests {
             vertex_ai: librefang_types::config::VertexAiConfig::default(),
             azure_openai: librefang_types::config::AzureOpenAiConfig::default(),
             skip_permissions: true,
+            ..Default::default()
         };
         let driver = create_driver(&config);
         assert!(driver.is_ok());
@@ -1168,6 +1185,7 @@ mod tests {
             },
             azure_openai: librefang_types::config::AzureOpenAiConfig::default(),
             skip_permissions: true,
+            ..Default::default()
         };
 
         let driver = create_driver(&config);
@@ -1204,6 +1222,7 @@ mod tests {
                 api_version: Some("2024-02-01".to_string()),
             },
             skip_permissions: true,
+            ..Default::default()
         };
         let driver = create_driver(&config);
         assert!(
@@ -1221,6 +1240,7 @@ mod tests {
             vertex_ai: librefang_types::config::VertexAiConfig::default(),
             azure_openai: librefang_types::config::AzureOpenAiConfig::default(),
             skip_permissions: true,
+            ..Default::default()
         };
         // Clear any env var that might interfere
         std::env::remove_var("AZURE_OPENAI_ENDPOINT");
@@ -1247,6 +1267,7 @@ mod tests {
             vertex_ai: librefang_types::config::VertexAiConfig::default(),
             azure_openai: librefang_types::config::AzureOpenAiConfig::default(),
             skip_permissions: true,
+            ..Default::default()
         };
         let d1 = cache.get_or_create(&config).unwrap();
         let d2 = cache.get_or_create(&config).unwrap();
@@ -1264,6 +1285,7 @@ mod tests {
             vertex_ai: librefang_types::config::VertexAiConfig::default(),
             azure_openai: librefang_types::config::AzureOpenAiConfig::default(),
             skip_permissions: true,
+            ..Default::default()
         };
         let config_b = DriverConfig {
             provider: "ollama".to_string(),
@@ -1272,6 +1294,7 @@ mod tests {
             vertex_ai: librefang_types::config::VertexAiConfig::default(),
             azure_openai: librefang_types::config::AzureOpenAiConfig::default(),
             skip_permissions: true,
+            ..Default::default()
         };
         let d_a = cache.get_or_create(&config_a).unwrap();
         let d_b = cache.get_or_create(&config_b).unwrap();
@@ -1292,6 +1315,7 @@ mod tests {
             vertex_ai: librefang_types::config::VertexAiConfig::default(),
             azure_openai: librefang_types::config::AzureOpenAiConfig::default(),
             skip_permissions: true,
+            ..Default::default()
         };
         cache.get_or_create(&config).unwrap();
         assert_eq!(cache.len(), 1);

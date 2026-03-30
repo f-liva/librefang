@@ -291,6 +291,10 @@ fn start_stream_text_bridge(
 ) -> mpsc::Receiver<String> {
     let (tx, rx) = mpsc::channel::<String>(64);
 
+    // Clone tx so the error-monitoring task can send a user-visible error
+    // message through the same channel if the kernel task fails.
+    let error_tx = tx.clone();
+
     let bridge_handle = tokio::spawn(async move {
         // Buffer text per iteration. Some providers emit tool call syntax
         // as plain text (recovered by agent_loop later). We hold text until
@@ -338,8 +342,21 @@ fn start_stream_text_bridge(
 
     tokio::spawn(async move {
         match kernel_handle.await {
-            Err(e) => error!("Streaming kernel task panicked: {e}"),
-            Ok(Err(e)) => error!("Streaming kernel task returned error: {e}"),
+            Err(e) => {
+                error!("Streaming kernel task panicked: {e}");
+                let _ = error_tx
+                    .send("[Error: task failed unexpectedly. Please try again.]".to_string())
+                    .await;
+            }
+            Ok(Err(e)) => {
+                error!("Streaming kernel task returned error: {e}");
+                let msg = if e.to_string().contains("timed out") {
+                    "[Error: task timed out due to inactivity. The request may have been too complex — try breaking it into smaller steps.]".to_string()
+                } else {
+                    format!("[Error: {}]", safe_truncate_str(&e.to_string(), 200))
+                };
+                let _ = error_tx.send(msg).await;
+            }
             Ok(Ok(result)) => {
                 debug!(
                     input_tokens = result.total_usage.input_tokens,

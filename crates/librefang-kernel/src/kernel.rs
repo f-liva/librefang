@@ -1367,6 +1367,8 @@ impl LibreFangKernel {
             vertex_ai: config.vertex_ai.clone(),
             azure_openai: config.azure_openai.clone(),
             skip_permissions: true,
+            message_timeout_secs: None,
+            inactivity_timeout_secs: None,
         };
         // Primary driver failure is non-fatal: the dashboard should remain accessible
         // even if the LLM provider is misconfigured. Users can fix config via dashboard.
@@ -1400,6 +1402,8 @@ impl LibreFangKernel {
                     vertex_ai: config.vertex_ai.clone(),
                     azure_openai: config.azure_openai.clone(),
                     skip_permissions: true,
+                    message_timeout_secs: None,
+                    inactivity_timeout_secs: None,
                 };
                 match drivers::create_driver(&profile_config) {
                     Ok(profile_driver) => {
@@ -1458,6 +1462,8 @@ impl LibreFangKernel {
                             vertex_ai: config.vertex_ai.clone(),
                             azure_openai: config.azure_openai.clone(),
                             skip_permissions: true,
+                            message_timeout_secs: None,
+                            inactivity_timeout_secs: None,
                         };
                         match drivers::create_driver(&auto_config) {
                             Ok(d) => {
@@ -1506,6 +1512,8 @@ impl LibreFangKernel {
                 vertex_ai: config.vertex_ai.clone(),
                 azure_openai: config.azure_openai.clone(),
                 skip_permissions: true,
+                message_timeout_secs: None,
+                inactivity_timeout_secs: None,
             };
             match drivers::create_driver(&fb_config) {
                 Ok(d) => {
@@ -7538,6 +7546,8 @@ system_prompt = "You are a helpful assistant."
                 vertex_ai: self.config.vertex_ai.clone(),
                 azure_openai: self.config.azure_openai.clone(),
                 skip_permissions: true,
+                message_timeout_secs: None,
+                inactivity_timeout_secs: None,
             };
 
             match self.driver_cache.get_or_create(&driver_config) {
@@ -7616,6 +7626,8 @@ system_prompt = "You are a helpful assistant."
                     vertex_ai: self.config.vertex_ai.clone(),
                     azure_openai: self.config.azure_openai.clone(),
                     skip_permissions: true,
+                    message_timeout_secs: None,
+                    inactivity_timeout_secs: None,
                 };
                 match self.driver_cache.get_or_create(&config) {
                     Ok(d) => chain.push((d, fb.model.clone())),

@@ -201,10 +201,36 @@ pub struct DriverConfig {
     /// restricts what agents can do, making this safe.
     #[serde(default = "default_skip_permissions")]
     pub skip_permissions: bool,
+    /// Wall-clock timeout (seconds) for non-streaming CLI calls.
+    /// Defaults to 300 (5 minutes).  Only applies to CLI-based providers
+    /// (claude-code, qwen-code, gemini-cli).
+    #[serde(default)]
+    pub message_timeout_secs: Option<u64>,
+    /// Inactivity timeout (seconds) for streaming CLI calls.  The timer
+    /// resets every time the subprocess produces output.  A truly stuck
+    /// process is killed, but an actively-producing task can run as long as
+    /// it needs.  Defaults to 120 (2 minutes of silence).
+    #[serde(default)]
+    pub inactivity_timeout_secs: Option<u64>,
 }
 
 fn default_skip_permissions() -> bool {
     true
+}
+
+impl Default for DriverConfig {
+    fn default() -> Self {
+        Self {
+            provider: String::new(),
+            api_key: None,
+            base_url: None,
+            vertex_ai: VertexAiConfig::default(),
+            azure_openai: AzureOpenAiConfig::default(),
+            skip_permissions: default_skip_permissions(),
+            message_timeout_secs: None,
+            inactivity_timeout_secs: None,
+        }
+    }
 }
 
 /// SECURITY: Custom Debug impl redacts the API key.
