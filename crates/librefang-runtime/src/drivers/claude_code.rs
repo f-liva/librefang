@@ -63,6 +63,9 @@ pub struct ClaudeCodeDriver {
     active_pids: Arc<DashMap<String, u32>>,
     /// Message timeout in seconds. CLI subprocesses that exceed this are killed.
     message_timeout_secs: u64,
+    /// Optional profile config directory.  When set, every spawned CLI process
+    /// gets `CLAUDE_CONFIG_DIR=<path>` so it uses that profile's credentials.
+    config_dir: Option<std::path::PathBuf>,
 }
 
 impl ClaudeCodeDriver {
@@ -87,7 +90,14 @@ impl ClaudeCodeDriver {
             skip_permissions,
             active_pids: Arc::new(DashMap::new()),
             message_timeout_secs: DEFAULT_MESSAGE_TIMEOUT_SECS,
+            config_dir: None,
         }
+    }
+
+    /// Set the profile config directory (`CLAUDE_CONFIG_DIR`).
+    pub fn with_config_dir(mut self, dir: std::path::PathBuf) -> Self {
+        self.config_dir = Some(dir);
+        self
     }
 
     /// Create a new Claude Code driver with a custom timeout.
@@ -373,6 +383,9 @@ impl LlmDriver for ClaudeCodeDriver {
         }
 
         Self::apply_env_filter(&mut cmd);
+        if let Some(ref dir) = self.config_dir {
+            cmd.env("CLAUDE_CONFIG_DIR", dir);
+        }
 
         cmd.stdout(std::process::Stdio::piped());
         cmd.stderr(std::process::Stdio::piped());
@@ -580,6 +593,9 @@ impl LlmDriver for ClaudeCodeDriver {
         }
 
         Self::apply_env_filter(&mut cmd);
+        if let Some(ref dir) = self.config_dir {
+            cmd.env("CLAUDE_CONFIG_DIR", dir);
+        }
 
         cmd.stdout(std::process::Stdio::piped());
         cmd.stderr(std::process::Stdio::piped());
