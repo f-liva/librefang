@@ -2951,6 +2951,12 @@ pub struct DefaultModelConfig {
     /// many seconds of silence on stdout, not wall-clock time.
     #[serde(default = "default_message_timeout_secs")]
     pub message_timeout_secs: u64,
+    /// CLI profile directories for token rotation (Claude Code only).
+    /// Each path is a `CLAUDE_CONFIG_DIR` value with its own OAuth credentials.
+    /// On rate-limit the driver rotates to the next profile.
+    /// Example: `["~/.claude", "~/.claude-profiles/account-2"]`
+    #[serde(default)]
+    pub profiles: Vec<String>,
 }
 
 fn default_message_timeout_secs() -> u64 {
@@ -2965,6 +2971,7 @@ impl Default for DefaultModelConfig {
             api_key_env: String::new(),
             base_url: None,
             message_timeout_secs: default_message_timeout_secs(),
+            profiles: Vec::new(),
         }
     }
 }
