@@ -1247,6 +1247,7 @@ mod tests {
             thinking: None,
             prompt_caching: false,
             response_format: None,
+            timeout_secs: None,
         };
 
         let tools = convert_tools(&request);
@@ -1267,6 +1268,7 @@ mod tests {
             thinking: None,
             prompt_caching: false,
             response_format: None,
+            timeout_secs: None,
         };
 
         let tools = convert_tools(&request);

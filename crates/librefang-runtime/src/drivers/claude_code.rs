@@ -408,7 +408,9 @@ impl LlmDriver for ClaudeCodeDriver {
         });
 
         // Wait with timeout
-        let timeout_duration = std::time::Duration::from_secs(self.message_timeout_secs);
+        let timeout_duration = std::time::Duration::from_secs(
+            request.timeout_secs.unwrap_or(self.message_timeout_secs),
+        );
         let wait_result = tokio::time::timeout(timeout_duration, child.wait()).await;
 
         // Clear PID tracking regardless of outcome
@@ -602,20 +604,60 @@ impl LlmDriver for ClaudeCodeDriver {
             ..Default::default()
         };
 
-        // Per-line inactivity timeout: each next_line() call must produce
-        // output within the timeout window. This prevents killing long-running
-        // but actively-streaming responses while still catching hung processes.
-        let inactivity_dur = std::time::Duration::from_secs(self.message_timeout_secs);
+        // Track last known activity for timeout diagnostics
+        let mut last_activity = "starting".to_string();
+
+        // Progressive inactivity timeout with three escalation levels:
+        //   1. warn  (20% of timeout) — log warning, internal only
+        //   2. notify (40% of timeout) — send "still working..." to user
+        //   3. kill  (100% of timeout) — kill process, preserve partial output
+        // The timer resets every time the CLI produces output.
+        let kill_secs = request.timeout_secs.unwrap_or(self.message_timeout_secs);
+        let warn_secs = kill_secs / 5;
+        let notify_secs = kill_secs * 2 / 5;
+
+        let mut last_output = tokio::time::Instant::now();
+        let mut warned = false;
+        let mut notified = false;
+
         let stream_err: Option<LlmError> = loop {
-            match tokio::time::timeout(inactivity_dur, lines.next_line()).await {
+            let elapsed = last_output.elapsed().as_secs();
+            let next_deadline_secs = if !warned {
+                warn_secs.saturating_sub(elapsed)
+            } else if !notified {
+                notify_secs.saturating_sub(elapsed)
+            } else {
+                kill_secs.saturating_sub(elapsed)
+            };
+            let deadline = std::time::Duration::from_secs(next_deadline_secs.max(1));
+
+            match tokio::time::timeout(deadline, lines.next_line()).await {
                 Ok(Ok(Some(line))) => {
+                    last_output = tokio::time::Instant::now();
+                    warned = false;
+                    notified = false;
+
                     if line.trim().is_empty() {
                         continue;
                     }
 
                     match serde_json::from_str::<ClaudeStreamEvent>(&line) {
                         Ok(event) => {
-                            match event.r#type.as_str() {
+                            // Track last activity for timeout diagnostics
+                            let etype = event.r#type.as_str();
+                            if etype.contains("tool") {
+                                // e.g. "tool_use", "tool_result" — extract tool name from content
+                                last_activity = event
+                                    .content
+                                    .as_deref()
+                                    .and_then(|c| c.get(..80))
+                                    .map(|s| format!("tool: {s}"))
+                                    .unwrap_or_else(|| format!("event: {etype}"));
+                            } else if !etype.is_empty() {
+                                last_activity = format!("event: {etype}");
+                            }
+
+                            match etype {
                                 "content" | "text" | "assistant" | "content_block_delta" => {
                                     if let Some(ref content) = event.content {
                                         full_text.push_str(content);
@@ -646,7 +688,6 @@ impl LlmDriver for ClaudeCodeDriver {
                                     }
                                 }
                                 _ => {
-                                    // Unknown event type — try content field as fallback
                                     if let Some(ref content) = event.content {
                                         full_text.push_str(content);
                                         let _ = tx
@@ -659,31 +700,49 @@ impl LlmDriver for ClaudeCodeDriver {
                             }
                         }
                         Err(e) => {
-                            // Not valid JSON — treat as raw text
                             warn!(line = %line, error = %e, "Non-JSON line from Claude CLI");
                             full_text.push_str(&line);
                             let _ = tx.send(StreamEvent::TextDelta { text: line }).await;
                         }
                     }
                 }
-                Ok(Ok(None)) => break None, // EOF — stream finished normally
+                Ok(Ok(None)) => break None,
                 Ok(Err(e)) => {
                     warn!(error = %e, "Claude Code CLI stream IO error");
                     break None;
                 }
                 Err(_) => {
-                    // Inactivity timeout — no output for message_timeout_secs
-                    warn!(
-                        timeout_secs = self.message_timeout_secs,
-                        model = %pid_label,
-                        "Claude Code CLI streaming subprocess timed out after {}s of inactivity — process killed",
-                        self.message_timeout_secs
-                    );
-                    let _ = child.kill().await;
-                    break Some(LlmError::Http(format!(
-                        "Claude Code CLI streaming subprocess timed out after {}s of inactivity — process killed",
-                        self.message_timeout_secs
-                    )));
+                    let silent_secs = last_output.elapsed().as_secs();
+                    if !warned {
+                        warned = true;
+                        warn!(silent_secs, model = %pid_label, "Claude CLI: no output, monitoring");
+                    } else if !notified {
+                        notified = true;
+                        info!(silent_secs, model = %pid_label, "Claude CLI: notifying user of long-running task");
+                        let _ = tx
+                            .send(StreamEvent::PhaseChange {
+                                phase: "long_running".to_string(),
+                                detail: Some(format!(
+                                    "No output for {silent_secs}s — task is still running..."
+                                )),
+                            })
+                            .await;
+                    } else {
+                        let partial_len = full_text.len();
+                        warn!(
+                            timeout_secs = kill_secs,
+                            partial_output_chars = partial_len,
+                            model = %pid_label,
+                            "Claude CLI streaming timed out due to inactivity, killing process"
+                        );
+                        let _ = child.kill().await;
+                        break Some(LlmError::TimedOut {
+                            inactivity_secs: kill_secs,
+                            partial_text_len: partial_len,
+                            partial_text: std::mem::take(&mut full_text),
+                            last_activity: last_activity.clone(),
+                        });
+                    }
                 }
             }
         };
@@ -807,6 +866,7 @@ mod tests {
             thinking: None,
             prompt_caching: false,
             response_format: None,
+            timeout_secs: None,
         };
 
         let prompt = ClaudeCodeDriver::build_prompt(&request);
@@ -847,6 +907,7 @@ mod tests {
             thinking: None,
             prompt_caching: false,
             response_format: None,
+            timeout_secs: None,
         };
 
         let prompt = ClaudeCodeDriver::build_prompt(&request);

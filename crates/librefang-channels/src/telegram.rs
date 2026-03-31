@@ -53,6 +53,8 @@ pub struct TelegramAdapter {
     long_poll_timeout: u64,
     shutdown_tx: Arc<watch::Sender<bool>>,
     shutdown_rx: watch::Receiver<bool>,
+    /// When true, remove the reaction on Done instead of showing 🎉.
+    clear_done_reaction: bool,
 }
 
 impl TelegramAdapter {
@@ -86,7 +88,15 @@ impl TelegramAdapter {
             long_poll_timeout: 30,
             shutdown_tx: Arc::new(shutdown_tx),
             shutdown_rx,
+            clear_done_reaction: false,
         }
+    }
+
+    /// When enabled, the Done reaction is removed (cleared) instead of
+    /// showing a completion emoji.  Returns self for builder chaining.
+    pub fn with_clear_done_reaction(mut self, clear: bool) -> Self {
+        self.clear_done_reaction = clear;
+        self
     }
 
     /// Set backoff and long-poll timeout configuration. Returns self for builder chaining.
@@ -605,6 +615,25 @@ impl TelegramAdapter {
             "message_id": message_id,
             "reaction": [{"type": "emoji", "emoji": emoji}],
         });
+        self.fire_reaction_body(url, body);
+    }
+
+    /// Remove all bot reactions from a message.
+    fn clear_reactions(&self, chat_id: i64, message_id: i64) {
+        let url = format!(
+            "{}/bot{}/setMessageReaction",
+            self.api_base_url,
+            self.token.as_str()
+        );
+        let body = serde_json::json!({
+            "chat_id": chat_id,
+            "message_id": message_id,
+            "reaction": [],
+        });
+        self.fire_reaction_body(url, body);
+    }
+
+    fn fire_reaction_body(&self, url: String, body: serde_json::Value) {
         let client = self.client.clone();
         tokio::spawn(async move {
             match client.post(&url).json(&body).send().await {
@@ -1009,7 +1038,23 @@ impl ChannelAdapter for TelegramAdapter {
         let msg_id: i64 = message_id
             .parse()
             .map_err(|_| format!("Invalid Telegram message_id: {message_id}"))?;
-        self.fire_reaction(chat_id, msg_id, &reaction.emoji);
+        // Telegram only supports a limited set of reaction emoji.
+        // Map unsupported ones to the closest Telegram-compatible alternative.
+        let emoji = match reaction.emoji.as_str() {
+            "\u{23F3}" => "\u{1F440}",        // ⏳ → 👀
+            "\u{2699}\u{FE0F}" => "\u{26A1}", // ⚙️ → ⚡
+            "\u{2705}" => "\u{1F389}",        // ✅ → 🎉
+            "\u{274C}" => "\u{1F44E}",        // ❌ → 👎
+            other => other,                   // 🤔, ✍️ etc. pass through
+        };
+
+        // Optionally clear the reaction on completion instead of showing 🎉.
+        let is_done = reaction.emoji == "\u{2705}"; // ✅
+        if is_done && self.clear_done_reaction {
+            self.clear_reactions(chat_id, msg_id);
+        } else {
+            self.fire_reaction(chat_id, msg_id, emoji);
+        }
         Ok(())
     }
 

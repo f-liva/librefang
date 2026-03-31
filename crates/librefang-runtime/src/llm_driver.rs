@@ -47,6 +47,15 @@ pub enum LlmError {
     /// Model not found.
     #[error("Model not found: {0}")]
     ModelNotFound(String),
+    /// Subprocess timed out due to inactivity, but partial output was captured.
+    #[error("Timed out after {inactivity_secs}s of inactivity (last: {last_activity}, {partial_text_len} chars partial output)")]
+    TimedOut {
+        inactivity_secs: u64,
+        partial_text: String,
+        partial_text_len: usize,
+        /// Last known activity before the process stalled.
+        last_activity: String,
+    },
 }
 
 /// A request to an LLM for completion.
@@ -78,6 +87,10 @@ pub struct CompletionRequest {
     /// When set, instructs the LLM to return output in the specified format.
     /// `None` preserves the default free-form text behaviour.
     pub response_format: Option<ResponseFormat>,
+    /// Per-request timeout override (seconds).  When set, the CLI driver uses
+    /// this instead of the global `message_timeout_secs`.  Allows the agent
+    /// loop to grant longer timeouts for requests that involve browser tools.
+    pub timeout_secs: Option<u64>,
 }
 
 /// A response from an LLM completion.
@@ -345,6 +358,7 @@ mod tests {
             thinking: None,
             prompt_caching: false,
             response_format: None,
+            timeout_secs: None,
         };
 
         let response = driver.stream(request, tx).await.unwrap();

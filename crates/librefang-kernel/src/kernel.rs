@@ -3856,6 +3856,7 @@ system_prompt = "You are a helpful assistant."
             thinking: None,
             prompt_caching: false,
             response_format: None,
+            timeout_secs: None,
         };
 
         let result = match tokio::time::timeout(
@@ -4341,6 +4342,7 @@ system_prompt = "You are a helpful assistant."
                 thinking: None,
                 prompt_caching: false,
                 response_format: None,
+                timeout_secs: None,
             };
             let (complexity, routed_model) = router.select_model(&probe);
             // Check if the routed model's provider has a valid API key.
