@@ -1042,7 +1042,25 @@ async function startConnection() {
 
         const rawResponse = await forwardToLibreFangStreaming(
           messageToSend, systemPrefix, phone, pushName, isOwner, attachments, onProgress,
+          { isGroup, wasMentioned },
         );
+        // Safety net: suppress NO_REPLY tokens that leaked through any path
+        const isNoReply = !rawResponse || /(?:^|\n)\s*NO_REPLY\s*$/.test(rawResponse.trim());
+        if (isNoReply) {
+          // Delete the streamed message if one was sent during accumulation
+          if (streamMsgKey && sock) {
+            try {
+              await sock.sendMessage(sender, { delete: streamMsgKey });
+              console.log(`[gateway] Deleted streamed NO_REPLY message in ${isGroup ? 'group' : 'DM'}`);
+            } catch (e) {
+              console.warn(`[gateway] Failed to delete NO_REPLY stream msg: ${e.message}`);
+            }
+          }
+          console.log(`[gateway] Suppressed NO_REPLY for ${pushName} (${sender})`);
+          dbMarkProcessed(msg.key.id, 1);
+          continue;
+        }
+
         const response = markdownToWhatsApp(rawResponse);
 
         // Helper: send a new message or edit the streamed one for final delivery
@@ -1526,6 +1544,11 @@ async function forwardToLibreFang(text, systemPrefix, phone, pushName, isOwner, 
 
           try {
             const data = JSON.parse(body);
+            // Silent completion — agent chose not to reply
+            if (data.silent) {
+              resolve('');
+              return;
+            }
             // The /api/agents/{id}/message endpoint returns { response: "..." }
             resolve(data.response || data.message || data.text || '');
           } catch {
@@ -1568,7 +1591,7 @@ const STREAMING_EDIT_INTERVAL_MS = 2000;
  * @param {(text: string) => Promise<void>} onProgress
  * @returns {Promise<string>} complete response
  */
-async function forwardToLibreFangStreaming(text, systemPrefix, phone, pushName, isOwner, attachments, onProgress) {
+async function forwardToLibreFangStreaming(text, systemPrefix, phone, pushName, isOwner, attachments, onProgress, { isGroup = false, wasMentioned = false } = {}) {
   // Resolve agent UUID if not cached
   if (!cachedAgentId) {
     try {
@@ -1586,6 +1609,8 @@ async function forwardToLibreFangStreaming(text, systemPrefix, phone, pushName, 
     channel_type: 'whatsapp',
     sender_id: phone,
     sender_name: pushName,
+    is_group: isGroup,
+    was_mentioned: wasMentioned,
   };
 
   if (attachments && attachments.length > 0) {
@@ -1688,12 +1713,27 @@ async function forwardToLibreFangStreaming(text, systemPrefix, phone, pushName, 
               } catch { /* ignore malformed JSON */ }
             }
             // 'done' event → stream is over, handled by res.on('end')
+            // 'silent_complete' → agent chose NO_REPLY, suppress the response
+            if (eventType === 'silent_complete' || eventType === 'done') {
+              try {
+                const parsed = JSON.parse(dataStr);
+                if (parsed.silent || parsed.type === 'silent_complete') {
+                  accumulated = ''; // wipe any partial text
+                }
+              } catch { /* ignore */ }
+            }
           }
         });
 
         res.on('end', () => {
           clearTimeout(pendingEdit);
-          resolve(accumulated);
+          // Safety net: strip NO_REPLY token if it leaked through streaming
+          const trimmed = accumulated.trim();
+          if (trimmed === 'NO_REPLY' || trimmed.endsWith('\nNO_REPLY') || trimmed.endsWith('\n\nNO_REPLY')) {
+            resolve('');
+          } else {
+            resolve(accumulated);
+          }
         });
 
         res.on('error', (err) => {
@@ -1761,8 +1801,9 @@ async function runCatchUpSweep() {
       dbMarkProcessed(msg.id, 1);
       console.log(`[gateway][catchup] Re-forwarded message ${msg.id} from ${msg.push_name || msg.jid}`);
 
-      // If there's a response, try to send it back (strangers and groups)
-      if (response && !isOwner && msg.jid) {
+      // If there's a response (and not a NO_REPLY), try to send it back
+      const catchupNoReply = !response || /(?:^|\n)\s*NO_REPLY\s*$/.test(response.trim());
+      if (response && !catchupNoReply && !isOwner && msg.jid) {
         try {
           const formatted = markdownToWhatsApp(response);
           await sock.sendMessage(msg.jid, { text: formatted });
