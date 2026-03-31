@@ -1692,6 +1692,43 @@ impl LibreFangKernel {
             }
         }
 
+        // CLI profile rotation (Claude Code): create one driver per profile
+        // directory, wrapped in TokenRotationDriver for automatic failover.
+        if driver_chain.is_empty() && !config.default_model.profiles.is_empty() {
+            let profiles = &config.default_model.profiles;
+            let mut profile_drivers: Vec<(Arc<dyn LlmDriver>, String)> = Vec::new();
+            for (i, profile_path) in profiles.iter().enumerate() {
+                let dir = if let Some(rest) = profile_path.strip_prefix("~/") {
+                    dirs::home_dir()
+                        .map(|h| h.join(rest))
+                        .unwrap_or_else(|| std::path::PathBuf::from(profile_path))
+                } else {
+                    std::path::PathBuf::from(profile_path)
+                };
+                let d = drivers::claude_code::ClaudeCodeDriver::with_timeout(
+                    config.default_model.base_url.clone(),
+                    true, // skip_permissions — daemon mode
+                    config.default_model.message_timeout_secs,
+                )
+                .with_config_dir(dir);
+                let name = format!("profile-{}", i + 1);
+                profile_drivers.push((Arc::new(d), name));
+            }
+            if profile_drivers.len() > 1 {
+                info!(
+                    pool_size = profile_drivers.len(),
+                    "Claude Code CLI profile rotation enabled"
+                );
+                let rotation = drivers::token_rotation::TokenRotationDriver::new(
+                    profile_drivers,
+                    config.default_model.provider.clone(),
+                );
+                driver_chain.push(Arc::new(rotation));
+            } else if let Some((d, _)) = profile_drivers.pop() {
+                driver_chain.push(d);
+            }
+        }
+
         if driver_chain.is_empty() {
             match &primary_result {
                 Ok(d) => driver_chain.push(d.clone()),

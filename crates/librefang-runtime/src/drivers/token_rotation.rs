@@ -91,6 +91,14 @@ impl TokenRotationDriver {
             if *status == 429
                 || *status == 402
                 || (*status == 403 && !message.to_lowercase().contains("invalid api key"))
+                // CLI-based providers (Claude Code) exit with code 1 and
+                // include "hit your limit" in the message on rate-limit.
+                || {
+                    let lower = message.to_lowercase();
+                    lower.contains("hit your limit")
+                        || lower.contains("rate limit")
+                        || lower.contains("too many requests")
+                }
         )
     }
 
