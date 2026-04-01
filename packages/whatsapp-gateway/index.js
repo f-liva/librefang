@@ -1636,7 +1636,7 @@ async function forwardToLibreFangStreaming(text, systemPrefix, phone, pushName, 
           res.on('data', (chunk) => (body += chunk));
           res.on('end', () => {
             console.warn(`[gateway] SSE endpoint returned ${res.statusCode}, falling back to non-streaming`);
-            forwardToLibreFang(text, systemPrefix, phone, pushName, isOwner, attachments)
+            forwardToLibreFang(text, systemPrefix, phone, pushName, isOwner, attachments, { isGroup, wasMentioned })
               .then(resolve)
               .catch(reject);
           });
@@ -1670,6 +1670,9 @@ async function forwardToLibreFangStreaming(text, systemPrefix, phone, pushName, 
               try {
                 const parsed = JSON.parse(dataStr);
                 if (parsed.phase === 'long_running' && onProgress) {
+                  // Don't send phase updates if accumulated text is NO_REPLY
+                  const accTrim = accumulated.trim();
+                  if (/(?:^|\n)\s*NO_REPLY\s*$/.test(accTrim) || accTrim === 'NO_REPLY') continue;
                   const status = parsed.detail || 'Still working...';
                   const display = accumulated ? accumulated + '\n\n[' + status + ']' : '[' + status + ']';
                   onProgress(display).catch(() => {});
@@ -1717,7 +1720,7 @@ async function forwardToLibreFangStreaming(text, systemPrefix, phone, pushName, 
         res.on('error', (err) => {
           clearTimeout(pendingEdit);
           console.warn(`[gateway] SSE stream error: ${err.message}, falling back`);
-          forwardToLibreFang(text, systemPrefix, phone, pushName, isOwner, attachments)
+          forwardToLibreFang(text, systemPrefix, phone, pushName, isOwner, attachments, { isGroup, wasMentioned })
             .then(resolve)
             .catch(reject);
         });
@@ -1726,7 +1729,7 @@ async function forwardToLibreFangStreaming(text, systemPrefix, phone, pushName, 
 
     req.on('error', (err) => {
       console.warn(`[gateway] SSE request error: ${err.message}, falling back`);
-      forwardToLibreFang(text, systemPrefix, phone, pushName, isOwner, attachments)
+      forwardToLibreFang(text, systemPrefix, phone, pushName, isOwner, attachments, { isGroup, wasMentioned })
         .then(resolve)
         .catch(reject);
     });
