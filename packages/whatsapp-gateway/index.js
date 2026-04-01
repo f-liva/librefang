@@ -1499,8 +1499,20 @@ async function forwardToLibreFang(text, systemPrefix, phone, pushName, isOwner, 
 
           try {
             const data = JSON.parse(body);
+            // Silent completion — agent intentionally chose not to reply (NO_REPLY)
+            if (data.silent) {
+              resolve('');
+              return;
+            }
             // The /api/agents/{id}/message endpoint returns { response: "..." }
-            resolve(data.response || data.message || data.text || '');
+            const text = data.response || data.message || data.text || '';
+            // Safety net: strip NO_REPLY token if it leaked through as text
+            const trimmed = text.trim();
+            if (trimmed === 'NO_REPLY' || trimmed.endsWith('\nNO_REPLY')) {
+              resolve('');
+              return;
+            }
+            resolve(text);
           } catch {
             resolve(body.trim() || '');
           }

@@ -346,8 +346,30 @@ fn start_stream_text_bridge(
                 Some(format!("Task failed: {e}. Please try again."))
             }
             Ok(Err(e)) => {
-                error!("Streaming kernel task returned error: {e}");
-                Some(format!("Task failed: {e}. Please try again."))
+                let err_str = e.to_string();
+                error!("Streaming kernel task returned error: {err_str}");
+                if err_str.contains("timed out") {
+                    Some(
+                        "[Error: task timed out due to inactivity. Try breaking it into smaller steps.]"
+                            .to_string(),
+                    )
+                } else if err_str.contains("hit your limit")
+                    || err_str.contains("rate limit")
+                    || err_str.contains("429")
+                    || err_str.contains("quota")
+                {
+                    Some(
+                        "[I've hit my usage limit and need to rest. I'll be back soon!]"
+                            .to_string(),
+                    )
+                } else if err_str.contains("exited with code") || err_str.contains("LLM driver") {
+                    Some(
+                        "[Sorry, something went wrong on my end. Please try again in a moment.]"
+                            .to_string(),
+                    )
+                } else {
+                    Some(format!("Task failed: {e}. Please try again."))
+                }
             }
             Ok(Ok(result)) => {
                 debug!(
