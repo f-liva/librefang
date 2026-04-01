@@ -198,30 +198,46 @@ fn run_watch(
     let binary_str = binary.display().to_string();
     let port = args.port;
 
-    // Start the daemon first so it's available immediately
     println!("Starting daemon on port {port} (watch mode)...");
     println!("  Binary: {binary_str}");
     println!("  Watching: crates/");
     println!("  Press Ctrl+C to stop\n");
 
-    let _ = Command::new(binary)
-        .args(["start", "--foreground"])
-        .env("LIBREFANG_PORT", port.to_string())
-        .spawn()?;
-
-    // After every successful rebuild: kill the old daemon by port, start a new one.
-    // Environment variables (API keys etc.) are inherited from the current shell.
-    // Wrapped in a subshell so cargo-watch's appended '; echo ...' doesn't produce '&;' syntax error.
+    // Stop any running daemon via the CLI (reads daemon.json, sends SIGTERM,
+    // waits for exit) — far more reliable than lsof + kill -9.
+    let _ = Command::new(binary).arg("stop").status();
+    // Belt-and-suspenders: also kill by port in case `stop` missed something.
     let home_dir = librefang_home().display().to_string();
-    let rebuild_and_restart = format!(
-        "(cargo build -p librefang-cli && \
+    let stop_script = format!(
+        "{binary} stop 2>/dev/null; \
          for pid in $(lsof -ti :{port} -sTCP:LISTEN 2>/dev/null); do kill -9 $pid 2>/dev/null; done; \
          rm -f {home}/daemon.json; \
-         sleep 0.3; \
-         LIBREFANG_PORT={port} {binary} start --foreground &)",
+         sleep 0.5",
+        binary = binary_str,
+        port = port,
+        home = home_dir,
+    );
+
+    // Start daemon immediately (no build needed — already built above).
+    let _ = Command::new("sh")
+        .args([
+            "-c",
+            &format!(
+                "({stop} && LIBREFANG_PORT={port} {binary} start --foreground &)",
+                stop = stop_script,
+                port = port,
+                binary = binary_str,
+            ),
+        ])
+        .current_dir(root)
+        .status();
+
+    // On every crate change: rebuild, then stop+restart.
+    let rebuild_and_restart = format!(
+        "(cargo build -p librefang-cli && {stop} && LIBREFANG_PORT={port} {binary} start --foreground &)",
+        stop = stop_script,
         port = port,
         binary = binary_str,
-        home = home_dir,
     );
 
     let cargo_watch_status = Command::new("cargo")
