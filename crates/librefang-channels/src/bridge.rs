@@ -611,6 +611,7 @@ fn flush_debounced(
     rate_limiter: &ChannelRateLimiter,
     sanitizer: &Arc<InputSanitizer>,
     semaphore: &Arc<tokio::sync::Semaphore>,
+    journal: &Option<crate::message_journal::MessageJournal>,
 ) -> Option<tokio::task::JoinHandle<()>> {
     let (merged_msg, blocks) = debouncer.drain(key, buffers)?;
 
@@ -619,6 +620,7 @@ fn flush_debounced(
     let adapter = adapter.clone();
     let rate_limiter = rate_limiter.clone();
     let sanitizer = Arc::clone(sanitizer);
+    let journal = journal.clone();
     let sem = semaphore.clone();
 
     let join_handle = tokio::spawn(async move {
@@ -712,6 +714,7 @@ fn flush_debounced(
                 ct_str,
                 thread_id,
                 output_format,
+                journal.as_ref(),
             )
             .await;
         } else {
@@ -722,6 +725,7 @@ fn flush_debounced(
                 adapter.as_ref(),
                 &rate_limiter,
                 &sanitizer,
+                journal.as_ref(),
             )
             .await;
         }
@@ -741,6 +745,8 @@ pub struct BridgeManager {
     adapters: Vec<Arc<dyn ChannelAdapter>>,
     /// Webhook routes collected from adapters, to be mounted on the shared server.
     webhook_routes: Vec<(String, axum::Router)>,
+    /// Optional message journal for crash recovery.
+    journal: Option<crate::message_journal::MessageJournal>,
 }
 
 impl BridgeManager {
@@ -757,6 +763,7 @@ impl BridgeManager {
             tasks: Vec::new(),
             adapters: Vec::new(),
             webhook_routes: Vec::new(),
+            journal: None,
         }
     }
 
@@ -777,6 +784,44 @@ impl BridgeManager {
             tasks: Vec::new(),
             adapters: Vec::new(),
             webhook_routes: Vec::new(),
+            journal: None,
+        }
+    }
+
+    /// Attach a message journal for crash recovery.
+    pub fn with_journal(mut self, journal: crate::message_journal::MessageJournal) -> Self {
+        self.journal = Some(journal);
+        self
+    }
+
+    /// Get a reference to the journal (if configured).
+    pub fn journal(&self) -> Option<&crate::message_journal::MessageJournal> {
+        self.journal.as_ref()
+    }
+
+    /// Recover messages that were in-flight when the daemon last crashed.
+    /// Returns the messages that need re-processing.  The caller is
+    /// responsible for re-dispatching them to agents.
+    pub async fn recover_pending(&self) -> Vec<crate::message_journal::JournalEntry> {
+        match &self.journal {
+            Some(j) => {
+                let entries = j.pending_entries().await;
+                if !entries.is_empty() {
+                    info!(
+                        count = entries.len(),
+                        "Recovering messages from journal that were interrupted by shutdown/crash"
+                    );
+                }
+                entries
+            }
+            None => Vec::new(),
+        }
+    }
+
+    /// Compact the journal and flush on shutdown.
+    pub async fn compact_journal(&self) {
+        if let Some(j) = &self.journal {
+            j.compact().await;
         }
     }
 
@@ -817,6 +862,7 @@ impl BridgeManager {
         let rate_limiter = self.rate_limiter.clone();
         let sanitizer = self.sanitizer.clone();
         let adapter_clone = adapter.clone();
+        let journal = self.journal.clone();
         let mut shutdown = self.shutdown_rx.clone();
 
         let ct_str = channel_type_str(&adapter.channel_type()).to_string();
@@ -850,6 +896,7 @@ impl BridgeManager {
                                     let adapter = adapter_clone.clone();
                                     let rate_limiter = rate_limiter.clone();
                                     let sanitizer = sanitizer.clone();
+                                    let journal = journal.clone();
                                     let sem = semaphore.clone();
                                     tokio::spawn(async move {
                                         let _permit = match sem.acquire().await {
@@ -863,6 +910,7 @@ impl BridgeManager {
                                             adapter.as_ref(),
                                             &rate_limiter,
                                             &sanitizer,
+                                            journal.as_ref(),
                                         ).await;
                                     });
                                 }
@@ -921,7 +969,7 @@ impl BridgeManager {
                                     let keys: Vec<String> = buffers.keys().cloned().collect();
                                     let mut handles = Vec::new();
                                     for key in keys {
-                                        if let Some(handle) = flush_debounced(&debouncer, &key, &mut buffers, &handle, &router, &adapter_clone, &rate_limiter, &sanitizer, &semaphore) {
+                                        if let Some(handle) = flush_debounced(&debouncer, &key, &mut buffers, &handle, &router, &adapter_clone, &rate_limiter, &sanitizer, &semaphore, &journal) {
                                             handles.push(handle);
                                         }
                                     }
@@ -943,14 +991,14 @@ impl BridgeManager {
                             debouncer.on_typing(&sender_key, event.is_typing, &mut buffers);
                         }
                         Some(key) = flush_rx.recv() => {
-                            let _ = flush_debounced(&debouncer, &key, &mut buffers, &handle, &router, &adapter_clone, &rate_limiter, &sanitizer, &semaphore);
+                            let _ = flush_debounced(&debouncer, &key, &mut buffers, &handle, &router, &adapter_clone, &rate_limiter, &sanitizer, &semaphore, &journal);
                         }
                         _ = shutdown.changed() => {
                             if *shutdown.borrow() {
                                 let keys: Vec<String> = buffers.keys().cloned().collect();
                                 let mut handles = Vec::new();
                                 for key in keys {
-                                    if let Some(handle) = flush_debounced(&debouncer, &key, &mut buffers, &handle, &router, &adapter_clone, &rate_limiter, &sanitizer, &semaphore) {
+                                    if let Some(handle) = flush_debounced(&debouncer, &key, &mut buffers, &handle, &router, &adapter_clone, &rate_limiter, &sanitizer, &semaphore, &journal) {
                                         handles.push(handle);
                                     }
                                 }
@@ -1567,6 +1615,7 @@ async fn dispatch_message(
     adapter: &dyn ChannelAdapter,
     rate_limiter: &ChannelRateLimiter,
     sanitizer: &InputSanitizer,
+    journal: Option<&crate::message_journal::MessageJournal>,
 ) {
     let ct_str = channel_type_str(&message.channel);
 
@@ -1708,6 +1757,7 @@ async fn dispatch_message(
                 ct_str,
                 thread_id,
                 output_format,
+                journal,
             )
             .await;
             return;
@@ -1965,6 +2015,27 @@ async fn dispatch_message(
         return;
     }
 
+    // --- Message journal: record before dispatch for crash recovery ---
+    if let Some(j) = journal {
+        let entry = crate::message_journal::JournalEntry {
+            message_id: message.platform_message_id.clone(),
+            channel: ct_str.to_string(),
+            sender_id: message.sender.platform_id.clone(),
+            sender_name: message.sender.display_name.clone(),
+            content: text.clone(),
+            agent_name: None, // resolved at re-dispatch if needed
+            received_at: message.timestamp,
+            status: crate::message_journal::JournalStatus::Processing,
+            attempts: 0,
+            last_error: None,
+            updated_at: chrono::Utc::now(),
+            is_group: message.is_group,
+            thread_id: thread_id.map(|s| s.to_string()),
+            metadata: std::collections::HashMap::new(),
+        };
+        j.record(entry).await;
+    }
+
     // Send typing indicator (best-effort)
     let _ = adapter.send_typing(&message.sender).await;
 
@@ -2028,6 +2099,14 @@ async fn dispatch_message(
                                 thread_id,
                             )
                             .await;
+                        if let Some(j) = journal {
+                            j.update_status(
+                                &message.platform_message_id,
+                                crate::message_journal::JournalStatus::Completed,
+                                None,
+                            )
+                            .await;
+                        }
                         return;
                     }
                     Err(e) => {
@@ -2060,6 +2139,14 @@ async fn dispatch_message(
                                     thread_id,
                                 )
                                 .await;
+                            if let Some(j) = journal {
+                                j.update_status(
+                                    &message.platform_message_id,
+                                    crate::message_journal::JournalStatus::Completed,
+                                    None,
+                                )
+                                .await;
+                            }
                             return;
                         }
                         // Buffer was empty — fall through to non-streaming path.
@@ -2080,6 +2167,14 @@ async fn dispatch_message(
                                 thread_id,
                             )
                             .await;
+                        if let Some(j) = journal {
+                            j.update_status(
+                                &message.platform_message_id,
+                                crate::message_journal::JournalStatus::Failed,
+                                Some(e.to_string()),
+                            )
+                            .await;
+                        }
                         return;
                     }
                 }
@@ -2099,8 +2194,6 @@ async fn dispatch_message(
     {
         Ok(response) => {
             send_lifecycle_reaction(adapter, &message.sender, msg_id, AgentPhase::Done).await;
-            // Empty response means the agent intentionally chose to stay silent
-            // (NO_REPLY / [[silent]]) — do not leak a message to the channel.
             if !response.is_empty() {
                 send_response(adapter, &message.sender, response, thread_id, output_format).await;
             }
@@ -2114,6 +2207,14 @@ async fn dispatch_message(
                     thread_id,
                 )
                 .await;
+            if let Some(j) = journal {
+                j.update_status(
+                    &message.platform_message_id,
+                    crate::message_journal::JournalStatus::Completed,
+                    None,
+                )
+                .await;
+            }
         }
         Err(e) => {
             let sender_ctx_retry = sender_ctx.clone();
@@ -2139,6 +2240,14 @@ async fn dispatch_message(
                 },
             )
             .await;
+            if let Some(j) = journal {
+                j.update_status(
+                    &message.platform_message_id,
+                    crate::message_journal::JournalStatus::Failed,
+                    Some(e.to_string()),
+                )
+                .await;
+            }
         }
     }
 }
@@ -2291,6 +2400,7 @@ async fn dispatch_with_blocks(
     ct_str: &str,
     thread_id: Option<&str>,
     output_format: OutputFormat,
+    journal: Option<&crate::message_journal::MessageJournal>,
 ) {
     let agent_id = match resolve_or_fallback(message, handle, router).await {
         Some(id) => id,
@@ -2325,6 +2435,28 @@ async fn dispatch_with_blocks(
         return;
     }
 
+    // --- Message journal: record before dispatch for crash recovery ---
+    if let Some(j) = journal {
+        let text = content_to_text(&message.content);
+        let entry = crate::message_journal::JournalEntry {
+            message_id: message.platform_message_id.clone(),
+            channel: ct_str.to_string(),
+            sender_id: message.sender.platform_id.clone(),
+            sender_name: message.sender.display_name.clone(),
+            content: text,
+            agent_name: None,
+            received_at: message.timestamp,
+            status: crate::message_journal::JournalStatus::Processing,
+            attempts: 0,
+            last_error: None,
+            updated_at: chrono::Utc::now(),
+            is_group: message.is_group,
+            thread_id: thread_id.map(|s| s.to_string()),
+            metadata: std::collections::HashMap::new(),
+        };
+        j.record(entry).await;
+    }
+
     let _ = adapter.send_typing(&message.sender).await;
 
     // Lifecycle reaction: ⏳ Queued → 🤔 Thinking → ✅ Done / ❌ Error
@@ -2343,6 +2475,14 @@ async fn dispatch_with_blocks(
             send_lifecycle_reaction(adapter, &message.sender, msg_id, AgentPhase::Done).await;
             if !response.is_empty() {
                 send_response(adapter, &message.sender, response, thread_id, output_format).await;
+            }
+            if let Some(j) = journal {
+                j.update_status(
+                    &message.platform_message_id,
+                    crate::message_journal::JournalStatus::Completed,
+                    None,
+                )
+                .await;
             }
             handle
                 .record_delivery(
@@ -2378,6 +2518,14 @@ async fn dispatch_with_blocks(
                 },
             )
             .await;
+            if let Some(j) = journal {
+                j.update_status(
+                    &message.platform_message_id,
+                    crate::message_journal::JournalStatus::Failed,
+                    Some(e.to_string()),
+                )
+                .await;
+            }
         }
     }
 }

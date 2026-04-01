@@ -2664,8 +2664,153 @@ pub async fn start_channel_bridge_with_config(
         started_at: Instant::now(),
     });
     let router = Arc::new(router);
+    // Create message journal for crash recovery
+    let data_dir = std::path::PathBuf::from(
+        std::env::var("LIBREFANG_HOME").unwrap_or_else(|_| ".".to_string()),
+    );
     let mut manager =
-        BridgeManager::with_sanitizer(bridge_handle, router, &kernel.config_ref().sanitize);
+        BridgeManager::with_sanitizer(bridge_handle.clone(), router, &kernel.config_ref().sanitize);
+    if let Ok(journal) = librefang_channels::message_journal::MessageJournal::open(&data_dir) {
+        journal.spawn_compaction_timer();
+        manager = manager.with_journal(journal);
+    } else {
+        warn!("Could not open message journal — crash recovery disabled");
+    }
+
+    // Recover messages that were in-flight during last shutdown/crash
+    let pending = manager.recover_pending().await;
+    if !pending.is_empty() {
+        let handle = bridge_handle.clone();
+        let kernel_for_recovery = kernel.clone();
+        let recovery_journal = manager.journal().cloned();
+        tokio::spawn(async move {
+            // Wait for adapters to initialize before sending responses.
+            // Retry with increasing delays: 5s, 10s, 15s.
+            const RECOVERY_DELAYS: &[u64] = &[5, 10, 15];
+
+            // First delay: let adapters boot
+            tokio::time::sleep(std::time::Duration::from_secs(RECOVERY_DELAYS[0])).await;
+
+            for entry in &pending {
+                let age_secs = (chrono::Utc::now() - entry.received_at).num_seconds();
+                let was_in_flight =
+                    entry.status == librefang_channels::message_journal::JournalStatus::Processing;
+                info!(
+                    id = %entry.message_id,
+                    channel = %entry.channel,
+                    sender = %entry.sender_name,
+                    age_secs,
+                    was_in_flight,
+                    "Re-dispatching recovered message"
+                );
+                let agent_id = if let Some(ref name) = entry.agent_name {
+                    handle.find_agent_by_name(name).await.ok().flatten()
+                } else {
+                    None
+                };
+                let agent_id = match agent_id {
+                    Some(id) => id,
+                    None => match kernel_for_recovery
+                        .agent_registry()
+                        .list()
+                        .first()
+                        .map(|e| e.id)
+                    {
+                        Some(id) => id,
+                        None => {
+                            warn!(id = %entry.message_id, "No agents available for recovery");
+                            continue;
+                        }
+                    },
+                };
+                // Differentiate prefix: if the task was already in-flight, the
+                // agent may have partially processed it. Tell it so.
+                let prefix = if was_in_flight {
+                    format!(
+                        "[RECOVERY: this message was being processed {age_secs}s ago when the \
+                         system restarted. It may have been partially handled — check your \
+                         session context before re-doing work. If you already responded, \
+                         reply with NO_REPLY.]\n\n"
+                    )
+                } else {
+                    format!(
+                        "[RECOVERY: this message was received {age_secs}s ago but processing \
+                         never started. Please process it now.]\n\n"
+                    )
+                };
+                let msg = format!("{prefix}{}", entry.content);
+                match handle.send_message(agent_id, &msg).await {
+                    Ok(response) => {
+                        info!(id = %entry.message_id, "Recovered message processed");
+                        if !response.is_empty() {
+                            // Retry delivery with backoff if adapter isn't ready yet
+                            let mut delivered = false;
+                            for delay in RECOVERY_DELAYS {
+                                if let Some(adapter) = kernel_for_recovery
+                                    .channel_adapters_ref()
+                                    .get(&entry.channel)
+                                {
+                                    let user = librefang_channels::types::ChannelUser {
+                                        platform_id: entry.sender_id.clone(),
+                                        display_name: entry.sender_name.clone(),
+                                        librefang_user: None,
+                                    };
+                                    let content = librefang_channels::types::ChannelContent::Text(
+                                        response.clone(),
+                                    );
+                                    match adapter.send(&user, content).await {
+                                        Ok(()) => {
+                                            delivered = true;
+                                            break;
+                                        }
+                                        Err(e) => {
+                                            warn!(
+                                                id = %entry.message_id,
+                                                error = %e,
+                                                "Recovery delivery failed, retrying in {delay}s"
+                                            );
+                                        }
+                                    }
+                                } else {
+                                    warn!(
+                                        id = %entry.message_id,
+                                        channel = %entry.channel,
+                                        "Adapter not ready, retrying in {delay}s"
+                                    );
+                                }
+                                tokio::time::sleep(std::time::Duration::from_secs(*delay)).await;
+                            }
+                            if !delivered {
+                                warn!(
+                                    id = %entry.message_id,
+                                    "Could not deliver recovery response after retries"
+                                );
+                            }
+                        }
+                        if let Some(ref j) = recovery_journal {
+                            j.update_status(
+                                &entry.message_id,
+                                librefang_channels::message_journal::JournalStatus::Completed,
+                                None,
+                            )
+                            .await;
+                        }
+                    }
+                    Err(e) => {
+                        warn!(id = %entry.message_id, error = %e, "Recovery re-dispatch failed");
+                        if let Some(ref j) = recovery_journal {
+                            j.update_status(
+                                &entry.message_id,
+                                librefang_channels::message_journal::JournalStatus::Failed,
+                                Some(e.to_string()),
+                            )
+                            .await;
+                        }
+                    }
+                }
+            }
+        });
+    }
 
     let mut started_names = Vec::new();
     for (adapter, _, _account_id) in adapters {
