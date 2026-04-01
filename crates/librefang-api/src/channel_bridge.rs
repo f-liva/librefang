@@ -8,6 +8,35 @@ use librefang_channels::router::AgentRouter;
 use librefang_channels::sidecar::SidecarAdapter;
 use librefang_channels::types::{ChannelAdapter, SenderContext};
 
+/// Sanitize LLM/driver errors into user-friendly messages for channel delivery.
+///
+/// Prevents raw technical details (stack traces, driver internals, status codes)
+/// from leaking to end users on WhatsApp, Telegram, etc.
+fn sanitize_channel_error(err: &str) -> String {
+    let lower = err.to_lowercase();
+    if lower.contains("timed out") || lower.contains("inactivity") {
+        "The task timed out due to inactivity. Try breaking it into smaller steps.".to_string()
+    } else if lower.contains("rate limit")
+        || lower.contains("rate_limit")
+        || lower.contains("429")
+        || lower.contains("quota")
+        || lower.contains("rate-limit")
+        || lower.contains("too many requests")
+        || lower.contains("resource exhausted")
+    {
+        "I've hit my usage limit and need to rest. I'll be back soon!".to_string()
+    } else if lower.contains("auth") || lower.contains("not logged in") || lower.contains("401") {
+        "I'm having trouble with my credentials. Please let the admin know.".to_string()
+    } else if lower.contains("exited with code") || lower.contains("llm driver") {
+        "Sorry, something went wrong on my end. Please try again in a moment.".to_string()
+    } else {
+        format!(
+            "Something went wrong: please try again. (ref: {})",
+            &err[..err.len().min(80)]
+        )
+    }
+}
+
 /// Check if text looks like a raw tool call leaked as content.
 ///
 /// Some providers emit tool calls as plain text (recovered by
@@ -343,33 +372,15 @@ fn start_stream_text_bridge(
         let error_msg = match kernel_handle.await {
             Err(e) => {
                 error!("Streaming kernel task panicked: {e}");
-                Some(format!("Task failed: {e}. Please try again."))
+                Some(
+                    "Sorry, something went wrong on my end. Please try again in a moment."
+                        .to_string(),
+                )
             }
             Ok(Err(e)) => {
                 let err_str = e.to_string();
                 error!("Streaming kernel task returned error: {err_str}");
-                if err_str.contains("timed out") {
-                    Some(
-                        "[Error: task timed out due to inactivity. Try breaking it into smaller steps.]"
-                            .to_string(),
-                    )
-                } else if err_str.contains("hit your limit")
-                    || err_str.contains("rate limit")
-                    || err_str.contains("429")
-                    || err_str.contains("quota")
-                {
-                    Some(
-                        "[I've hit my usage limit and need to rest. I'll be back soon!]"
-                            .to_string(),
-                    )
-                } else if err_str.contains("exited with code") || err_str.contains("LLM driver") {
-                    Some(
-                        "[Sorry, something went wrong on my end. Please try again in a moment.]"
-                            .to_string(),
-                    )
-                } else {
-                    Some(format!("Task failed: {e}. Please try again."))
-                }
+                Some(sanitize_channel_error(&err_str))
             }
             Ok(Ok(result)) => {
                 debug!(
@@ -2876,5 +2887,78 @@ mod tests {
         assert!(config.channels.gotify.is_none());
         assert!(config.channels.webhook.is_none());
         assert!(config.channels.linkedin.is_none());
+    }
+
+    #[test]
+    fn test_sanitize_channel_error_rate_limit() {
+        let msg = sanitize_channel_error("LLM driver error: Rate limited — retrying shortly.");
+        assert!(
+            msg.contains("usage limit"),
+            "expected rate-limit msg, got: {msg}"
+        );
+
+        let msg = sanitize_channel_error("API error (429): Too Many Requests");
+        assert!(
+            msg.contains("usage limit"),
+            "expected rate-limit msg, got: {msg}"
+        );
+
+        let msg = sanitize_channel_error("rate_limit_error: Number of request tokens exceeded");
+        assert!(
+            msg.contains("usage limit"),
+            "expected rate-limit msg, got: {msg}"
+        );
+
+        let msg = sanitize_channel_error("Resource exhausted: request rate limit exceeded");
+        assert!(
+            msg.contains("usage limit"),
+            "expected rate-limit msg, got: {msg}"
+        );
+
+        let msg =
+            sanitize_channel_error("All 3 API keys for provider 'anthropic' are rate-limited");
+        assert!(
+            msg.contains("usage limit"),
+            "expected rate-limit msg, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn test_sanitize_channel_error_timeout() {
+        let msg = sanitize_channel_error("Task timed out after 600s of inactivity");
+        assert!(
+            msg.contains("timed out"),
+            "expected timeout msg, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn test_sanitize_channel_error_driver_crash() {
+        let msg =
+            sanitize_channel_error("LLM driver error: Claude Code CLI exited with code 1: err");
+        assert!(
+            msg.contains("something went wrong"),
+            "expected driver msg, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn test_sanitize_channel_error_auth() {
+        let msg = sanitize_channel_error("Auth error: Claude Code CLI is not authenticated");
+        assert!(msg.contains("credentials"), "expected auth msg, got: {msg}");
+    }
+
+    #[test]
+    fn test_sanitize_channel_error_unknown() {
+        let msg = sanitize_channel_error("Something completely unexpected happened");
+        assert!(
+            msg.contains("Something went wrong"),
+            "expected generic msg, got: {msg}"
+        );
+        // Should include a truncated reference, not the full raw error
+        assert!(
+            msg.contains("ref:"),
+            "expected ref in generic msg, got: {msg}"
+        );
     }
 }

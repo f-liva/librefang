@@ -1532,16 +1532,22 @@ async function forwardToLibreFang(text, systemPrefix, phone, pushName, isOwner, 
               return;
             }
             // The /api/agents/{id}/message endpoint returns { response: "..." }
-            const text = data.response || data.message || data.text || '';
+            const responseText = data.response || data.message || data.text || '';
             // Safety net: strip NO_REPLY token if it leaked through as text
-            const trimmed = text.trim();
+            const trimmed = responseText.trim();
             if (trimmed === 'NO_REPLY' || trimmed.endsWith('\nNO_REPLY')) {
               resolve('');
               return;
             }
-            resolve(text);
+            resolve(responseText);
           } catch {
-            resolve(body.trim() || '');
+            // Non-JSON fallback — still check for NO_REPLY
+            const fallback = body.trim() || '';
+            if (fallback === 'NO_REPLY' || fallback.endsWith('\nNO_REPLY')) {
+              resolve('');
+              return;
+            }
+            resolve(fallback);
           }
         });
       },
