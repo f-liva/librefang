@@ -263,6 +263,7 @@ mod tests {
             thinking: None,
             prompt_caching: false,
             response_format: None,
+            timeout_secs: None,
         }
     }
 

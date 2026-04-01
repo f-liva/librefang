@@ -97,6 +97,12 @@ pub struct ChannelOverrides {
     /// Maximum number of messages to buffer per sender before forcing dispatch. Default: 64.
     #[serde(default = "default_message_debounce_max_buffer")]
     pub message_debounce_max_buffer: usize,
+    /// Remove the reaction emoji on task completion instead of showing a
+    /// "done" reaction.  When `true`, the bot clears all its reactions once
+    /// the response is delivered, keeping the chat cleaner.  Default: `false`
+    /// (show the done reaction for backward compatibility).
+    #[serde(default)]
+    pub clear_done_reaction: bool,
 }
 
 impl Default for ChannelOverrides {
@@ -116,6 +122,7 @@ impl Default for ChannelOverrides {
             message_debounce_ms: 0,
             message_debounce_max_ms: 30000,
             message_debounce_max_buffer: 64,
+            clear_done_reaction: false,
         }
     }
 }

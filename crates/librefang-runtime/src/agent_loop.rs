@@ -56,6 +56,10 @@ const MAX_CONTINUATIONS: u32 = 5;
 /// 7-10 real conversation turns instead of the previous 3-5.
 const MAX_HISTORY_MESSAGES: usize = 40;
 
+/// Marker included in timeout error messages when partial output was delivered.
+/// Used by channel_bridge to detect this case without fragile string matching.
+pub const TIMEOUT_PARTIAL_OUTPUT_MARKER: &str = "[partial_output_delivered]";
+
 /// Check if a response is a NO_REPLY.  Matches:
 /// - Exact `"NO_REPLY"` (original behaviour)
 /// - Text ending with `NO_REPLY` on its own line (model sometimes adds context before it)
@@ -817,6 +821,21 @@ pub async fn run_agent_loop(
             .and_then(|v| v.as_bool())
             .unwrap_or(true);
 
+        let timeout_override = manifest
+            .metadata
+            .get("timeout_secs")
+            .and_then(|v| v.as_u64())
+            .or_else(|| {
+                if available_tools
+                    .iter()
+                    .any(|t| t.name.starts_with("browser_") || t.name.starts_with("playwright_"))
+                {
+                    Some(600)
+                } else {
+                    None
+                }
+            });
+
         let request = CompletionRequest {
             model: api_model,
             messages: messages.clone(),
@@ -827,6 +846,7 @@ pub async fn run_agent_loop(
             thinking: manifest.thinking.clone(),
             prompt_caching,
             response_format: manifest.response_format.clone(),
+            timeout_secs: timeout_override,
         };
 
         // Notify phase: Thinking
@@ -1827,6 +1847,26 @@ async fn stream_with_retry(
                 tokio::time::sleep(std::time::Duration::from_millis(delay)).await;
                 last_error = Some("Overloaded".to_string());
             }
+            Err(LlmError::TimedOut {
+                inactivity_secs,
+                partial_text,
+                partial_text_len,
+                last_activity,
+            }) => {
+                warn!(
+                    inactivity_secs,
+                    partial_text_len, last_activity, "LLM stream timed out with partial output"
+                );
+                if !partial_text.is_empty() {
+                    let _ = tx.send(StreamEvent::TextDelta { text: partial_text }).await;
+                }
+                return Err(LibreFangError::LlmDriver(format!(
+                    "Task timed out after {inactivity_secs}s of inactivity \
+                     (last: {last_activity}). \
+                     {partial_text_len} chars of partial output were delivered. \
+                     {TIMEOUT_PARTIAL_OUTPUT_MARKER}"
+                )));
+            }
             Err(e) => {
                 let raw_error = e.to_string();
                 let status = match &e {
@@ -2292,6 +2332,24 @@ pub async fn run_agent_loop_streaming(
             .and_then(|v| v.as_bool())
             .unwrap_or(true);
 
+        // Per-request timeout: manifest metadata takes priority, then browser
+        // heuristic, then driver default (None = use driver's configured value).
+        let timeout_override = manifest
+            .metadata
+            .get("timeout_secs")
+            .and_then(|v| v.as_u64())
+            .or_else(|| {
+                // Auto-extend for agents with browser tools
+                if available_tools
+                    .iter()
+                    .any(|t| t.name.starts_with("browser_") || t.name.starts_with("playwright_"))
+                {
+                    Some(600) // 10 minutes for browser tasks
+                } else {
+                    None
+                }
+            });
+
         let request = CompletionRequest {
             model: api_model,
             messages: messages.clone(),
@@ -2302,6 +2360,7 @@ pub async fn run_agent_loop_streaming(
             thinking: manifest.thinking.clone(),
             prompt_caching,
             response_format: manifest.response_format.clone(),
+            timeout_secs: timeout_override,
         };
 
         // Notify phase: on first iteration emit Streaming; on subsequent
@@ -2323,14 +2382,41 @@ pub async fn run_agent_loop_streaming(
 
         // Stream LLM call with retry, error classification, and circuit breaker
         let provider_name = manifest.model.provider.as_str();
-        let mut response = stream_with_retry(
+        let mut response = match stream_with_retry(
             &*driver,
             request,
             stream_tx.clone(),
             Some(provider_name),
             None,
         )
-        .await?;
+        .await
+        {
+            Ok(resp) => resp,
+            Err(e) => {
+                let err_str = e.to_string();
+                if err_str.contains("timed out") {
+                    // Extract last_activity from error if present (format: "last: <activity>")
+                    let activity = err_str
+                        .find("last: ")
+                        .map(|i| {
+                            let start = i + 6;
+                            let end = err_str[start..]
+                                .find(')')
+                                .map_or(err_str.len(), |j| start + j);
+                            &err_str[start..end]
+                        })
+                        .unwrap_or("unknown");
+                    let note = format!(
+                        "[System: your previous task timed out while doing: {activity}. \
+                         The user's request could not be completed. \
+                         Any partial output was already sent to the user.]"
+                    );
+                    session.messages.push(Message::assistant(note));
+                    let _ = memory.save_session_async(session).await;
+                }
+                return Err(e);
+            }
+        };
 
         total_usage.input_tokens += response.usage.input_tokens;
         total_usage.output_tokens += response.usage.output_tokens;

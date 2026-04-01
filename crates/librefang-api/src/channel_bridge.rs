@@ -355,6 +355,12 @@ fn start_stream_text_bridge(
                 StreamEvent::ToolUseStart { .. } => {
                     saw_tool_use = true;
                 }
+                StreamEvent::PhaseChange { .. } => {
+                    // PhaseChange events (e.g. "long_running") are NOT injected
+                    // into the text stream — they would persist in the response.
+                    // They flow through the SSE endpoint as `event: phase` and
+                    // each adapter handles them independently.
+                }
                 _ => {}
             }
         }
@@ -380,7 +386,14 @@ fn start_stream_text_bridge(
             Ok(Err(e)) => {
                 let err_str = e.to_string();
                 error!("Streaming kernel task returned error: {err_str}");
-                Some(sanitize_channel_error(&err_str))
+                if err_str.contains(librefang_runtime::agent_loop::TIMEOUT_PARTIAL_OUTPUT_MARKER) {
+                    Some(
+                        "\n\n---\n[Task timed out. The output above may be incomplete.]"
+                            .to_string(),
+                    )
+                } else {
+                    Some(sanitize_channel_error(&err_str))
+                }
             }
             Ok(Ok(result)) => {
                 debug!(
@@ -1682,7 +1695,8 @@ pub async fn start_channel_bridge_with_config(
                     tg_config.initial_backoff_secs,
                     tg_config.max_backoff_secs,
                     tg_config.long_poll_timeout_secs,
-                ),
+                )
+                .with_clear_done_reaction(tg_config.overrides.clear_done_reaction),
             );
             adapters.push((
                 adapter,
