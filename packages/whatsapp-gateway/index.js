@@ -1773,10 +1773,19 @@ async function runCatchUpSweep() {
       const senderPnJid = msg.phone ? msg.phone.replace(/^\+/, '') + '@s.whatsapp.net' : '';
       const isOwner = OWNER_JIDS.size > 0 && (OWNER_JIDS.has(msg.jid) || (senderPnJid && OWNER_JIDS.has(senderPnJid)));
 
-      // Simple re-forward: send the stored text to the agent without full context rebuild
+      // Never re-forward group messages — we cannot tell if the bot was
+      // mentioned, so replaying them violates group_policy and can leak
+      // internal text (rate-limit errors, recovery prefixes) into groups.
       const isCatchupGroup = msg.jid && msg.jid.endsWith('@g.us');
+      if (isCatchupGroup) {
+        dbMarkProcessed(msg.id, 1);
+        console.log(`[gateway][catchup] Skipping group message ${msg.id} (${msg.jid}) — group catchup disabled`);
+        continue;
+      }
+
+      // Simple re-forward: send the stored text to the agent without full context rebuild
       const prefix = isOwner ? '' : `[CATCHUP_REDELIVERY from ${msg.push_name || msg.phone || msg.jid}]\n`;
-      const response = await forwardToLibreFang(prefix + (msg.text || ''), '', msg.phone || '', msg.push_name || '', isOwner, [], { isGroup: isCatchupGroup, wasMentioned: false });
+      const response = await forwardToLibreFang(prefix + (msg.text || ''), '', msg.phone || '', msg.push_name || '', isOwner, [], { isGroup: false, wasMentioned: false });
 
       // Mark as processed
       dbMarkProcessed(msg.id, 1);
