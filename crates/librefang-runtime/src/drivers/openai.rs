@@ -565,6 +565,7 @@ impl LlmDriver for OpenAIDriver {
                 }
                 return Err(LlmError::RateLimited {
                     retry_after_ms: 5000,
+                    message: None,
                 });
             }
 
@@ -894,6 +895,7 @@ impl LlmDriver for OpenAIDriver {
                 }
                 return Err(LlmError::RateLimited {
                     retry_after_ms: 5000,
+                    message: None,
                 });
             }
 
@@ -1101,17 +1103,6 @@ impl LlmDriver for OpenAIDriver {
 
                         // Reasoning/thinking content delta (DeepSeek-R1 via official API or local servers, Qwen3, etc.)
                         if let Some(reasoning) = delta["reasoning_content"].as_str() {
-                            if !reasoning.is_empty() {
-                                reasoning_content.push_str(reasoning);
-                                let _ = tx
-                                    .send(StreamEvent::ThinkingDelta {
-                                        text: reasoning.to_string(),
-                                    })
-                                    .await;
-                            }
-                        } else if let Some(reasoning) = delta["reasoning"].as_str() {
-                            // Fallback: Ollama and some local servers expose the reasoning
-                            // field instead of reasoning_content.
                             if !reasoning.is_empty() {
                                 reasoning_content.push_str(reasoning);
                                 let _ = tx
