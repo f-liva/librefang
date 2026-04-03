@@ -310,6 +310,7 @@ mod tests {
             ) -> Result<CompletionResponse, LlmError> {
                 Err(LlmError::RateLimited {
                     retry_after_ms: 5000,
+                    message: None,
                 })
             }
         }
@@ -336,6 +337,7 @@ mod tests {
             ) -> Result<CompletionResponse, LlmError> {
                 Err(LlmError::RateLimited {
                     retry_after_ms: 5000,
+                    message: None,
                 })
             }
         }

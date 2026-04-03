@@ -1735,15 +1735,23 @@ async fn call_with_retry(
                 }
                 return Ok(response);
             }
-            Err(LlmError::RateLimited { retry_after_ms }) => {
-                if attempt == MAX_RETRIES {
+            Err(LlmError::RateLimited {
+                retry_after_ms,
+                ref message,
+            }) => {
+                let all_exhausted = message.as_deref().map_or(false, |m| {
+                    let l = m.to_lowercase();
+                    l.contains("resets") || l.contains("out of extra usage")
+                });
+                if attempt == MAX_RETRIES || all_exhausted {
                     if let (Some(provider), Some(cooldown)) = (provider, cooldown) {
                         cooldown.record_failure(provider, false);
                     }
-                    return Err(LibreFangError::LlmDriver(format!(
-                        "Rate limited after {} retries",
-                        MAX_RETRIES
-                    )));
+                    return Err(LibreFangError::LlmDriver(
+                        message.clone().unwrap_or_else(|| {
+                            format!("Rate limited after {} retries", MAX_RETRIES)
+                        }),
+                    ));
                 }
                 let delay = std::cmp::max(retry_after_ms, BASE_RETRY_DELAY_MS * 2u64.pow(attempt));
                 warn!(
@@ -1850,15 +1858,23 @@ async fn stream_with_retry(
                 }
                 return Ok(response);
             }
-            Err(LlmError::RateLimited { retry_after_ms }) => {
-                if attempt == MAX_RETRIES {
+            Err(LlmError::RateLimited {
+                retry_after_ms,
+                ref message,
+            }) => {
+                let all_exhausted = message.as_deref().map_or(false, |m| {
+                    let l = m.to_lowercase();
+                    l.contains("resets") || l.contains("out of extra usage")
+                });
+                if attempt == MAX_RETRIES || all_exhausted {
                     if let (Some(provider), Some(cooldown)) = (provider, cooldown) {
                         cooldown.record_failure(provider, false);
                     }
-                    return Err(LibreFangError::LlmDriver(format!(
-                        "Rate limited after {} retries",
-                        MAX_RETRIES
-                    )));
+                    return Err(LibreFangError::LlmDriver(
+                        message.clone().unwrap_or_else(|| {
+                            format!("Rate limited after {} retries", MAX_RETRIES)
+                        }),
+                    ));
                 }
                 let delay = std::cmp::max(retry_after_ms, BASE_RETRY_DELAY_MS * 2u64.pow(attempt));
                 warn!(

@@ -475,6 +475,21 @@ impl LlmDriver for ClaudeCodeDriver {
                 "Claude Code CLI exited with error"
             );
 
+            // Detect rate-limit messages so token rotation can kick in.
+            let lower = detail.to_lowercase();
+            if lower.contains("hit your limit")
+                || lower.contains("out of extra usage")
+                || lower.contains("rate limit")
+                || lower.contains("too many requests")
+                || lower.contains("resets")
+            {
+                prepared.cleanup();
+                return Err(LlmError::RateLimited {
+                    retry_after_ms: 5 * 60 * 1000,
+                    message: Some(detail.clone()),
+                });
+            }
+
             // Provide actionable error messages
             let message = if detail.contains("not authenticated")
                 || detail.contains("auth")
@@ -649,13 +664,27 @@ impl LlmDriver for ClaudeCodeDriver {
 
             match tokio::time::timeout(deadline, lines.next_line()).await {
                 Ok(Ok(Some(line))) => {
+                    if line.trim().is_empty() {
+                        continue;
+                    }
+
+                    // Only reset inactivity timer for non-empty lines
                     last_output = tokio::time::Instant::now();
                     warned = false;
                     notified = false;
 
-                    if line.trim().is_empty() {
-                        continue;
-                    }
+                    // Helper: detect text that must never be streamed to
+                    // channel users (rate-limit messages and NO_REPLY tokens).
+                    let should_suppress = |t: &str| -> bool {
+                        let l = t.to_lowercase();
+                        l.contains("hit your limit")
+                            || l.contains("out of extra usage")
+                            || l.contains("rate limit")
+                            || l.contains("too many requests")
+                            || (l.contains("resets") && l.contains("utc"))
+                            || t.trim() == "NO_REPLY"
+                            || t.trim().ends_with("NO_REPLY")
+                    };
 
                     match serde_json::from_str::<ClaudeStreamEvent>(&line) {
                         Ok(event) => {
@@ -677,22 +706,26 @@ impl LlmDriver for ClaudeCodeDriver {
                                 "content" | "text" | "assistant" | "content_block_delta" => {
                                     if let Some(ref content) = event.content {
                                         full_text.push_str(content);
-                                        let _ = tx
-                                            .send(StreamEvent::TextDelta {
-                                                text: content.clone(),
-                                            })
-                                            .await;
+                                        if !should_suppress(content) {
+                                            let _ = tx
+                                                .send(StreamEvent::TextDelta {
+                                                    text: content.clone(),
+                                                })
+                                                .await;
+                                        }
                                     }
                                 }
                                 "result" | "done" | "complete" => {
                                     if let Some(ref result) = event.result {
                                         if full_text.is_empty() {
                                             full_text = result.clone();
-                                            let _ = tx
-                                                .send(StreamEvent::TextDelta {
-                                                    text: result.clone(),
-                                                })
-                                                .await;
+                                            if !should_suppress(result) {
+                                                let _ = tx
+                                                    .send(StreamEvent::TextDelta {
+                                                        text: result.clone(),
+                                                    })
+                                                    .await;
+                                            }
                                         }
                                     }
                                     if let Some(usage) = event.usage {
@@ -706,11 +739,13 @@ impl LlmDriver for ClaudeCodeDriver {
                                 _ => {
                                     if let Some(ref content) = event.content {
                                         full_text.push_str(content);
-                                        let _ = tx
-                                            .send(StreamEvent::TextDelta {
-                                                text: content.clone(),
-                                            })
-                                            .await;
+                                        if !should_suppress(content) {
+                                            let _ = tx
+                                                .send(StreamEvent::TextDelta {
+                                                    text: content.clone(),
+                                                })
+                                                .await;
+                                        }
                                     }
                                 }
                             }
@@ -718,7 +753,9 @@ impl LlmDriver for ClaudeCodeDriver {
                         Err(e) => {
                             warn!(line = %line, error = %e, "Non-JSON line from Claude CLI");
                             full_text.push_str(&line);
-                            let _ = tx.send(StreamEvent::TextDelta { text: line }).await;
+                            if !should_suppress(&line) {
+                                let _ = tx.send(StreamEvent::TextDelta { text: line }).await;
+                            }
                         }
                     }
                 }
@@ -784,12 +821,45 @@ impl LlmDriver for ClaudeCodeDriver {
 
         if !status.success() {
             let code = status.code().unwrap_or(1);
+            let detail = if !stderr_text.trim().is_empty() {
+                stderr_text.trim().to_string()
+            } else {
+                full_text.clone()
+            };
             warn!(
                 exit_code = code,
                 model = %pid_label,
                 stderr = %stderr_text,
                 "Claude Code CLI streaming subprocess exited with error"
             );
+            // Detect rate-limit messages in streamed output so token rotation
+            // can kick in.  The CLI often exits with code 1 and puts "hit your
+            // limit" in stdout (already streamed) rather than stderr.
+            // When both stderr and stdout are empty the CLI likely hit a rate
+            // limit before producing any output — treat exit-code 1 with no
+            // output as a rate-limit so rotation still fires.
+            let lower = detail.to_lowercase();
+            if lower.contains("hit your limit")
+                || lower.contains("out of extra usage")
+                || lower.contains("rate limit")
+                || lower.contains("too many requests")
+                || lower.contains("resets")
+                || (code == 1 && detail.is_empty())
+            {
+                warn!(
+                    exit_code = code,
+                    detail_empty = detail.is_empty(),
+                    "Treating CLI exit as rate-limit for profile rotation"
+                );
+                return Err(LlmError::RateLimited {
+                    retry_after_ms: 5 * 60 * 1000,
+                    message: if detail.is_empty() {
+                        None
+                    } else {
+                        Some(detail.clone())
+                    },
+                });
+            }
             return Err(LlmError::Api {
                 status: code as u16,
                 message: format!(
