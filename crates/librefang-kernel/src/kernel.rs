@@ -7922,6 +7922,18 @@ system_prompt = "You are a helpful assistant."
         let has_custom_key = manifest.model.api_key_env.is_some();
         let has_custom_url = manifest.model.base_url.is_some();
 
+        // CLI profile rotation: when the agent uses the default provider
+        // and CLI profiles are configured, use the boot-time
+        // TokenRotationDriver directly. The driver_cache would create a
+        // single vanilla driver without config_dir, bypassing rotation.
+        if !has_custom_key
+            && !has_custom_url
+            && (agent_provider.is_empty() || agent_provider == default_provider)
+            && !effective_default.profiles.is_empty()
+        {
+            return Ok(self.default_driver.clone());
+        }
+
         // Always create a fresh driver by reading current env vars.
         // This ensures API keys saved at runtime (via dashboard POST
         // /api/providers/{name}/key which calls std::env::set_var) are

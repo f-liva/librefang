@@ -1747,11 +1747,9 @@ async fn call_with_retry(
                     if let (Some(provider), Some(cooldown)) = (provider, cooldown) {
                         cooldown.record_failure(provider, false);
                     }
-                    return Err(LibreFangError::LlmDriver(
-                        message.clone().unwrap_or_else(|| {
-                            format!("Rate limited after {} retries", MAX_RETRIES)
-                        }),
-                    ));
+                    return Err(LibreFangError::LlmDriver(message.clone().unwrap_or_else(
+                        || format!("Rate limited after {} retries", MAX_RETRIES),
+                    )));
                 }
                 let delay = std::cmp::max(retry_after_ms, BASE_RETRY_DELAY_MS * 2u64.pow(attempt));
                 warn!(
@@ -1870,11 +1868,9 @@ async fn stream_with_retry(
                     if let (Some(provider), Some(cooldown)) = (provider, cooldown) {
                         cooldown.record_failure(provider, false);
                     }
-                    return Err(LibreFangError::LlmDriver(
-                        message.clone().unwrap_or_else(|| {
-                            format!("Rate limited after {} retries", MAX_RETRIES)
-                        }),
-                    ));
+                    return Err(LibreFangError::LlmDriver(message.clone().unwrap_or_else(
+                        || format!("Rate limited after {} retries", MAX_RETRIES),
+                    )));
                 }
                 let delay = std::cmp::max(retry_after_ms, BASE_RETRY_DELAY_MS * 2u64.pow(attempt));
                 warn!(
