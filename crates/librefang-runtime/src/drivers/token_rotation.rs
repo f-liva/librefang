@@ -99,6 +99,9 @@ impl TokenRotationDriver {
         let after = &lower[idx + 7..];
         let num_end = after.find(|c: char| !c.is_ascii_digit())?;
         let hour: u32 = after[..num_end].parse().ok()?;
+        if hour == 0 || hour > 12 {
+            return None; // Invalid 12-hour format
+        }
         if after[num_end..].starts_with("pm") {
             Some(if hour == 12 { 12 } else { hour + 12 })
         } else if after[num_end..].starts_with("am") {
