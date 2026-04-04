@@ -481,7 +481,7 @@ impl LlmDriver for ClaudeCodeDriver {
                 || lower.contains("out of extra usage")
                 || lower.contains("rate limit")
                 || lower.contains("too many requests")
-                || lower.contains("resets")
+                || (lower.contains("resets") && lower.contains("utc"))
             {
                 prepared.cleanup();
                 return Err(LlmError::RateLimited {
@@ -679,7 +679,7 @@ impl LlmDriver for ClaudeCodeDriver {
                         let l = t.to_lowercase();
                         l.contains("hit your limit")
                             || l.contains("out of extra usage")
-                            || l.contains("rate limit")
+                            || l.contains("you've been rate limited")
                             || l.contains("too many requests")
                             || (l.contains("resets") && l.contains("utc"))
                             || t.trim() == "NO_REPLY"
@@ -843,7 +843,7 @@ impl LlmDriver for ClaudeCodeDriver {
                 || lower.contains("out of extra usage")
                 || lower.contains("rate limit")
                 || lower.contains("too many requests")
-                || lower.contains("resets")
+                || (lower.contains("resets") && lower.contains("utc"))
                 || (code == 1 && detail.is_empty())
             {
                 warn!(
