@@ -741,6 +741,10 @@ fn convert_message(msg: &Message) -> ApiMessage {
                         is_error: *is_error,
                     }),
                     ContentBlock::Thinking { .. } => None,
+                    // ImageFile references are handled by drivers that support
+                    // file paths (e.g. Claude Code). API drivers will gain
+                    // lazy base64 loading in a future phase.
+                    ContentBlock::ImageFile { .. } => None,
                     ContentBlock::Unknown => None,
                 })
                 .collect();
