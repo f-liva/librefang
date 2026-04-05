@@ -3,49 +3,182 @@
 
 const http = require('node:http');
 const fs = require('node:fs');
+const path = require('node:path');
+const os = require('node:os');
 const { randomUUID } = require('node:crypto');
+const toml = require('toml');
+
+// ---------------------------------------------------------------------------
+// SQLite Message Store (better-sqlite3)
+// ---------------------------------------------------------------------------
+const Database = require('better-sqlite3');
+const DB_PATH = process.env.WHATSAPP_DB_PATH || path.join(__dirname, 'messages.db');
+
+const db = new Database(DB_PATH);
+db.pragma('journal_mode = WAL');
+db.pragma('busy_timeout = 5000');
+
+// Set file permissions to 600 (owner read/write only)
+fs.chmodSync(DB_PATH, 0o600);
+
+// Schema
+db.exec(`
+  CREATE TABLE IF NOT EXISTS messages (
+    id TEXT PRIMARY KEY,
+    jid TEXT NOT NULL,
+    sender_jid TEXT,
+    push_name TEXT,
+    phone TEXT,
+    text TEXT,
+    direction TEXT NOT NULL,
+    timestamp INTEGER NOT NULL,
+    processed INTEGER DEFAULT 0,
+    retry_count INTEGER DEFAULT 0,
+    raw_type TEXT,
+    created_at TEXT DEFAULT (datetime('now'))
+  );
+  CREATE INDEX IF NOT EXISTS idx_messages_jid_ts ON messages(jid, timestamp);
+  CREATE INDEX IF NOT EXISTS idx_messages_processed ON messages(processed);
+`);
+
+// Track last-seen timestamp per JID (for gap detection — Fase 3.2 Option C)
+db.exec(`
+  CREATE TABLE IF NOT EXISTS jid_last_seen (
+    jid TEXT PRIMARY KEY,
+    last_timestamp INTEGER NOT NULL,
+    updated_at TEXT DEFAULT (datetime('now'))
+  );
+`);
+
+console.log(`[gateway] SQLite message store initialized: ${DB_PATH}`);
+
+// --- Prepared statements (reusable, faster) ---
+const stmtInsertMsg = db.prepare(`
+  INSERT OR IGNORE INTO messages (id, jid, sender_jid, push_name, phone, text, direction, timestamp, processed, raw_type)
+  VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+`);
+
+const stmtMarkProcessed = db.prepare(`
+  UPDATE messages SET processed = ? WHERE id = ?
+`);
+
+const stmtIncrRetry = db.prepare(`
+  UPDATE messages SET retry_count = retry_count + 1 WHERE id = ?
+`);
+
+const stmtMarkFailed = db.prepare(`
+  UPDATE messages SET processed = -1 WHERE id = ?
+`);
+
+const stmtGetByJid = db.prepare(`
+  SELECT id, jid, sender_jid, push_name, phone, text, direction, timestamp, processed, raw_type
+  FROM messages WHERE jid = ? AND timestamp >= ? ORDER BY timestamp DESC LIMIT ?
+`);
+
+const stmtGetUnprocessed = db.prepare(`
+  SELECT id, jid, sender_jid, push_name, phone, text, direction, timestamp, retry_count, raw_type
+  FROM messages WHERE processed = 0 AND timestamp < ? ORDER BY timestamp ASC
+`);
+
+const stmtCleanupOld = db.prepare(`
+  DELETE FROM messages WHERE timestamp < ? AND processed IN (1, -1)
+`);
+
+const stmtUpsertLastSeen = db.prepare(`
+  INSERT INTO jid_last_seen (jid, last_timestamp, updated_at)
+  VALUES (?, ?, datetime('now'))
+  ON CONFLICT(jid) DO UPDATE SET last_timestamp = excluded.last_timestamp, updated_at = datetime('now')
+`);
+
+const stmtGetLastSeen = db.prepare(`
+  SELECT jid, last_timestamp FROM jid_last_seen
+`);
+
+/**
+ * Save a message to the SQLite store.
+ */
+function dbSaveMessage({ id, jid, senderJid, pushName, phone, text, direction, timestamp, processed, rawType }) {
+  try {
+    stmtInsertMsg.run(id, jid, senderJid || null, pushName || null, phone || null, text || null, direction, timestamp, processed || 0, rawType || null);
+  } catch (err) {
+    console.error(`[gateway][db] Failed to save message ${id}: ${err.message}`);
+  }
+}
+
+/**
+ * Mark a message as processed (1) or failed (-1).
+ */
+function dbMarkProcessed(msgId, status) {
+  try {
+    stmtMarkProcessed.run(status, msgId);
+  } catch (err) {
+    console.error(`[gateway][db] Failed to mark message ${msgId}: ${err.message}`);
+  }
+}
+
+/**
+ * Get messages for a JID, optionally filtered by since timestamp.
+ */
+function dbGetMessagesByJid(jid, limit = 20, since = 0) {
+  return stmtGetByJid.all(jid, since, limit);
+}
+
+/**
+ * Get all unprocessed messages older than a threshold (epoch ms).
+ */
+function dbGetUnprocessed(olderThan) {
+  return stmtGetUnprocessed.all(olderThan);
+}
+
+/**
+ * Increment retry count for a message. If retry_count >= maxRetries, mark as permanently failed.
+ */
+function dbIncrRetryOrFail(msgId, maxRetries = 3) {
+  const msg = db.prepare('SELECT retry_count FROM messages WHERE id = ?').get(msgId);
+  if (!msg) return;
+  if (msg.retry_count + 1 >= maxRetries) {
+    stmtMarkFailed.run(msgId);
+    console.warn(`[gateway][db] Message ${msgId} permanently failed after ${maxRetries} retries`);
+  } else {
+    stmtIncrRetry.run(msgId);
+  }
+}
+
+/**
+ * Delete old processed/failed messages.
+ */
+function dbCleanupOld(olderThanMs) {
+  const result = stmtCleanupOld.run(olderThanMs);
+  return result.changes;
+}
+
+/**
+ * Update last-seen timestamp for a JID.
+ */
+function dbUpdateLastSeen(jid, timestamp) {
+  try {
+    stmtUpsertLastSeen.run(jid, timestamp);
+  } catch (err) {
+    console.error(`[gateway][db] Failed to update last_seen for ${jid}: ${err.message}`);
+  }
+}
 
 // ---------------------------------------------------------------------------
 // Read config.toml — the gateway reads its own config directly
 // ---------------------------------------------------------------------------
-const CONFIG_PATH = process.env.LIBREFANG_CONFIG || '/data/config.toml';
+const CONFIG_PATH = process.env.LIBREFANG_CONFIG || path.join(os.homedir(), '.librefang', 'config.toml');
 
 function readWhatsAppConfig(configPath) {
   const defaults = { default_agent: 'assistant', owner_numbers: [], conversation_ttl_hours: 24 };
   try {
     const content = fs.readFileSync(configPath, 'utf8');
-    const lines = content.split('\n');
-    let inWhatsApp = false;
-    const cfg = { ...defaults };
-
-    for (const line of lines) {
-      const trimmed = line.trim();
-      // Detect section headers
-      if (/^\[/.test(trimmed)) {
-        inWhatsApp = trimmed === '[channels.whatsapp]';
-        continue;
-      }
-      if (!inWhatsApp) continue;
-
-      const m = trimmed.match(/^(\w+)\s*=\s*(.+)$/);
-      if (!m) continue;
-      const [, key, rawVal] = m;
-
-      if (key === 'default_agent') {
-        cfg.default_agent = rawVal.replace(/^["']|["']$/g, '');
-      } else if (key === 'owner_numbers') {
-        // Parse TOML array: ["393760105565", "393407682386"]
-        const arrMatch = rawVal.match(/\[([^\]]*)\]/);
-        if (arrMatch) {
-          cfg.owner_numbers = arrMatch[1]
-            .split(',')
-            .map(s => s.trim().replace(/^["']|["']$/g, ''))
-            .filter(Boolean);
-        }
-      } else if (key === 'conversation_ttl_hours') {
-        cfg.conversation_ttl_hours = parseInt(rawVal, 10) || defaults.conversation_ttl_hours;
-      }
-    }
+    const parsed = toml.parse(content);
+    const wa = parsed?.channels?.whatsapp || {};
+    const cfg = {
+      default_agent: wa.default_agent || defaults.default_agent,
+      owner_numbers: Array.isArray(wa.owner_numbers) ? wa.owner_numbers : defaults.owner_numbers,
+      conversation_ttl_hours: parseInt(wa.conversation_ttl_hours, 10) || defaults.conversation_ttl_hours,
+    };
     console.log(`[gateway] Read config from ${configPath}: default_agent="${cfg.default_agent}", owner_numbers=${JSON.stringify(cfg.owner_numbers)}, conversation_ttl_hours=${cfg.conversation_ttl_hours}`);
     return cfg;
   } catch (err) {
@@ -109,6 +242,57 @@ let cachedAgentId = null;
 
 // The user's own JID (set after connection opens) for self-chat detection
 let ownJid = null;
+
+// ---------------------------------------------------------------------------
+// Markdown → WhatsApp formatting conversion
+// ---------------------------------------------------------------------------
+// LLM responses use standard Markdown but WhatsApp has its own formatting
+// syntax. Convert the most common patterns so messages render correctly.
+function markdownToWhatsApp(text) {
+  if (!text) return text;
+
+  // Step 1: Protect inline code from formatting — replace with placeholders.
+  // Must run BEFORE bold/italic so `**bold**` inside backticks is untouched.
+  const codeSlots = [];
+  text = text.replace(/(?<!`)(`{1})(?!`)(.+?)(?<!`)\1(?!`)/g, (_, _tick, content) => {
+    const idx = codeSlots.length;
+    codeSlots.push(content);
+    return '\x01CODE' + idx + 'CODE\x01';
+  });
+
+  // Step 2: Protect backslash-escaped stars — \* should stay literal.
+  text = text.replace(/\\\*/g, '\x01ESCAPED_STAR\x01');
+
+  // Step 3: Bold — **text** or __text__ → placeholder.
+  // Only **text** is treated as bold. The __text__ form is intentionally
+  // skipped because it's ambiguous with Python dunders (__init__, __main__).
+  // LLM responses almost always use ** for bold.
+  // Escape any `*` inside bold content to \x02 to prevent italic regex collision.
+  text = text.replace(/\*\*(.+?)\*\*/g, (_, inner) => '\x01BOLD' + inner.replace(/\*/g, '\x02') + 'BOLD\x01');
+
+  // Step 4: Italic — *text* → _text_ (WhatsApp italic).
+  // Exclude bullet-list items: lines starting with `* ` (star + space).
+  text = text.replace(/(?<!\*)\*(?!\*)(?!\s)(.+?)(?<!\s|\*)\*(?!\*)/g, (match, inner, offset) => {
+    // Check if this is a bullet list item (star at line start followed by space)
+    const lineStart = text.lastIndexOf('\n', offset - 1) + 1;
+    if (offset === lineStart && text[offset + 1] === ' ') return match;
+    return '_' + inner + '_';
+  });
+
+  // Step 5: Restore bold placeholders → *text* (WhatsApp bold)
+  text = text.replace(/\x01BOLD(.+?)BOLD\x01/g, (_, inner) => '*' + inner.replace(/\x02/g, '*') + '*');
+
+  // Step 6: Strikethrough — ~~text~~ → ~text~
+  text = text.replace(/~~(.+?)~~/g, '~$1~');
+
+  // Step 7: Restore inline code placeholders → ```text``` (WhatsApp monospace)
+  text = text.replace(/\x01CODE(\d+)CODE\x01/g, (_, idx) => '```' + codeSlots[Number(idx)] + '```');
+
+  // Step 8: Restore escaped stars → literal *
+  text = text.replace(/\x01ESCAPED_STAR\x01/g, '*');
+
+  return text;
+}
 
 // ---------------------------------------------------------------------------
 // Step B: Conversation Tracker — in-memory Map with TTL
@@ -234,6 +418,14 @@ function shouldDebounceEscalation(strangerJid) {
   return false;
 }
 
+// Cleanup stale escalation entries every 10 minutes
+setInterval(() => {
+  const now = Date.now();
+  for (const [jid, ts] of lastEscalationTime) {
+    if (now - ts > ESCALATION_DEBOUNCE_MS) lastEscalationTime.delete(jid);
+  }
+}, 10 * 60 * 1000);
+
 // ---------------------------------------------------------------------------
 // Step D: Build active conversations context block for owner messages
 // ---------------------------------------------------------------------------
@@ -292,12 +484,11 @@ function buildStrangerContext(pushName, phone, strangerJid) {
 // ---------------------------------------------------------------------------
 // Step C: Parse NOTIFY_OWNER tags from agent response
 // ---------------------------------------------------------------------------
-const NOTIFY_OWNER_REGEX = /\[NOTIFY_OWNER\]\s*(\{[\s\S]*?\})\s*\[\/NOTIFY_OWNER\]/g;
+const NOTIFY_OWNER_RE = /\[NOTIFY_OWNER\]\s*(\{[\s\S]*?\})\s*\[\/NOTIFY_OWNER\]/g;
 
 function extractNotifyOwner(responseText) {
   const notifications = [];
-  let match;
-  while ((match = NOTIFY_OWNER_REGEX.exec(responseText)) !== null) {
+  for (const match of responseText.matchAll(NOTIFY_OWNER_RE)) {
     try {
       const parsed = JSON.parse(match[1]);
       notifications.push({
@@ -308,11 +499,7 @@ function extractNotifyOwner(responseText) {
       console.error('[gateway] Failed to parse NOTIFY_OWNER JSON:', match[1]);
     }
   }
-  NOTIFY_OWNER_REGEX.lastIndex = 0;
-
-  const cleanedText = responseText.replace(NOTIFY_OWNER_REGEX, '').trim();
-  NOTIFY_OWNER_REGEX.lastIndex = 0;
-
+  const cleanedText = responseText.replace(NOTIFY_OWNER_RE, '').trim();
   return { notifications, cleanedText };
 }
 
@@ -322,16 +509,11 @@ function extractNotifyOwner(responseText) {
 
 // The agent can embed a relay command in its response using this JSON format:
 // [RELAY_TO_STRANGER]{"jid":"...@s.whatsapp.net","message":"..."}[/RELAY_TO_STRANGER]
-const RELAY_REGEX = /\[RELAY_TO_STRANGER\]\s*(\{[\s\S]*?\})\s*\[\/RELAY_TO_STRANGER\]/g;
+const RELAY_RE = /\[RELAY_TO_STRANGER\]\s*(\{[\s\S]*?\})\s*\[\/RELAY_TO_STRANGER\]/g;
 
-/**
- * Extract relay commands from agent response text.
- * Returns { relays: [{jid, message}], cleanedText: string }
- */
 function extractRelayCommands(responseText) {
   const relays = [];
-  let match;
-  while ((match = RELAY_REGEX.exec(responseText)) !== null) {
+  for (const match of responseText.matchAll(RELAY_RE)) {
     try {
       const parsed = JSON.parse(match[1]);
       if (parsed.jid && parsed.message) {
@@ -341,13 +523,7 @@ function extractRelayCommands(responseText) {
       console.error('[gateway] Failed to parse relay command JSON:', match[1]);
     }
   }
-  // Reset regex lastIndex for reuse
-  RELAY_REGEX.lastIndex = 0;
-
-  // Remove relay blocks from the text the owner sees
-  const cleanedText = responseText.replace(RELAY_REGEX, '').trim();
-  RELAY_REGEX.lastIndex = 0;
-
+  const cleanedText = responseText.replace(RELAY_RE, '').trim();
   return { relays, cleanedText };
 }
 
@@ -376,13 +552,15 @@ async function executeRelay(relay) {
   }
 
   try {
-    await sock.sendMessage(jid, { text: message });
+    const sentRelay = await sock.sendMessage(jid, { text: markdownToWhatsApp(message) });
 
     // F4: Audit log
     console.log(`[gateway] RELAY SENT | to: ${convo.pushName} (${convo.phone}) [${jid}] | message: "${message.substring(0, 100)}" | timestamp: ${new Date().toISOString()}`);
 
     // Update conversation tracker with outbound message
     trackMessage(jid, convo.pushName, convo.phone, message, 'outbound');
+    // Save relay outbound to DB
+    dbSaveMessage({ id: sentRelay?.key?.id || randomUUID(), jid, senderJid: ownJid, pushName: null, phone: convo.phone, text: message, direction: 'outbound', timestamp: Date.now(), processed: 1, rawType: 'text' });
 
     return { success: true, recipient: convo.pushName, phone: convo.phone };
   } catch (err) {
@@ -458,6 +636,16 @@ function resolveAgentId() {
 // ---------------------------------------------------------------------------
 // Baileys connection
 // ---------------------------------------------------------------------------
+async function cleanupSocket() {
+  if (!sock) return;
+  const previousSock = sock;
+  sock = null;
+  ownJid = null;
+  try { previousSock.ev?.removeAllListeners?.(); } catch {}
+  try { previousSock.ws?.close?.(); } catch {}
+  try { previousSock.end?.(); } catch {}
+}
+
 async function startConnection() {
   if (isConnecting) {
     console.log('[gateway] Connection attempt already in progress, skipping');
@@ -523,10 +711,8 @@ async function startConnection() {
         connStatus = 'disconnected';
         statusMessage = 'Logged out. Generate a new QR code to reconnect.';
         qrDataUrl = '';
-        sock = null;
-        ownJid = null;
+        await cleanupSocket();
         reconnectAttempts = 0;
-        // Invalidate cached agent ID so it re-resolves on next connect
         cachedAgentId = null;
         // Remove auth store so next connect gets a fresh QR
         const fs = require('node:fs');
@@ -540,8 +726,7 @@ async function startConnection() {
         connStatus = 'disconnected';
         statusMessage = `Disconnected: ${reason}. Use POST /login/start to reconnect.`;
         qrDataUrl = '';
-        sock = null;
-        ownJid = null;
+        await cleanupSocket();
       } else {
         // All other disconnect reasons are treated as recoverable
         reconnectAttempts += 1;
@@ -641,7 +826,7 @@ async function startConnection() {
         const locName = loc.name || loc.address || '';
         const locLabel = locName ? `${locName} — ` : '';
         // Override mediaDescriptor with enriched location text
-        const locationText = `[Posizione: ${locLabel}${lat}, ${lon} — https://maps.google.com/?q=${lat},${lon}]`;
+        const locationText = `[Location: ${locLabel}${lat}, ${lon} — https://maps.google.com/?q=${lat},${lon}]`;
         // Fall through to normal message processing with this text
         innerMsg._overrideMediaText = locationText;
       }
@@ -656,7 +841,7 @@ async function startConnection() {
         if (telMatch) contactPhone = telMatch[1].trim();
         const fnMatch = vcard.match(/FN:(.+)/i);
         if (fnMatch && !contactName) contactName = fnMatch[1].trim();
-        innerMsg._overrideMediaText = `[Contatto condiviso: ${contactName}${contactPhone ? ' ' + contactPhone : ''}]`;
+        innerMsg._overrideMediaText = `[Shared contact: ${contactName}${contactPhone ? ' ' + contactPhone : ''}]`;
       }
       if (innerMsg.contactsArrayMessage) {
         const contacts = innerMsg.contactsArrayMessage.contacts || [];
@@ -667,7 +852,7 @@ async function startConnection() {
           const phone = telMatch ? telMatch[1].trim() : '';
           return `${name}${phone ? ' ' + phone : ''}`;
         });
-        innerMsg._overrideMediaText = `[Contatti condivisi: ${parsed.join(', ')}]`;
+        innerMsg._overrideMediaText = `[Shared contacts: ${parsed.join(', ')}]`;
       }
 
       // Skip if there's nothing to process
@@ -690,8 +875,20 @@ async function startConnection() {
       const isOwner = OWNER_JIDS.size > 0 && (OWNER_JIDS.has(sender) || (senderPnJid && OWNER_JIDS.has(senderPnJid)));
       const isStranger = !isGroup && OWNER_JIDS.size > 0 && !isOwner;
 
-      // Rate limiting for strangers
-      if (isStranger && isRateLimited(sender)) {
+      // Detect @mention: check if our JID is in the mentionedJid list
+      let wasMentioned = false;
+      if (isGroup && ownJid) {
+        const mentionedJids = innerMsg.extendedTextMessage?.contextInfo?.mentionedJid
+          || innerMsg.imageMessage?.contextInfo?.mentionedJid
+          || innerMsg.videoMessage?.contextInfo?.mentionedJid
+          || [];
+        // ownJid is normalized like "1234567890@s.whatsapp.net"
+        const ownNumber = ownJid.replace(/@.*$/, '');
+        wasMentioned = mentionedJids.some(jid => jid.replace(/@.*$/, '') === ownNumber);
+      }
+
+      // Rate limiting for strangers and group messages
+      if ((isStranger || isGroup) && isRateLimited(sender)) {
         console.log(`[gateway] Rate limited: ${pushName} (${phone}) — dropping message`);
         continue;
       }
@@ -723,7 +920,7 @@ async function startConnection() {
             if (transcriptionText) {
               // Audio with transcription: use transcription as message text
               const ptt = innerMsg.audioMessage?.ptt;
-              messageText = `[${ptt ? 'Vocale' : 'Audio'} trascritto]: ${transcriptionText}`;
+              messageText = `[${ptt ? 'Voice' : 'Audio'} transcription]: ${transcriptionText}`;
             } else {
               messageText = innerMsg._overrideMediaText || getMediaFilename(downloadableMedia.type, downloadableMedia.msg);
             }
@@ -734,7 +931,7 @@ async function startConnection() {
         } else {
           // Download/upload failed — fall back to text descriptor
           console.warn(`[gateway] Media processing failed, falling back to text descriptor`);
-          messageText = messageText || innerMsg._overrideMediaText || mediaDescriptor || '[Media non processabile]';
+          messageText = messageText || innerMsg._overrideMediaText || mediaDescriptor || '[Unprocessable media]';
         }
       } else if (innerMsg._overrideMediaText) {
         // Location or contact — no downloadable media, just enriched text
@@ -771,10 +968,39 @@ async function startConnection() {
 
       // --- FASE 2: Forwarded message context ---
       if (contextInfo?.isForwarded) {
-        messageText = `[Messaggio inoltrato]\n${messageText}`;
+        messageText = `[Forwarded message]\n${messageText}`;
       }
 
       console.log(`[gateway] Incoming from ${pushName} (${phone}): ${messageText.substring(0, 80)}${attachments.length ? ` [+${attachments.length} attachment(s)]` : ''}`);
+
+      // --- Message Store: determine raw type ---
+      const rawType = downloadableMedia ? downloadableMedia.type.replace('Message', '')
+        : innerMsg.locationMessage ? 'location'
+        : innerMsg.contactMessage ? 'contact'
+        : innerMsg.contactsArrayMessage ? 'contacts'
+        : innerMsg.reactionMessage ? 'reaction'
+        : 'text';
+
+      // --- Message Store: save inbound message BEFORE processing (processed=0) ---
+      const msgTimestamp = (msg.messageTimestamp
+        ? (typeof msg.messageTimestamp === 'number' ? msg.messageTimestamp * 1000 : Number(msg.messageTimestamp) * 1000)
+        : Date.now());
+      dbSaveMessage({
+        id: msg.key.id,
+        jid: sender,
+        senderJid: msg.key.participant || sender,
+        pushName,
+        phone,
+        text: messageText,
+        direction: 'inbound',
+        timestamp: msgTimestamp,
+        processed: 0,
+        rawType,
+      });
+      dbUpdateLastSeen(sender, msgTimestamp);
+
+      // Send read receipt (blue ticks) immediately
+      await sock.readMessages([msg.key]);
 
       // Forward to LibreFang agent
       try {
@@ -788,7 +1014,8 @@ async function startConnection() {
         let systemPrefix = '';
 
         if (isGroup) {
-          messageToSend = messageText;
+          // Include sender identity so the LLM knows who is talking in the group
+          messageToSend = `[Group message from ${pushName || phone}]\n${messageText}`;
         } else if (isStranger) {
           const strangerContext = buildStrangerContext(pushName, phone, sender);
           messageToSend = strangerContext + messageText;
@@ -800,20 +1027,50 @@ async function startConnection() {
           messageToSend = messageText;
         }
 
-        const response = await forwardToLibreFang(messageToSend, systemPrefix, phone, pushName, isOwner, attachments);
+        // --- Streaming: progressive message edits while LLM generates ---
+        let streamMsgKey = null; // key of the initial WhatsApp message we'll edit
+        const onProgress = async (partialText) => {
+          if (!sock) return;
+          const formatted = markdownToWhatsApp(partialText);
+          if (!streamMsgKey) {
+            const sent = await sock.sendMessage(sender, { text: formatted });
+            streamMsgKey = sent?.key;
+          } else {
+            await sock.sendMessage(sender, { text: formatted, edit: streamMsgKey });
+          }
+        };
+
+        const rawResponse = await forwardToLibreFangStreaming(
+          messageToSend, systemPrefix, phone, pushName, isOwner, attachments, onProgress,
+        );
+        const response = markdownToWhatsApp(rawResponse);
+
+        // Helper: send a new message or edit the streamed one for final delivery
+        const sendOrEdit = async (jid, finalText) => {
+          if (streamMsgKey && jid === sender) {
+            // Edit the message we've been streaming
+            await sock.sendMessage(jid, { text: finalText, edit: streamMsgKey });
+            return streamMsgKey;
+          }
+          // No streaming happened (fallback path) — send new message
+          return (await sock.sendMessage(jid, { text: finalText }))?.key;
+        };
 
         if (response && sock) {
           if (isStranger) {
             // Step C: Agent response goes to STRANGER, not owner
             const { notifications, cleanedText } = extractNotifyOwner(response);
 
-            // Send cleaned response to the stranger
+            // Send cleaned response to the stranger (format after tag extraction)
             if (cleanedText) {
-              await sock.sendMessage(sender, { text: cleanedText });
-              console.log(`[gateway] Replied to stranger ${pushName} (${phone})`);
+              const formattedText = markdownToWhatsApp(cleanedText);
+              const sentKey = await sendOrEdit(sender, formattedText);
+              console.log(`[gateway] Replied to stranger ${pushName} (${phone})${streamMsgKey ? ' (streamed)' : ''}`);
 
               // Track outbound message
               trackMessage(sender, pushName, phone, cleanedText, 'outbound');
+              // Save outbound to DB
+              dbSaveMessage({ id: sentKey?.id || randomUUID(), jid: sender, senderJid: ownJid, pushName: null, phone, text: cleanedText, direction: 'outbound', timestamp: Date.now(), processed: 1, rawType: 'text' });
             }
 
             // Step C + F: If NOTIFY_OWNER tags found, send notification to owner
@@ -830,7 +1087,7 @@ async function startConnection() {
 
               const ownerNotif = notif.summary || `[${pushName}] ${notif.reason}`;
 
-              // Bug fix: Send to ALL owner JIDs (or use primary)
+              // Send notification to primary owner
               await sock.sendMessage(OWNER_JID, { text: ownerNotif });
               console.log(`[gateway] NOTIFY_OWNER sent for ${pushName}: ${notif.reason}`);
             }
@@ -856,28 +1113,99 @@ async function startConnection() {
                 console.log(`[gateway] Relay delivered to ${r.recipient} (${r.phone})`);
               } else {
                 console.error(`[gateway] Relay failed: ${r.error}`);
-                const failLine = `\n✗ Invio fallito: ${r.error}`;
+                const failLine = `\n✗ Relay failed: ${r.error}`;
                 ownerReply = ownerReply ? ownerReply + failLine : failLine.trim();
               }
             }
 
             if (ownerReply) {
-              // Bug fix: Reply to the SENDER's JID, not always OWNER_JID[0]
-              await sock.sendMessage(sender, { text: ownerReply });
-              console.log(`[gateway] Replied to owner (${sender})`);
+              ownerReply = markdownToWhatsApp(ownerReply);
+              const sentKey = await sendOrEdit(sender, ownerReply);
+              console.log(`[gateway] Replied to owner (${sender})${streamMsgKey ? ' (streamed)' : ''}`);
+              dbSaveMessage({ id: sentKey?.id || randomUUID(), jid: sender, senderJid: ownJid, pushName: null, phone, text: ownerReply, direction: 'outbound', timestamp: Date.now(), processed: 1, rawType: 'text' });
             }
 
           } else {
             // Groups or no owner routing — reply directly
-            await sock.sendMessage(sender, { text: response });
+            const finalText = markdownToWhatsApp(response);
+            const sentKey = await sendOrEdit(sender, finalText);
             console.log(`[gateway] Replied to ${pushName}`);
+            dbSaveMessage({ id: sentKey?.id || randomUUID(), jid: sender, senderJid: ownJid, pushName: null, phone, text: response, direction: 'outbound', timestamp: Date.now(), processed: 1, rawType: 'text' });
           }
         }
+
+        // --- Message Store: mark inbound message as processed ---
+        dbMarkProcessed(msg.key.id, 1);
+
       } catch (err) {
         console.error(`[gateway] Forward/reply failed:`, err.message);
+        // Message stays processed=0 in DB — catch-up sweep will retry later
       }
     }
   });
+
+  // -------------------------------------------------------------------------
+  // Fase 3.2 — Option A: Hook messages.update for failed decryptions
+  // -------------------------------------------------------------------------
+  sock.ev.on('messages.update', (updates) => {
+    for (const update of updates) {
+      // Baileys emits update.message with error info for decryption failures
+      const key = update.key;
+      const updateData = update.update || {};
+
+      // Check for message retry / decryption error signals
+      if (updateData.messageStubType || updateData.status === 'ERROR' || updateData.status === 5) {
+        const jid = key?.remoteJid || 'unknown';
+        const msgId = key?.id || 'unknown';
+        console.warn(`[gateway][session-error] Possible decryption failure detected — jid: ${jid}, msgId: ${msgId}, stub: ${updateData.messageStubType || 'none'}, status: ${updateData.status || 'none'}`);
+
+        // Save a placeholder in DB so the catch-up sweep can attempt recovery
+        dbSaveMessage({
+          id: msgId,
+          jid,
+          senderJid: key?.participant || null,
+          pushName: null,
+          phone: null,
+          text: '[DECRYPTION_FAILED — message could not be read]',
+          direction: 'inbound',
+          timestamp: Date.now(),
+          processed: 0,
+          rawType: 'decryption_error',
+        });
+      }
+    }
+  });
+
+  // -------------------------------------------------------------------------
+  // Fase 3.2 — Option C: Gap detection — warn if active chat goes silent
+  // -------------------------------------------------------------------------
+  const GAP_DETECTION_INTERVAL_MS = 10 * 60 * 1000;  // check every 10 min
+  const GAP_THRESHOLD_MS = 30 * 60 * 1000;            // 30 min silence = warning
+
+  const gapDetectionTimer = setInterval(() => {
+    if (connStatus !== 'connected') return;
+    const allLastSeen = stmtGetLastSeen.all();
+    const now = Date.now();
+    for (const row of allLastSeen) {
+      // Only check JIDs that had recent activity (within last 2 hours)
+      if (now - row.last_timestamp > 2 * 60 * 60 * 1000) continue;
+      const gap = now - row.last_timestamp;
+      if (gap > GAP_THRESHOLD_MS) {
+        // Check if there's an active conversation for this JID (only warn for active ones)
+        if (activeConversations.has(row.jid)) {
+          console.warn(`[gateway][gap-detect] No messages from ${row.jid} for ${Math.round(gap / 60000)}min — possible message loss`);
+        }
+      }
+    }
+  }, GAP_DETECTION_INTERVAL_MS);
+
+  // Clean up interval on socket close to prevent leaks on reconnect
+  sock.ev.on('connection.update', (update) => {
+    if (update.connection === 'close') {
+      clearInterval(gapDetectionTimer);
+    }
+  });
+
   } finally {
     isConnecting = false;
   }
@@ -1081,7 +1409,7 @@ async function processMediaMessage(fullMsg, innerMsg, agentId) {
     // Size check
     if (buffer.length > MAX_MEDIA_SIZE) {
       console.warn(`[gateway] Media too large: ${(buffer.length / 1024 / 1024).toFixed(1)}MB > ${MAX_MEDIA_SIZE / 1024 / 1024}MB`);
-      return { fallbackText: `[File troppo grande: ${(buffer.length / 1024 / 1024).toFixed(0)}MB, limite ${MAX_MEDIA_SIZE / 1024 / 1024}MB]` };
+      return { fallbackText: `[File too large: ${(buffer.length / 1024 / 1024).toFixed(0)}MB, limit ${MAX_MEDIA_SIZE / 1024 / 1024}MB]` };
     }
 
     const startTime = Date.now();
@@ -1131,7 +1459,9 @@ function buildRelaySystemInstruction() {
 // ---------------------------------------------------------------------------
 // Forward incoming message to LibreFang API, return agent response
 // ---------------------------------------------------------------------------
-async function forwardToLibreFang(text, systemPrefix, phone, pushName, isOwner, attachments) {
+const MAX_FORWARD_RETRIES = 1;
+
+async function forwardToLibreFang(text, systemPrefix, phone, pushName, isOwner, attachments, { isGroup = false, wasMentioned = false } = {}, retryCount = 0) {
   // Resolve agent UUID if not cached (or if invalidated on reconnect)
   if (!cachedAgentId) {
     try {
@@ -1149,6 +1479,8 @@ async function forwardToLibreFang(text, systemPrefix, phone, pushName, isOwner, 
     channel_type: 'whatsapp',
     sender_id: phone,
     sender_name: pushName,
+    is_group: isGroup,
+    was_mentioned: wasMentioned,
   };
 
   // Include attachments if present
@@ -1179,22 +1511,43 @@ async function forwardToLibreFang(text, systemPrefix, phone, pushName, isOwner, 
         res.on('end', () => {
           // If the agent UUID became stale (404), invalidate cache and retry once
           if (res.statusCode === 404) {
-            console.log('[gateway] Agent UUID stale (404), re-resolving...');
-            cachedAgentId = null;
-            // Retry once with fresh UUID
-            resolveAgentId()
-              .then(() => forwardToLibreFang(text, systemPrefix, phone, pushName, isOwner, attachments))
-              .then(resolve)
-              .catch(reject);
-            return;
+            if (retryCount < MAX_FORWARD_RETRIES) {
+              console.log('[gateway] Agent UUID stale (404), re-resolving...');
+              cachedAgentId = null;
+              resolveAgentId()
+                .then(() => forwardToLibreFang(text, systemPrefix, phone, pushName, isOwner, attachments, { isGroup, wasMentioned }, retryCount + 1))
+                .then(resolve)
+                .catch(reject);
+              return;
+            }
+            console.error('[gateway] Agent UUID still 404 after retry, giving up');
+            return reject(new Error('Agent not found after retry'));
           }
 
           try {
             const data = JSON.parse(body);
+            // Silent completion — agent intentionally chose not to reply (NO_REPLY)
+            if (data.silent) {
+              resolve('');
+              return;
+            }
             // The /api/agents/{id}/message endpoint returns { response: "..." }
-            resolve(data.response || data.message || data.text || '');
+            const responseText = data.response || data.message || data.text || '';
+            // Safety net: strip NO_REPLY token if it leaked through as text
+            const trimmed = responseText.trim();
+            if (trimmed === 'NO_REPLY' || trimmed.endsWith('\nNO_REPLY')) {
+              resolve('');
+              return;
+            }
+            resolve(responseText);
           } catch {
-            resolve(body.trim() || '');
+            // Non-JSON fallback — still check for NO_REPLY
+            const fallback = body.trim() || '';
+            if (fallback === 'NO_REPLY' || fallback.endsWith('\nNO_REPLY')) {
+              resolve('');
+              return;
+            }
+            resolve(fallback);
           }
         });
       },
@@ -1211,6 +1564,271 @@ async function forwardToLibreFang(text, systemPrefix, phone, pushName, isOwner, 
 }
 
 // ---------------------------------------------------------------------------
+// Streaming forward — SSE version with progressive WhatsApp message edits
+// ---------------------------------------------------------------------------
+
+/** Minimum interval (ms) between WhatsApp message edits during streaming. */
+const STREAMING_EDIT_INTERVAL_MS = 2000;
+
+/**
+ * Forward a message to LibreFang using the SSE streaming endpoint.
+ * Calls `onProgress(accumulatedText)` periodically so the caller can
+ * edit the WhatsApp message in-place.  Returns the complete response text.
+ *
+ * Falls back to the non-streaming `forwardToLibreFang()` on any SSE error.
+ *
+ * @param {string} text
+ * @param {string} systemPrefix
+ * @param {string} phone
+ * @param {string} pushName
+ * @param {boolean} isOwner
+ * @param {object[]} attachments
+ * @param {(text: string) => Promise<void>} onProgress
+ * @returns {Promise<string>} complete response
+ */
+async function forwardToLibreFangStreaming(text, systemPrefix, phone, pushName, isOwner, attachments, onProgress) {
+  // Resolve agent UUID if not cached
+  if (!cachedAgentId) {
+    try {
+      await resolveAgentId();
+    } catch (err) {
+      console.error(`[gateway] Agent resolution failed: ${err.message}`);
+      throw err;
+    }
+  }
+
+  const fullMessage = systemPrefix ? systemPrefix + text : text;
+
+  const payload = {
+    message: fullMessage,
+    channel_type: 'whatsapp',
+    sender_id: phone,
+    sender_name: pushName,
+  };
+
+  if (attachments && attachments.length > 0) {
+    payload.attachments = attachments;
+  }
+
+  const payloadStr = JSON.stringify(payload);
+
+  return new Promise((resolve, reject) => {
+    const url = new URL(`${LIBREFANG_URL}/api/agents/${encodeURIComponent(cachedAgentId)}/message/stream`);
+
+    const req = http.request(
+      {
+        hostname: url.hostname,
+        port: url.port || 4545,
+        path: url.pathname,
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'Content-Length': Buffer.byteLength(payloadStr),
+          Accept: 'text/event-stream',
+        },
+        timeout: 180_000, // streaming can take longer
+      },
+      (res) => {
+        // Non-200 or non-SSE → fall back to non-streaming
+        const ct = res.headers['content-type'] || '';
+        if (res.statusCode !== 200 || !ct.includes('text/event-stream')) {
+          let body = '';
+          res.on('data', (chunk) => (body += chunk));
+          res.on('end', () => {
+            console.warn(`[gateway] SSE endpoint returned ${res.statusCode}, falling back to non-streaming`);
+            forwardToLibreFang(text, systemPrefix, phone, pushName, isOwner, attachments, { isGroup, wasMentioned })
+              .then(resolve)
+              .catch(reject);
+          });
+          return;
+        }
+
+        let accumulated = '';
+        let lastEditTime = 0;
+        let pendingEdit = null;
+        let buf = '';
+
+        res.setEncoding('utf8');
+        res.on('data', (raw) => {
+          buf += raw;
+          // SSE frames are separated by double newlines
+          const parts = buf.split('\n\n');
+          buf = parts.pop(); // keep incomplete frame in buffer
+
+          for (const frame of parts) {
+            let eventType = 'message';
+            let dataStr = '';
+            for (const line of frame.split('\n')) {
+              if (line.startsWith('event:')) eventType = line.slice(6).trim();
+              else if (line.startsWith('data:')) dataStr += line.slice(5).trim();
+            }
+            if (!dataStr) continue;
+
+            if (eventType === 'phase') {
+              // Transient status (e.g. "still working..."). Show via onProgress
+              // but DON'T add to accumulated — next real chunk overwrites it.
+              try {
+                const parsed = JSON.parse(dataStr);
+                if (parsed.phase === 'long_running' && onProgress) {
+                  // Don't send phase updates if accumulated text is NO_REPLY
+                  const accTrim = accumulated.trim();
+                  if (/(?:^|\n)\s*NO_REPLY\s*$/.test(accTrim) || accTrim === 'NO_REPLY') continue;
+                  const status = parsed.detail || 'Still working...';
+                  const display = accumulated ? accumulated + '\n\n[' + status + ']' : '[' + status + ']';
+                  onProgress(display).catch(() => {});
+                }
+              } catch { /* ignore */ }
+            } else if (eventType === 'chunk') {
+              try {
+                const parsed = JSON.parse(dataStr);
+                if (parsed.content) {
+                  accumulated += parsed.content;
+
+                  // Throttle edits
+                  const now = Date.now();
+                  if (onProgress && now - lastEditTime >= STREAMING_EDIT_INTERVAL_MS) {
+                    lastEditTime = now;
+                    // Fire-and-forget; don't block the stream
+                    clearTimeout(pendingEdit);
+                    pendingEdit = null;
+                    onProgress(accumulated).catch((e) =>
+                      console.warn(`[gateway] Streaming edit failed: ${e.message}`)
+                    );
+                  } else if (onProgress && !pendingEdit) {
+                    // Schedule a trailing edit so the last chunk is always sent
+                    const remaining = STREAMING_EDIT_INTERVAL_MS - (now - lastEditTime);
+                    pendingEdit = setTimeout(() => {
+                      pendingEdit = null;
+                      lastEditTime = Date.now();
+                      onProgress(accumulated).catch((e) =>
+                        console.warn(`[gateway] Streaming trailing edit failed: ${e.message}`)
+                      );
+                    }, remaining);
+                  }
+                }
+              } catch { /* ignore malformed JSON */ }
+            }
+            // 'done' event → stream is over, handled by res.on('end')
+          }
+        });
+
+        res.on('end', () => {
+          clearTimeout(pendingEdit);
+          resolve(accumulated);
+        });
+
+        res.on('error', (err) => {
+          clearTimeout(pendingEdit);
+          console.warn(`[gateway] SSE stream error: ${err.message}, falling back`);
+          forwardToLibreFang(text, systemPrefix, phone, pushName, isOwner, attachments, { isGroup, wasMentioned })
+            .then(resolve)
+            .catch(reject);
+        });
+      },
+    );
+
+    req.on('error', (err) => {
+      console.warn(`[gateway] SSE request error: ${err.message}, falling back`);
+      forwardToLibreFang(text, systemPrefix, phone, pushName, isOwner, attachments, { isGroup, wasMentioned })
+        .then(resolve)
+        .catch(reject);
+    });
+    req.on('timeout', () => {
+      req.destroy();
+      reject(new Error('LibreFang SSE timeout'));
+    });
+    req.write(payloadStr);
+    req.end();
+  });
+}
+
+// ---------------------------------------------------------------------------
+// Catch-up Sweep: re-process unprocessed messages every 5 minutes (Fase 3.1)
+// ---------------------------------------------------------------------------
+const CATCHUP_INTERVAL_MS = 5 * 60 * 1000;  // 5 minutes
+const CATCHUP_AGE_MS = 30_000;               // only messages older than 30s
+const CATCHUP_MAX_RETRIES = 3;
+
+async function runCatchUpSweep() {
+  if (connStatus !== 'connected' || !sock) return;
+
+  const cutoff = Date.now() - CATCHUP_AGE_MS;
+  const unprocessed = dbGetUnprocessed(cutoff);
+  if (unprocessed.length === 0) return;
+
+  console.log(`[gateway][catchup] Found ${unprocessed.length} unprocessed message(s), attempting re-forward...`);
+
+  for (const msg of unprocessed) {
+    // Skip messages already at max retries (they'll be marked failed by dbIncrRetryOrFail)
+    if (msg.retry_count >= CATCHUP_MAX_RETRIES) {
+      dbIncrRetryOrFail(msg.id, CATCHUP_MAX_RETRIES);
+      continue;
+    }
+
+    try {
+      // Ensure agent ID is resolved
+      if (!cachedAgentId) await resolveAgentId();
+
+      // Determine if sender is owner or stranger
+      const senderPnJid = msg.phone ? msg.phone.replace(/^\+/, '') + '@s.whatsapp.net' : '';
+      const isOwner = OWNER_JIDS.size > 0 && (OWNER_JIDS.has(msg.jid) || (senderPnJid && OWNER_JIDS.has(senderPnJid)));
+
+      // Never re-forward group messages — we cannot tell if the bot was
+      // mentioned, so replaying them violates group_policy and can leak
+      // internal text (rate-limit errors, recovery prefixes) into groups.
+      const isCatchupGroup = msg.jid && msg.jid.endsWith('@g.us');
+      if (isCatchupGroup) {
+        dbMarkProcessed(msg.id, 1);
+        console.log(`[gateway][catchup] Skipping group message ${msg.id} (${msg.jid}) — group catchup disabled`);
+        continue;
+      }
+
+      // Simple re-forward: send the stored text to the agent without full context rebuild
+      const prefix = isOwner ? '' : `[CATCHUP_REDELIVERY from ${msg.push_name || msg.phone || msg.jid}]\n`;
+      const response = await forwardToLibreFang(prefix + (msg.text || ''), '', msg.phone || '', msg.push_name || '', isOwner, [], { isGroup: false, wasMentioned: false });
+
+      // Mark as processed
+      dbMarkProcessed(msg.id, 1);
+      console.log(`[gateway][catchup] Re-forwarded message ${msg.id} from ${msg.push_name || msg.jid}`);
+
+      // If there's a response, try to send it back (strangers and groups)
+      if (response && !isOwner && msg.jid) {
+        try {
+          const formatted = markdownToWhatsApp(response);
+          await sock.sendMessage(msg.jid, { text: formatted });
+          dbSaveMessage({ id: randomUUID(), jid: msg.jid, senderJid: ownJid, pushName: null, phone: msg.phone, text: response, direction: 'outbound', timestamp: Date.now(), processed: 1, rawType: 'text' });
+        } catch (sendErr) {
+          console.warn(`[gateway][catchup] Could not send catch-up reply to ${msg.jid}: ${sendErr.message}`);
+        }
+      }
+    } catch (err) {
+      console.warn(`[gateway][catchup] Failed to re-forward message ${msg.id}: ${err.message}`);
+      dbIncrRetryOrFail(msg.id, CATCHUP_MAX_RETRIES);
+    }
+  }
+}
+
+setInterval(runCatchUpSweep, CATCHUP_INTERVAL_MS);
+
+// ---------------------------------------------------------------------------
+// DB Cleanup: delete old processed/failed messages (Fase 4.1)
+// ---------------------------------------------------------------------------
+const CLEANUP_INTERVAL_MS = 24 * 60 * 60 * 1000;  // once per day
+const CLEANUP_MAX_AGE_MS = 7 * 24 * 60 * 60 * 1000;  // 7 days
+
+function runDbCleanup() {
+  const cutoff = Date.now() - CLEANUP_MAX_AGE_MS;
+  const deleted = dbCleanupOld(cutoff);
+  if (deleted > 0) {
+    console.log(`[gateway][cleanup] Deleted ${deleted} old messages from DB`);
+  }
+}
+
+// Run cleanup on startup (no-op if DB is fresh) and then daily
+runDbCleanup();
+setInterval(runDbCleanup, CLEANUP_INTERVAL_MS);
+
+// ---------------------------------------------------------------------------
 // Send a message via Baileys (called by LibreFang for outgoing)
 // ---------------------------------------------------------------------------
 async function sendMessage(to, text) {
@@ -1218,19 +1836,119 @@ async function sendMessage(to, text) {
     throw new Error('WhatsApp not connected');
   }
 
-  // Normalize phone → JID: "+1234567890" → "1234567890@s.whatsapp.net"
-  const jid = to.replace(/^\+/, '').replace(/@.*$/, '') + '@s.whatsapp.net';
+  // Preserve group JIDs (@g.us) as-is; normalize phone → JID for individuals
+  const jid = to.includes('@g.us') ? to
+    : to.replace(/^\+/, '').replace(/@.*$/, '') + '@s.whatsapp.net';
 
-  await sock.sendMessage(jid, { text });
+  const formatted = markdownToWhatsApp(text);
+  const sent = await sock.sendMessage(jid, { text: formatted });
+  // Save outbound message to DB (store formatted text to match what was delivered)
+  dbSaveMessage({
+    id: sent?.key?.id || randomUUID(),
+    jid,
+    senderJid: ownJid || null,
+    pushName: null,
+    phone: to,
+    text: formatted,
+    direction: 'outbound',
+    timestamp: Date.now(),
+    processed: 1,
+    rawType: 'text',
+  });
+}
+
+async function sendImage(to, imageUrl, caption) {
+  if (!sock || connStatus !== 'connected') {
+    throw new Error('WhatsApp not connected');
+  }
+
+  // Preserve group JIDs (@g.us) as-is; normalize phone → JID for individuals
+  const jid = to.includes('@g.us') ? to
+    : to.replace(/^\+/, '').replace(/@.*$/, '') + '@s.whatsapp.net';
+
+  // Fetch image into buffer (Baileys needs buffer or local file)
+  const buffer = await new Promise((resolve, reject) => {
+    const MAX_REDIRECTS = 5;
+    const request = (url, redirectCount = 0) => {
+      if (redirectCount > MAX_REDIRECTS) {
+        return reject(new Error(`Too many redirects (max ${MAX_REDIRECTS})`));
+      }
+      const mod = url.startsWith('https') ? require('node:https') : require('node:http');
+      mod.get(url, (resp) => {
+        if (resp.statusCode >= 300 && resp.statusCode < 400 && resp.headers.location) {
+          return request(resp.headers.location, redirectCount + 1);
+        }
+        if (resp.statusCode !== 200) {
+          return reject(new Error(`Failed to fetch image: HTTP ${resp.statusCode}`));
+        }
+        const chunks = [];
+        resp.on('data', (c) => chunks.push(c));
+        resp.on('end', () => resolve(Buffer.concat(chunks)));
+        resp.on('error', reject);
+      }).on('error', reject);
+    };
+    request(imageUrl);
+  });
+
+  const imgMsg = { image: buffer };
+  if (caption) imgMsg.caption = caption;
+
+  const sent = await sock.sendMessage(jid, imgMsg);
+  dbSaveMessage({
+    id: sent?.key?.id || randomUUID(),
+    jid,
+    senderJid: ownJid || null,
+    pushName: null,
+    phone: to,
+    text: caption || '[Image]',
+    direction: 'outbound',
+    timestamp: Date.now(),
+    processed: 1,
+    rawType: 'image',
+  });
+}
+
+async function sendAudio(to, filePath, ptt = true) {
+  if (!sock || connStatus !== 'connected') {
+    throw new Error('WhatsApp not connected');
+  }
+  const jid = to.includes('@g.us') ? to
+    : to.replace(/^\+/, '').replace(/@.*$/, '') + '@s.whatsapp.net';
+
+  const buffer = fs.readFileSync(filePath);
+  const audioMsg = { audio: buffer, mimetype: 'audio/ogg; codecs=opus', ptt };
+  const sent = await sock.sendMessage(jid, audioMsg);
+  dbSaveMessage({
+    id: sent?.key?.id || randomUUID(),
+    jid,
+    senderJid: ownJid || null,
+    pushName: null,
+    phone: to,
+    text: '[Voice note]',
+    direction: 'outbound',
+    timestamp: Date.now(),
+    processed: 1,
+    rawType: 'audio',
+  });
 }
 
 // ---------------------------------------------------------------------------
 // HTTP server
 // ---------------------------------------------------------------------------
+const MAX_BODY_SIZE = 64 * 1024;
+
 function parseBody(req) {
   return new Promise((resolve, reject) => {
     let body = '';
-    req.on('data', (chunk) => (body += chunk));
+    let size = 0;
+    req.on('data', (chunk) => {
+      size += chunk.length;
+      if (size > MAX_BODY_SIZE) {
+        req.destroy();
+        return reject(new Error('Request body too large'));
+      }
+      body += chunk;
+    });
     req.on('end', () => {
       try {
         resolve(body ? JSON.parse(body) : {});
@@ -1242,12 +1960,28 @@ function parseBody(req) {
   });
 }
 
-function jsonResponse(res, status, data) {
+const ALLOWED_ORIGIN_RE = /^(https?:\/\/(localhost|127\.0\.0\.1)(:\d+)?|tauri:\/\/localhost|app:\/\/localhost)$/i;
+
+function isAllowedOrigin(origin) {
+  return Boolean(origin && ALLOWED_ORIGIN_RE.test(origin));
+}
+
+function buildCorsHeaders(origin) {
+  if (!isAllowedOrigin(origin)) return {};
+  return {
+    'Access-Control-Allow-Origin': origin,
+    'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
+    'Access-Control-Allow-Headers': 'Content-Type',
+    'Vary': 'Origin',
+  };
+}
+
+function jsonResponse(req, res, status, data) {
   const body = JSON.stringify(data);
   res.writeHead(status, {
     'Content-Type': 'application/json',
     'Content-Length': Buffer.byteLength(body),
-    'Access-Control-Allow-Origin': '*',
+    ...buildCorsHeaders(req.headers.origin),
   });
   res.end(body);
 }
@@ -1255,11 +1989,7 @@ function jsonResponse(res, status, data) {
 const server = http.createServer(async (req, res) => {
   // CORS preflight
   if (req.method === 'OPTIONS') {
-    res.writeHead(204, {
-      'Access-Control-Allow-Origin': '*',
-      'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
-      'Access-Control-Allow-Headers': 'Content-Type',
-    });
+    res.writeHead(204, buildCorsHeaders(req.headers.origin));
     return res.end();
   }
 
@@ -1271,7 +2001,7 @@ const server = http.createServer(async (req, res) => {
     if (req.method === 'POST' && path === '/login/start') {
       // If already connected, just return success
       if (connStatus === 'connected') {
-        return jsonResponse(res, 200, {
+        return jsonResponse(req, res, 200, {
           qr_data_url: '',
           session_id: sessionId,
           message: 'Already connected to WhatsApp',
@@ -1289,7 +2019,7 @@ const server = http.createServer(async (req, res) => {
         waited += 300;
       }
 
-      return jsonResponse(res, 200, {
+      return jsonResponse(req, res, 200, {
         qr_data_url: qrDataUrl,
         session_id: sessionId,
         message: statusMessage,
@@ -1299,7 +2029,7 @@ const server = http.createServer(async (req, res) => {
 
     // GET /login/status — poll for connection status
     if (req.method === 'GET' && path === '/login/status') {
-      return jsonResponse(res, 200, {
+      return jsonResponse(req, res, 200, {
         connected: connStatus === 'connected',
         message: statusMessage,
         expired: qrExpired,
@@ -1312,11 +2042,40 @@ const server = http.createServer(async (req, res) => {
       const { to, text } = body;
 
       if (!to || !text) {
-        return jsonResponse(res, 400, { error: 'Missing "to" or "text" field' });
+        return jsonResponse(req, res, 400, { error: 'Missing "to" or "text" field' });
       }
 
       await sendMessage(to, text);
-      return jsonResponse(res, 200, { success: true, message: 'Sent' });
+      return jsonResponse(req, res, 200, { success: true, message: 'Sent' });
+    }
+
+    // POST /message/send-image — send image via URL
+    if (req.method === 'POST' && path === '/message/send-image') {
+      const body = await parseBody(req);
+      const { to, image_url, caption } = body;
+
+      if (!to || !image_url) {
+        return jsonResponse(req, res, 400, { error: 'Missing "to" or "image_url" field' });
+      }
+
+      await sendImage(to, image_url, caption || '');
+      return jsonResponse(req, res, 200, { success: true, message: 'Image sent' });
+    }
+
+    // POST /message/send-audio — send voice note from local file
+    if (req.method === 'POST' && path === '/message/send-audio') {
+      const body = await parseBody(req);
+      const { to, file_path: audioPath, ptt } = body;
+
+      if (!to || !audioPath) {
+        return jsonResponse(req, res, 400, { error: 'Missing "to" or "file_path" field' });
+      }
+      if (!fs.existsSync(audioPath)) {
+        return jsonResponse(req, res, 400, { error: `File not found: ${audioPath}` });
+      }
+
+      await sendAudio(to, audioPath, ptt !== false);
+      return jsonResponse(req, res, 200, { success: true, message: 'Audio sent' });
     }
 
     // GET /conversations — list active stranger conversations (Step B)
@@ -1333,12 +2092,51 @@ const server = http.createServer(async (req, res) => {
           lastMessage: convo.messages[convo.messages.length - 1] || null,
         });
       }
-      return jsonResponse(res, 200, { conversations });
+      return jsonResponse(req, res, 200, { conversations });
+    }
+
+    // GET /messages/unprocessed — messages that failed to forward (Fase 2.2)
+    if (req.method === 'GET' && path === '/messages/unprocessed') {
+      const rows = dbGetUnprocessed(Date.now());
+      const unprocessed = rows.map(r => ({
+        id: r.id,
+        jid: r.jid,
+        text: r.text,
+        push_name: r.push_name,
+        phone: r.phone,
+        timestamp: r.timestamp,
+        retry_count: r.retry_count,
+        raw_type: r.raw_type,
+      }));
+      return jsonResponse(req, res, 200, { unprocessed });
+    }
+
+    // GET /messages/:jid — message history for a specific chat (Fase 2.1)
+    if (req.method === 'GET' && path.startsWith('/messages/')) {
+      const jid = decodeURIComponent(path.slice('/messages/'.length));
+      if (!jid) {
+        return jsonResponse(req, res, 400, { error: 'Missing JID in path' });
+      }
+      const limit = parseInt(url.searchParams.get('limit') || '20', 10);
+      const since = parseInt(url.searchParams.get('since') || '0', 10);
+      const rows = dbGetMessagesByJid(jid, Math.min(limit, 100), since);
+      // Reverse to chronological order (query is DESC)
+      rows.reverse();
+      const messages = rows.map(r => ({
+        id: r.id,
+        text: r.text,
+        direction: r.direction,
+        push_name: r.push_name,
+        timestamp: r.timestamp,
+        processed: r.processed === 1,
+        raw_type: r.raw_type,
+      }));
+      return jsonResponse(req, res, 200, { jid, messages });
     }
 
     // GET /health — health check
     if (req.method === 'GET' && path === '/health') {
-      return jsonResponse(res, 200, {
+      return jsonResponse(req, res, 200, {
         status: 'ok',
         connected: connStatus === 'connected',
         session_id: sessionId || null,
@@ -1347,13 +2145,14 @@ const server = http.createServer(async (req, res) => {
     }
 
     // 404
-    jsonResponse(res, 404, { error: 'Not found' });
+    jsonResponse(req, res, 404, { error: 'Not found' });
   } catch (err) {
     console.error(`[gateway] ${req.method} ${path} error:`, err.message);
-    jsonResponse(res, 500, { error: err.message });
+    jsonResponse(req, res, 500, { error: err.message });
   }
 });
 
+if (require.main === module) {
 server.listen(PORT, '127.0.0.1', async () => {
   console.log(`[gateway] WhatsApp Web gateway listening on http://127.0.0.1:${PORT}`);
   console.log(`[gateway] LibreFang URL: ${LIBREFANG_URL}`);
@@ -1395,3 +2194,17 @@ process.on('SIGTERM', () => {
   if (sock) sock.end();
   server.close(() => process.exit(0));
 });
+} // end if (require.main === module)
+
+// Export for testing
+module.exports = {
+  markdownToWhatsApp,
+  extractNotifyOwner,
+  extractRelayCommands,
+  buildConversationsContext,
+  isRateLimited,
+  buildCorsHeaders,
+  isAllowedOrigin,
+  parseBody,
+  MAX_BODY_SIZE,
+};
