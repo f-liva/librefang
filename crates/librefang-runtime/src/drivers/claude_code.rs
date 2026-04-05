@@ -694,6 +694,7 @@ impl LlmDriver for ClaudeCodeDriver {
                             || (l.contains("resets") && l.contains("utc"))
                             || t.trim() == "NO_REPLY"
                             || t.trim().ends_with("NO_REPLY")
+                            || l.contains("[no reply needed]")
                     };
 
                     match serde_json::from_str::<ClaudeStreamEvent>(&line) {
