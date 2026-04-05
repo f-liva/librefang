@@ -2481,7 +2481,7 @@ async fn download_image_to_blocks(
 
     // Save image to disk instead of base64-encoding into the session.
     // A 3 MB photo becomes ~100 KB on disk with only a short path in the session.
-    const UPLOAD_DIR: &str = "/tmp/librefang_uploads";
+    let upload_dir = std::env::temp_dir().join("librefang_uploads");
 
     let ext = match final_media_type.as_str() {
         "image/jpeg" => "jpg",
@@ -2492,8 +2492,8 @@ async fn download_image_to_blocks(
     };
 
     // Ensure upload directory exists (BRDG-04)
-    if let Err(e) = tokio::fs::create_dir_all(UPLOAD_DIR).await {
-        warn!("Failed to create upload dir {UPLOAD_DIR}: {e}");
+    if let Err(e) = tokio::fs::create_dir_all(&upload_dir).await {
+        warn!("Failed to create upload dir {}: {e}", upload_dir.display());
         // Fallback to base64 inline encoding
         let data = base64::engine::general_purpose::STANDARD.encode(&final_bytes);
         blocks.push(ContentBlock::Image {
@@ -2504,24 +2504,27 @@ async fn download_image_to_blocks(
     }
 
     let filename = format!("{}.{}", uuid::Uuid::new_v4(), ext);
-    let file_path = format!("{UPLOAD_DIR}/{filename}");
+    let file_path = upload_dir.join(&filename);
 
     // Save image to disk (BRDG-01)
     match tokio::fs::write(&file_path, &final_bytes).await {
         Ok(()) => {
             tracing::debug!(
-                path = %file_path,
+                path = %file_path.display(),
                 size_kb = final_bytes.len() / 1024,
                 "Saved channel image to disk"
             );
             // Return ImageFile with absolute path (BRDG-02)
             blocks.push(ContentBlock::ImageFile {
                 media_type: final_media_type,
-                path: file_path,
+                path: file_path.to_string_lossy().into_owned(),
             });
         }
         Err(e) => {
-            warn!("Failed to write image to {file_path}: {e} — falling back to base64");
+            warn!(
+                "Failed to write image to {}: {e} — falling back to base64",
+                file_path.display()
+            );
             let data = base64::engine::general_purpose::STANDARD.encode(&final_bytes);
             blocks.push(ContentBlock::Image {
                 media_type: final_media_type,
