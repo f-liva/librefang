@@ -66,7 +66,12 @@ pub const TIMEOUT_PARTIAL_OUTPUT_MARKER: &str = "[partial_output_delivered]";
 ///   either on the same line or on a new line)
 fn is_no_reply(text: &str) -> bool {
     let t = text.trim();
-    t == "NO_REPLY" || t.ends_with("NO_REPLY")
+    t == "NO_REPLY"
+        || t.ends_with("NO_REPLY")
+        || t == "[no reply needed]"
+        || t.ends_with("[no reply needed]")
+        || t == "[no reply needed]"
+        || t.ends_with("[no reply needed]")
 }
 
 /// Safely trim message history to `MAX_HISTORY_MESSAGES`, cutting at
