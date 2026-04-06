@@ -130,6 +130,12 @@ impl TokenRotationDriver {
     }
 
     /// Check if an error should trigger key rotation.
+    ///
+    /// Rotates on: rate-limit, overload, billing (402), permission (403),
+    /// authentication (401), and expired OAuth tokens.  The Claude Code CLI
+    /// reports auth failures as exit-code 1 (mapped to `status: 1` by the
+    /// driver) with messages containing "not authenticated" or "expired".
+    /// Rotating lets us try the next profile whose token may still be valid.
     fn should_rotate(err: &LlmError) -> bool {
         matches!(
             err,
@@ -137,15 +143,19 @@ impl TokenRotationDriver {
         ) || matches!(err, LlmError::Api { status, message }
             if *status == 429
                 || *status == 402
+                || *status == 401
                 || (*status == 403 && !message.to_lowercase().contains("invalid api key"))
                 // CLI-based providers (Claude Code) exit with code 1 and
-                // include "hit your limit" in the message on rate-limit.
+                // include rate-limit or auth errors in the message.
                 || {
                     let lower = message.to_lowercase();
                     lower.contains("hit your limit")
                         || lower.contains("out of extra usage")
                         || lower.contains("rate limit")
                         || lower.contains("too many requests")
+                        || lower.contains("not authenticated")
+                        || lower.contains("token has expired")
+                        || lower.contains("authentication_error")
                 }
         )
     }
@@ -568,6 +578,28 @@ mod tests {
         assert!(!TokenRotationDriver::should_rotate(&LlmError::Api {
             status: 403,
             message: "invalid api key".to_string()
+        }));
+        // Auth errors that should rotate (expired token on one profile)
+        assert!(TokenRotationDriver::should_rotate(&LlmError::Api {
+            status: 401,
+            message: "OAuth token has expired".to_string()
+        }));
+        assert!(TokenRotationDriver::should_rotate(&LlmError::Api {
+            status: 1,
+            message: "Claude Code CLI is not authenticated. Run: claude auth\nDetail: {\"result\":\"Failed to authenticate. API Error: 401 {\\\"type\\\":\\\"error\\\",\\\"error\\\":{\\\"type\\\":\\\"authentication_error\\\"}}\"}".to_string()
+        }));
+        assert!(TokenRotationDriver::should_rotate(&LlmError::Api {
+            status: 1,
+            message: "not authenticated".to_string()
+        }));
+        assert!(TokenRotationDriver::should_rotate(&LlmError::Api {
+            status: 1,
+            message: "OAuth token has expired".to_string()
+        }));
+        // Generic exit-code-1 errors should NOT rotate
+        assert!(!TokenRotationDriver::should_rotate(&LlmError::Api {
+            status: 1,
+            message: "some other CLI error".to_string()
         }));
     }
 
