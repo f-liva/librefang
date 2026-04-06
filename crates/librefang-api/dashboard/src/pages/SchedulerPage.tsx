@@ -183,7 +183,7 @@ export function SchedulerPage() {
                   <div className="flex items-center gap-2 sm:gap-3 pl-9 sm:pl-11 text-[9px] sm:text-[10px] text-text-dim/60 flex-wrap">
                     <span className="font-mono bg-main px-1 sm:px-1.5 py-0.5 rounded">{s.cron}</span>
                     <span className="text-text-dim hidden sm:inline">{cronHint(s.cron || "")}</span>
-                    <span className="text-text-dim/40">{(s as any).tz || "UTC"}</span>
+                    <span className="text-text-dim/40">{s.tz || "UTC"}</span>
                     {agent && <span className="font-bold text-brand truncate">{t(`agents.builtin.${agent.name}.name`, { defaultValue: agent.name })}</span>}
                     {s.next_run && <span className="text-text-dim/40">{t("scheduler.next_run", { defaultValue: "Next" })}: {new Date(s.next_run).toLocaleString()}</span>}
                   </div>
@@ -277,6 +277,7 @@ export function SchedulerPage() {
                 <ScheduleModal
                   title={t("scheduler.cron_exp")}
                   initialCron={cron}
+                  initialTz={cronTz}
                   onSave={(c, tz) => { setCron(c); setCronTz(tz); setShowCronPicker(false); }}
                   onClose={() => setShowCronPicker(false)}
                 />

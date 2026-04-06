@@ -61,10 +61,17 @@ function detectBrowserTimezone(): string {
 }
 
 export function ScheduleModal({ title, subtitle, initialCron, initialTz, onSave, onClose }: ScheduleModalProps) {
-  const { t } = useTranslation();
+  const { t, i18n } = useTranslation();
+  const isZh = i18n.language?.startsWith("zh");
 
   const parsed = parseCronType(initialCron || "0 9 * * *");
-  const [timezone, setTimezone] = useState(initialTz || detectBrowserTimezone());
+  const detectedTz = initialTz || detectBrowserTimezone();
+  const [timezone, setTimezone] = useState(detectedTz);
+
+  // If the detected/initial timezone isn't in the common list, include it
+  const timezoneOptions = COMMON_TIMEZONES.includes(detectedTz)
+    ? COMMON_TIMEZONES
+    : [detectedTz, ...COMMON_TIMEZONES];
   const [scheduleType, setScheduleType] = useState<ScheduleType>(parsed.type);
   const [intervalMin, setIntervalMin] = useState(parsed.type === "interval_min" ? (parsed.interval ?? 5) : 5);
   const [intervalHour, setIntervalHour] = useState(parsed.type === "interval_hour" ? (parsed.interval ?? 1) : 1);
@@ -263,7 +270,7 @@ export function ScheduleModal({ title, subtitle, initialCron, initialTz, onSave,
           <label className="text-[10px] font-bold text-text-dim/50 uppercase shrink-0">{t("scheduler.timezone", { defaultValue: "Timezone" })}</label>
           <select value={timezone} onChange={e => setTimezone(e.target.value)}
             className="flex-1 h-8 rounded-lg border border-border-subtle bg-main px-2 text-xs outline-none focus:border-brand transition-colors">
-            {COMMON_TIMEZONES.map(tz => <option key={tz} value={tz}>{tz.replace(/_/g, " ")}</option>)}
+            {timezoneOptions.map(tz => <option key={tz} value={tz}>{tz.replace(/_/g, " ")}</option>)}
           </select>
         </div>
 

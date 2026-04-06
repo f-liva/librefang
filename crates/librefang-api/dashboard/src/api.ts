@@ -283,6 +283,7 @@ export interface ScheduleItem {
   id: string;
   name?: string;
   cron?: string;
+  tz?: string | null;
   description?: string;
   message?: string;
   enabled?: boolean;
