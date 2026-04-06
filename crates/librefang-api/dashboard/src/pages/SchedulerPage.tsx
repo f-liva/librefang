@@ -267,8 +267,8 @@ export function SchedulerPage() {
                   className="w-full flex items-center justify-between px-3 py-2 rounded-xl border border-border-subtle bg-main hover:border-brand transition-colors text-left"
                 >
                   <div>
-                    <p className="text-sm">{cronHint(cron)}</p>
-                    <p className="text-[10px] font-mono text-text-dim/50">{cron}</p>
+                    <p className="text-sm">{cronHint(cron)}{cronTz && cronTz !== "UTC" ? ` (${cronTz.split("/").pop()?.replace(/_/g, " ")})` : ""}</p>
+                    <p className="text-[10px] font-mono text-text-dim/50">{cron}{cronTz ? ` · ${cronTz}` : ""}</p>
                   </div>
                   <ChevronRight className="w-4 h-4 text-text-dim/40 flex-shrink-0" />
                 </button>
