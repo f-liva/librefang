@@ -85,6 +85,8 @@ Periodically:
 | npm packages lost on restart | `NPM_CONFIG_PREFIX=/data/npm-global` |
 | Claude Code refuses --skip-permissions as root | gosu drops privileges; user has NOPASSWD sudo |
 
+NAS SSH/Docker connection details: see skill `librefang-fix` at `/home/fede9/Progetti/skill-librefang/commands/librefang-fix/SKILL.md`
+
 LZC package repo: `fede91it/lzc-librefang` (git.federicoliva.it)
 Local: `/home/fede9/Progetti/lzc-librefang`
 
