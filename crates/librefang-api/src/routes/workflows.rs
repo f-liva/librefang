@@ -1287,6 +1287,16 @@ pub async fn create_schedule(
         .map(|s| s.to_string())
         .filter(|s| !s.is_empty());
 
+    // Validate timezone string if provided
+    if let Some(ref tz_str) = tz {
+        if tz_str != "UTC" && tz_str.parse::<chrono_tz::Tz>().is_err() {
+            return ApiErrorResponse::bad_request(format!(
+                "Invalid timezone '{tz_str}'. Use IANA format (e.g. 'America/New_York', 'Europe/Rome')"
+            ))
+            .into_json_tuple();
+        }
+    }
+
     // Build the CronJob action
     let action = if !workflow_id_str.is_empty() {
         librefang_types::scheduler::CronAction::Workflow {
@@ -1367,6 +1377,16 @@ pub async fn update_schedule(
         .and_then(|v| v.as_str())
         .filter(|s| !s.is_empty())
         .map(|s| s.to_string());
+
+    // Validate timezone string if provided
+    if let Some(ref tz_str) = req_tz {
+        if tz_str != "UTC" && tz_str.parse::<chrono_tz::Tz>().is_err() {
+            return ApiErrorResponse::bad_request(format!(
+                "Invalid timezone '{tz_str}'. Use IANA format (e.g. 'America/New_York', 'Europe/Rome')"
+            ))
+            .into_json_tuple();
+        }
+    }
 
     if let Some(cron) = req.get("cron").and_then(|v| v.as_str()) {
         let cron_parts: Vec<&str> = cron.split_whitespace().collect();
