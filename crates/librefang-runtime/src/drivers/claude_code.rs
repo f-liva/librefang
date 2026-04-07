@@ -342,6 +342,9 @@ struct ClaudeJsonOutput {
     #[serde(default)]
     #[allow(dead_code)]
     cost_usd: Option<f64>,
+    /// The CLI sets this when the result is an error (auth failure, etc.).
+    #[serde(default)]
+    is_error: bool,
 }
 
 /// Usage stats from Claude CLI JSON output.
@@ -364,6 +367,43 @@ struct ClaudeStreamEvent {
     result: Option<String>,
     #[serde(default)]
     usage: Option<ClaudeUsage>,
+    /// The CLI sets this when the result is an error (auth failure, etc.).
+    #[serde(default)]
+    is_error: bool,
+}
+
+/// Check if CLI response text looks like an auth or rate-limit error that
+/// should be converted to an `LlmError` so token rotation can kick in.
+///
+/// The Claude CLI sometimes exits with code 0 but sets `is_error: true` and
+/// puts the API error in the result text.  This function detects those
+/// patterns and returns the appropriate `LlmError` variant.
+fn detect_cli_error_in_text(text: &str) -> Option<LlmError> {
+    let lower = text.to_lowercase();
+    // Auth / credential failures → should trigger rotation to next profile
+    if lower.contains("failed to authenticate")
+        || lower.contains("authentication_error")
+        || lower.contains("invalid authentication credentials")
+        || lower.contains("not authenticated")
+    {
+        return Some(LlmError::Api {
+            status: 401,
+            message: text.to_string(),
+        });
+    }
+    // Rate-limit / quota exhaustion
+    if lower.contains("hit your limit")
+        || lower.contains("out of extra usage")
+        || lower.contains("rate limit")
+        || lower.contains("too many requests")
+        || (lower.contains("resets") && lower.contains("utc"))
+    {
+        return Some(LlmError::RateLimited {
+            retry_after_ms: 5 * 60 * 1000,
+            message: Some(text.to_string()),
+        });
+    }
+    None
 }
 
 #[async_trait]
@@ -485,29 +525,15 @@ impl LlmDriver for ClaudeCodeDriver {
                 "Claude Code CLI exited with error"
             );
 
-            // Detect rate-limit messages so token rotation can kick in.
-            let lower = detail.to_lowercase();
-            if lower.contains("hit your limit")
-                || lower.contains("out of extra usage")
-                || lower.contains("rate limit")
-                || lower.contains("too many requests")
-                || (lower.contains("resets") && lower.contains("utc"))
-            {
+            // Detect rate-limit and auth error messages so token rotation
+            // can kick in.  Use the shared helper for consistent detection.
+            if let Some(err) = detect_cli_error_in_text(detail) {
                 prepared.cleanup();
-                return Err(LlmError::RateLimited {
-                    retry_after_ms: 5 * 60 * 1000,
-                    message: Some(detail.clone()),
-                });
+                return Err(err);
             }
 
-            // Provide actionable error messages
-            let message = if detail.contains("not authenticated")
-                || detail.contains("auth")
-                || detail.contains("login")
-                || detail.contains("credentials")
-            {
-                format!("Claude Code CLI is not authenticated. Run: claude auth\nDetail: {detail}")
-            } else if detail.contains("permission")
+            // Provide actionable error messages for non-rotatable errors
+            let message = if detail.contains("permission")
                 || detail.contains("--dangerously-skip-permissions")
             {
                 format!(
@@ -539,6 +565,27 @@ impl LlmDriver for ClaudeCodeDriver {
                 .or(parsed.content)
                 .or(parsed.text)
                 .unwrap_or_default();
+
+            // CLI exited 0 but flagged the result as an error (auth failure,
+            // rate-limit, etc.).  Convert to LlmError so token rotation fires.
+            if parsed.is_error {
+                warn!(model = %pid_label, "Claude CLI result has is_error=true, checking for rotatable error");
+                if let Some(err) = detect_cli_error_in_text(&text) {
+                    return Err(err);
+                }
+                // is_error but unrecognised pattern — return as generic API error
+                return Err(LlmError::Api {
+                    status: 1,
+                    message: text,
+                });
+            }
+
+            // Safety net: even without is_error, detect obvious error responses
+            if let Some(err) = detect_cli_error_in_text(&text) {
+                warn!(model = %pid_label, "Claude CLI response looks like an error despite exit 0");
+                return Err(err);
+            }
+
             let usage = parsed.usage.unwrap_or_default();
             return Ok(CompletionResponse {
                 content: vec![ContentBlock::Text {
@@ -557,6 +604,13 @@ impl LlmDriver for ClaudeCodeDriver {
 
         // Fallback: treat entire stdout as plain text
         let text = stdout.trim().to_string();
+
+        // Safety net for plain-text responses that are really errors
+        if let Some(err) = detect_cli_error_in_text(&text) {
+            warn!(model = %pid_label, "Claude CLI plain-text response looks like an error");
+            return Err(err);
+        }
+
         Ok(CompletionResponse {
             content: vec![ContentBlock::Text {
                 text,
@@ -730,7 +784,10 @@ impl LlmDriver for ClaudeCodeDriver {
                                     if let Some(ref result) = event.result {
                                         if full_text.is_empty() {
                                             full_text = result.clone();
-                                            if !should_suppress(result) {
+                                            // Don't stream error results to the user —
+                                            // they will be caught after the loop and
+                                            // converted to LlmError for rotation.
+                                            if !event.is_error && !should_suppress(result) {
                                                 let _ = tx
                                                     .send(StreamEvent::TextDelta {
                                                         text: result.clone(),
@@ -843,32 +900,24 @@ impl LlmDriver for ClaudeCodeDriver {
                 stderr = %stderr_text,
                 "Claude Code CLI streaming subprocess exited with error"
             );
-            // Detect rate-limit messages in streamed output so token rotation
-            // can kick in.  The CLI often exits with code 1 and puts "hit your
-            // limit" in stdout (already streamed) rather than stderr.
-            // When both stderr and stdout are empty the CLI likely hit a rate
-            // limit before producing any output — treat exit-code 1 with no
-            // output as a rate-limit so rotation still fires.
-            let lower = detail.to_lowercase();
-            if lower.contains("hit your limit")
-                || lower.contains("out of extra usage")
-                || lower.contains("rate limit")
-                || lower.contains("too many requests")
-                || (lower.contains("resets") && lower.contains("utc"))
-                || (code == 1 && detail.is_empty())
-            {
+            // Detect rate-limit and auth error messages so token rotation can
+            // kick in.  Use the shared helper first; fall back to the
+            // empty-output heuristic for exit-code 1.
+            if let Some(err) = detect_cli_error_in_text(&detail) {
                 warn!(
                     exit_code = code,
-                    detail_empty = detail.is_empty(),
-                    "Treating CLI exit as rate-limit for profile rotation"
+                    "Treating CLI exit as rotatable error for profile rotation"
+                );
+                return Err(err);
+            }
+            if code == 1 && detail.is_empty() {
+                warn!(
+                    exit_code = code,
+                    "Treating empty exit-code-1 as rate-limit for profile rotation"
                 );
                 return Err(LlmError::RateLimited {
                     retry_after_ms: 5 * 60 * 1000,
-                    message: if detail.is_empty() {
-                        None
-                    } else {
-                        Some(detail.clone())
-                    },
+                    message: None,
                 });
             }
             return Err(LlmError::Api {
@@ -886,6 +935,14 @@ impl LlmDriver for ClaudeCodeDriver {
 
         if !stderr_text.trim().is_empty() {
             warn!(stderr = %stderr_text.trim(), "Claude CLI streaming stderr output");
+        }
+
+        // Safety net: even with exit 0, the streamed text may be an error
+        // (e.g. CLI returned is_error result, or auth failure text).
+        // Convert to LlmError so token rotation can try the next profile.
+        if let Some(err) = detect_cli_error_in_text(&full_text) {
+            warn!(model = %pid_label, "Claude CLI stream text looks like an error despite exit 0");
+            return Err(err);
         }
 
         let _ = tx
