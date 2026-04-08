@@ -525,9 +525,9 @@ function buildStrangerContext(pushName, phone, strangerJid) {
 
   return [
     '[WHATSAPP_STRANGER_CONTEXT]',
-    `Incoming WhatsApp message from: ${pushName} (${phone})`,
-    'This person is NOT the owner. They are an external contact.',
-    `Active conversation: ${messageCount} messages, started ${firstMessageAt}`,
+    `Messaggio WhatsApp da: ${pushName} (${phone})`,
+    `⚠️ Questa persona NON è il Signore. È un contatto esterno. Chiamala "${pushName || 'Lei'}", MAI "Signore".`,
+    `Conversazione attiva: ${messageCount} messaggi, iniziata ${firstMessageAt}`,
     '',
     'Available routing tags:',
     '- [NOTIFY_OWNER]{"reason": "...", "summary": "..."}[/NOTIFY_OWNER] — sends a notification to the owner',
@@ -1100,7 +1100,18 @@ async function startConnection() {
         let streamMsgKey = null; // key of the initial WhatsApp message we'll edit
         const onProgress = async (partialText) => {
           if (!sock) return;
-          const formatted = markdownToWhatsApp(partialText);
+          // Strip internal tags before sending partial text to WhatsApp.
+          // Bail early if no brackets — most chunks won't contain tags.
+          let cleaned = partialText;
+          if (cleaned.includes('[NOTIFY_OWNER]') || cleaned.includes('[RELAY_TO_STRANGER]') || cleaned.includes('[no reply needed]')) {
+            cleaned = cleaned
+              .replace(NOTIFY_OWNER_RE, '')
+              .replace(RELAY_RE, '')
+              .replace(/\[no reply needed\]/gi, '');
+          }
+          cleaned = cleaned.trim();
+          if (!cleaned) return;
+          const formatted = markdownToWhatsApp(cleaned);
           if (!streamMsgKey) {
             const sent = await sock.sendMessage(sender, { text: formatted });
             streamMsgKey = sent?.key;
@@ -1110,7 +1121,7 @@ async function startConnection() {
         };
 
         const rawResponse = await forwardToLibreFangStreaming(
-          messageToSend, systemPrefix, phone, pushName, isOwner, attachments, onProgress,
+          messageToSend, systemPrefix, phone, pushName, isOwner, attachments, onProgress, sender, { isGroup, wasMentioned },
         );
         const response = markdownToWhatsApp(rawResponse);
 
@@ -1573,7 +1584,7 @@ function buildRelaySystemInstruction() {
 // ---------------------------------------------------------------------------
 const MAX_FORWARD_RETRIES = 1;
 
-async function forwardToLibreFang(text, systemPrefix, phone, pushName, isOwner, attachments, { isGroup = false, wasMentioned = false } = {}, retryCount = 0) {
+async function forwardToLibreFang(text, systemPrefix, phone, pushName, isOwner, attachments, { isGroup = false, wasMentioned = false, chatJid = '' } = {}, retryCount = 0) {
   // Resolve agent UUID if not cached (or if invalidated on reconnect)
   if (!cachedAgentId) {
     try {
@@ -1586,9 +1597,12 @@ async function forwardToLibreFang(text, systemPrefix, phone, pushName, isOwner, 
 
   const fullMessage = systemPrefix ? systemPrefix + text : text;
 
+  // Per-conversation session isolation: include chat JID in channel_type
+  // so the kernel creates separate sessions for each WhatsApp conversation.
+  const channelType = chatJid ? `whatsapp:${chatJid}` : 'whatsapp';
   const payload = {
     message: fullMessage,
-    channel_type: 'whatsapp',
+    channel_type: channelType,
     sender_id: phone,
     sender_name: pushName,
     is_group: isGroup,
@@ -1627,7 +1641,7 @@ async function forwardToLibreFang(text, systemPrefix, phone, pushName, isOwner, 
               console.log('[gateway] Agent UUID stale (404), re-resolving...');
               cachedAgentId = null;
               resolveAgentId()
-                .then(() => forwardToLibreFang(text, systemPrefix, phone, pushName, isOwner, attachments, { isGroup, wasMentioned }, retryCount + 1))
+                .then(() => forwardToLibreFang(text, systemPrefix, phone, pushName, isOwner, attachments, { isGroup, wasMentioned, chatJid }, retryCount + 1))
                 .then(resolve)
                 .catch(reject);
               return;
@@ -1698,7 +1712,7 @@ const STREAMING_EDIT_INTERVAL_MS = 2000;
  * @param {(text: string) => Promise<void>} onProgress
  * @returns {Promise<string>} complete response
  */
-async function forwardToLibreFangStreaming(text, systemPrefix, phone, pushName, isOwner, attachments, onProgress) {
+async function forwardToLibreFangStreaming(text, systemPrefix, phone, pushName, isOwner, attachments, onProgress, chatJid = '', { isGroup = false, wasMentioned = false } = {}) {
   // Resolve agent UUID if not cached
   if (!cachedAgentId) {
     try {
@@ -1711,9 +1725,10 @@ async function forwardToLibreFangStreaming(text, systemPrefix, phone, pushName, 
 
   const fullMessage = systemPrefix ? systemPrefix + text : text;
 
+  const channelType = chatJid ? `whatsapp:${chatJid}` : 'whatsapp';
   const payload = {
     message: fullMessage,
-    channel_type: 'whatsapp',
+    channel_type: channelType,
     sender_id: phone,
     sender_name: pushName,
   };
@@ -1748,7 +1763,7 @@ async function forwardToLibreFangStreaming(text, systemPrefix, phone, pushName, 
           res.on('data', (chunk) => (body += chunk));
           res.on('end', () => {
             console.warn(`[gateway] SSE endpoint returned ${res.statusCode}, falling back to non-streaming`);
-            forwardToLibreFang(text, systemPrefix, phone, pushName, isOwner, attachments)
+            forwardToLibreFang(text, systemPrefix, phone, pushName, isOwner, attachments, { isGroup, wasMentioned, chatJid })
               .then(resolve)
               .catch(reject);
           });
@@ -1782,6 +1797,9 @@ async function forwardToLibreFangStreaming(text, systemPrefix, phone, pushName, 
               try {
                 const parsed = JSON.parse(dataStr);
                 if (parsed.phase === 'long_running' && onProgress) {
+                  // Don't send phase updates if accumulated text is NO_REPLY
+                  const accTrim = accumulated.trim();
+                  if (/(?:^|\n)\s*NO_REPLY\s*$/.test(accTrim) || accTrim === 'NO_REPLY') continue;
                   const status = parsed.detail || 'Still working...';
                   const display = accumulated ? accumulated + '\n\n[' + status + ']' : '[' + status + ']';
                   onProgress(display).catch(() => {});
@@ -1829,7 +1847,7 @@ async function forwardToLibreFangStreaming(text, systemPrefix, phone, pushName, 
         res.on('error', (err) => {
           clearTimeout(pendingEdit);
           console.warn(`[gateway] SSE stream error: ${err.message}, falling back`);
-          forwardToLibreFang(text, systemPrefix, phone, pushName, isOwner, attachments)
+          forwardToLibreFang(text, systemPrefix, phone, pushName, isOwner, attachments, { isGroup, wasMentioned, chatJid })
             .then(resolve)
             .catch(reject);
         });
@@ -1838,7 +1856,7 @@ async function forwardToLibreFangStreaming(text, systemPrefix, phone, pushName, 
 
     req.on('error', (err) => {
       console.warn(`[gateway] SSE request error: ${err.message}, falling back`);
-      forwardToLibreFang(text, systemPrefix, phone, pushName, isOwner, attachments)
+      forwardToLibreFang(text, systemPrefix, phone, pushName, isOwner, attachments, { isGroup, wasMentioned, chatJid })
         .then(resolve)
         .catch(reject);
     });
@@ -1882,10 +1900,19 @@ async function runCatchUpSweep() {
       const senderPnJid = msg.phone ? msg.phone.replace(/^\+/, '') + '@s.whatsapp.net' : '';
       const isOwner = OWNER_JIDS.size > 0 && (OWNER_JIDS.has(msg.jid) || (senderPnJid && OWNER_JIDS.has(senderPnJid)));
 
-      // Simple re-forward: send the stored text to the agent without full context rebuild
+      // Never re-forward group messages — we cannot tell if the bot was
+      // mentioned, so replaying them violates group_policy and can leak
+      // internal text (rate-limit errors, recovery prefixes) into groups.
       const isCatchupGroup = msg.jid && msg.jid.endsWith('@g.us');
+      if (isCatchupGroup) {
+        dbMarkProcessed(msg.id, 1);
+        console.log(`[gateway][catchup] Skipping group message ${msg.id} (${msg.jid}) — group catchup disabled`);
+        continue;
+      }
+
+      // Simple re-forward: send the stored text to the agent without full context rebuild
       const prefix = isOwner ? '' : `[CATCHUP_REDELIVERY from ${msg.push_name || msg.phone || msg.jid}]\n`;
-      const response = await forwardToLibreFang(prefix + (msg.text || ''), '', msg.phone || '', msg.push_name || '', isOwner, [], { isGroup: isCatchupGroup, wasMentioned: false });
+      const response = await forwardToLibreFang(prefix + (msg.text || ''), '', msg.phone || '', msg.push_name || '', isOwner, [], { isGroup: false, wasMentioned: false, chatJid: msg.jid || '' });
 
       // Mark as processed
       dbMarkProcessed(msg.id, 1);
@@ -2005,57 +2032,6 @@ async function sendImage(to, imageUrl, caption) {
     timestamp: Date.now(),
     processed: 1,
     rawType: 'image',
-  });
-}
-
-async function sendAudio(to, audioUrl, ptt = true) {
-  if (!sock || connStatus !== 'connected') {
-    throw new Error('WhatsApp not connected');
-  }
-
-  // Preserve group JIDs (@g.us) as-is; normalize phone → JID for individuals
-  const jid = to.includes('@g.us') ? to
-    : to.replace(/^\+/, '').replace(/@.*$/, '') + '@s.whatsapp.net';
-
-  // Fetch audio into buffer (Baileys needs buffer or local file)
-  const buffer = await new Promise((resolve, reject) => {
-    const MAX_REDIRECTS = 5;
-    const request = (url, redirectCount = 0) => {
-      if (redirectCount > MAX_REDIRECTS) {
-        return reject(new Error(`Too many redirects (max ${MAX_REDIRECTS})`));
-      }
-      const mod = url.startsWith('https') ? require('node:https') : require('node:http');
-      mod.get(url, (resp) => {
-        if (resp.statusCode >= 300 && resp.statusCode < 400 && resp.headers.location) {
-          return request(resp.headers.location, redirectCount + 1);
-        }
-        if (resp.statusCode !== 200) {
-          return reject(new Error(`Failed to fetch audio: HTTP ${resp.statusCode}`));
-        }
-        const chunks = [];
-        resp.on('data', (c) => chunks.push(c));
-        resp.on('end', () => resolve(Buffer.concat(chunks)));
-        resp.on('error', reject);
-      }).on('error', reject);
-    };
-    request(audioUrl);
-  });
-
-  // ptt: true sends as a voice note (push-to-talk bubble); false sends as audio file
-  const audioMsg = { audio: buffer, mimetype: 'audio/ogg; codecs=opus', ptt };
-
-  const sent = await sock.sendMessage(jid, audioMsg);
-  dbSaveMessage({
-    id: sent?.key?.id || randomUUID(),
-    jid,
-    senderJid: ownJid || null,
-    pushName: null,
-    phone: to,
-    text: ptt ? '[Voice message]' : '[Audio]',
-    direction: 'outbound',
-    timestamp: Date.now(),
-    processed: 1,
-    rawType: 'audio',
   });
 }
 
@@ -2187,20 +2163,6 @@ const server = http.createServer(async (req, res) => {
 
       await sendImage(to, image_url, caption || '');
       return jsonResponse(req, res, 200, { success: true, message: 'Image sent' });
-    }
-
-    // POST /message/send-audio — send audio file or voice note via URL
-    if (req.method === 'POST' && path === '/message/send-audio') {
-      const body = await parseBody(req);
-      const { to, audio_url, ptt } = body;
-
-      if (!to || !audio_url) {
-        return jsonResponse(req, res, 400, { error: 'Missing "to" or "audio_url" field' });
-      }
-
-      // ptt (push-to-talk) defaults to true — sends as voice note bubble
-      await sendAudio(to, audio_url, ptt !== false);
-      return jsonResponse(req, res, 200, { success: true, message: 'Audio sent' });
     }
 
     // GET /conversations — list active stranger conversations (Step B)
