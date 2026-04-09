@@ -525,9 +525,9 @@ function buildStrangerContext(pushName, phone, strangerJid) {
 
   return [
     '[WHATSAPP_STRANGER_CONTEXT]',
-    `Messaggio WhatsApp da: ${pushName} (${phone})`,
-    `⚠️ Questa persona NON è il Signore. È un contatto esterno. Chiamala "${pushName || 'Lei'}", MAI "Signore".`,
-    `Conversazione attiva: ${messageCount} messaggi, iniziata ${firstMessageAt}`,
+    `Incoming WhatsApp message from: ${pushName} (${phone})`,
+    `This person is NOT the owner. They are an external contact.`,
+    `Active conversation: ${messageCount} messages, started ${firstMessageAt}`,
     '',
     'Available routing tags:',
     '- [NOTIFY_OWNER]{"reason": "...", "summary": "..."}[/NOTIFY_OWNER] — sends a notification to the owner',
@@ -1270,14 +1270,14 @@ async function startConnection() {
           dbIncrRetryOrFail(msgId, DECRYPT_RETRY_MAX);
 
           const contactName = jid.replace(/@.*/, '');
-          const timestamp = new Date().toLocaleString('it-IT', { timeZone: 'Europe/Rome' });
+          const timestamp = new Date().toISOString();
           const notifyText = [
-            `⚠️ Messaggio non leggibile da ${contactName}`,
-            `Orario: ${timestamp}`,
+            `⚠️ Unreadable message from ${contactName}`,
+            `Time: ${timestamp}`,
             `ID: ${msgId}`,
             ``,
-            `Il messaggio non è stato decrittato dopo ${DECRYPT_RETRY_MAX} tentativi.`,
-            `Suggerimento: chiedi al contatto di reinviare il messaggio.`,
+            `Message could not be decrypted after ${DECRYPT_RETRY_MAX} attempts.`,
+            `Hint: ask the contact to resend the message.`,
           ].join('\n');
 
           forwardToLibreFang(
