@@ -3574,6 +3574,12 @@ pub struct DefaultModelConfig {
     /// into the API request body.
     #[serde(default, flatten)]
     pub extra_params: HashMap<String, serde_json::Value>,
+    /// Claude Code CLI profile directories for token rotation.
+    /// Each entry is a path to a `.claude/` config dir (e.g. `~/.claude-profiles/account-2`).
+    /// When multiple profiles are configured, a TokenRotationDriver wraps them
+    /// for automatic failover on rate limits.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub cli_profile_dirs: Vec<String>,
 }
 
 fn default_message_timeout_secs() -> u64 {
@@ -3589,6 +3595,7 @@ impl Default for DefaultModelConfig {
             base_url: None,
             message_timeout_secs: default_message_timeout_secs(),
             extra_params: HashMap::new(),
+            cli_profile_dirs: Vec::new(),
         }
     }
 }
