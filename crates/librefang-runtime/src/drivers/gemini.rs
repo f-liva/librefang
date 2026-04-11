@@ -758,6 +758,11 @@ pub(crate) async fn stream_gemini_sse(
 
 #[async_trait]
 impl LlmDriver for GeminiDriver {
+    fn supports_vision(&self) -> bool {
+        // All Gemini 1.5+ and 2.x models accept inline image parts.
+        true
+    }
+
     async fn complete(&self, request: CompletionRequest) -> Result<CompletionResponse, LlmError> {
         let (contents, system_instruction) = convert_messages(&request.messages, &request.system);
         let tools = convert_tools(&request);

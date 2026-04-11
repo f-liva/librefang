@@ -424,6 +424,12 @@ fn detect_cli_error_in_text(text: &str) -> Option<LlmError> {
 
 #[async_trait]
 impl LlmDriver for ClaudeCodeDriver {
+    fn supports_vision(&self) -> bool {
+        // Claude Code CLI runs Claude Sonnet/Opus models which accept image
+        // paths inline (see `build_prompt` / `image_dir` plumbing).
+        true
+    }
+
     async fn complete(&self, request: CompletionRequest) -> Result<CompletionResponse, LlmError> {
         let prepared = Self::build_prompt(&request);
         let model_flag = Self::model_flag(&request.model);

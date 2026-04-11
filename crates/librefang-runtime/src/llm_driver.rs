@@ -198,6 +198,17 @@ pub trait LlmDriver: Send + Sync {
     fn is_configured(&self) -> bool {
         true
     }
+
+    /// Whether this driver's underlying LLM can interpret images natively
+    /// (multimodal input). Tools that produce image payloads — such as
+    /// `image_analyze`, which returns base64-encoded images — are filtered
+    /// from the tool list presented to drivers that return `false` here,
+    /// since the model cannot make use of the output anyway.
+    ///
+    /// Defaults to `false` so new drivers are conservative by default.
+    fn supports_vision(&self) -> bool {
+        false
+    }
 }
 
 /// Configuration for creating an LLM driver.

@@ -546,6 +546,15 @@ impl OpenAIDriver {
 
 #[async_trait]
 impl LlmDriver for OpenAIDriver {
+    fn supports_vision(&self) -> bool {
+        // OpenAI supports vision via GPT-4o / GPT-4 Turbo with vision.
+        // Returning true is the best the driver can say without inspecting
+        // the runtime-selected model name; agents configured with non-vision
+        // models (e.g. gpt-3.5-turbo) will still see image_analyze in their
+        // tool list, which matches the pre-fix behaviour for OpenAI.
+        true
+    }
+
     async fn complete(&self, request: CompletionRequest) -> Result<CompletionResponse, LlmError> {
         let mut oai_request = self.build_request(&request)?;
 

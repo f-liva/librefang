@@ -19,6 +19,17 @@ use tracing::{debug, warn};
 #[allow(dead_code)]
 const MAX_AGENT_CALL_DEPTH: u32 = 5;
 
+/// Built-in tools whose output is only useful when the LLM can interpret
+/// images natively (multimodal). These are filtered from the tool list when
+/// the agent's effective driver does not support vision — see
+/// `crate::llm_driver::provider_supports_vision`.
+const VISION_REQUIRING_TOOLS: &[&str] = &["image_analyze"];
+
+/// Returns true if the named tool requires a vision-capable LLM to be useful.
+pub fn is_vision_requiring_tool(name: &str) -> bool {
+    VISION_REQUIRING_TOOLS.contains(&name)
+}
+
 /// Check if a shell command should be blocked by taint tracking.
 ///
 /// Layer 1: Shell metacharacter injection (backticks, `$(`, `${`, etc.)
@@ -4360,6 +4371,22 @@ mod tests {
     use async_trait::async_trait;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
+
+    #[test]
+    fn vision_requiring_tools_classification() {
+        // Positive: image_analyze must be classified as vision-requiring
+        // so the kernel filters it out for non-multimodal drivers.
+        assert!(is_vision_requiring_tool("image_analyze"));
+
+        // Negative: tools that operate on images but only return metadata
+        // or text (e.g. read_file rendering paths) are NOT vision-only.
+        assert!(!is_vision_requiring_tool("read_file"));
+        assert!(!is_vision_requiring_tool("file_read"));
+        assert!(!is_vision_requiring_tool("media_describe"));
+        assert!(!is_vision_requiring_tool("image_generate"));
+        assert!(!is_vision_requiring_tool("nonexistent_tool"));
+        assert!(!is_vision_requiring_tool(""));
+    }
 
     struct ApprovalKernel {
         approval_requests: Arc<AtomicUsize>,

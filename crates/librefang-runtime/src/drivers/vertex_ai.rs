@@ -732,6 +732,11 @@ fn resolve_region(config: &DriverConfig) -> String {
 
 #[async_trait]
 impl LlmDriver for VertexAiDriver {
+    fn supports_vision(&self) -> bool {
+        // Vertex AI fronts Gemini; same multimodal capability.
+        true
+    }
+
     async fn complete(&self, request: CompletionRequest) -> Result<CompletionResponse, LlmError> {
         let url = self.endpoint_url(&request.model, false);
 

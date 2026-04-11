@@ -249,6 +249,10 @@ fn build_anthropic_request(request: &CompletionRequest) -> ApiRequest {
 
 #[async_trait]
 impl LlmDriver for AnthropicDriver {
+    fn supports_vision(&self) -> bool {
+        true
+    }
+
     async fn complete(&self, request: CompletionRequest) -> Result<CompletionResponse, LlmError> {
         let api_request = build_anthropic_request(&request);
 

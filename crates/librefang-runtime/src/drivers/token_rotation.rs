@@ -42,6 +42,10 @@ pub struct TokenRotationDriver {
     current: AtomicUsize,
     /// Provider name for logging.
     provider: String,
+    /// Cached vision capability, derived from the first driver at construction.
+    /// All slots in a rotation pool share the same provider, so this is
+    /// uniform across the pool and can be read synchronously.
+    supports_vision: bool,
 }
 
 impl TokenRotationDriver {
@@ -60,6 +64,13 @@ impl TokenRotationDriver {
             profiles = ?drivers.iter().map(|(_, n)| n.as_str()).collect::<Vec<_>>(),
             "Token rotation pool initialized"
         );
+        // All slots in a rotation pool share the same provider, so the
+        // vision capability is uniform across the pool. Snapshot it now
+        // from the first driver so `supports_vision()` can stay sync.
+        let supports_vision = drivers
+            .first()
+            .map(|(d, _)| d.supports_vision())
+            .unwrap_or(false);
         let slots = drivers
             .into_iter()
             .map(|(driver, name)| KeySlot {
@@ -72,6 +83,7 @@ impl TokenRotationDriver {
             slots: RwLock::new(slots),
             current: AtomicUsize::new(0),
             provider,
+            supports_vision,
         }
     }
 
@@ -224,6 +236,10 @@ impl TokenRotationDriver {
 
 #[async_trait]
 impl LlmDriver for TokenRotationDriver {
+    fn supports_vision(&self) -> bool {
+        self.supports_vision
+    }
+
     async fn complete(&self, request: CompletionRequest) -> Result<CompletionResponse, LlmError> {
         let slot_count = self.slots.read().await.len();
         let mut last_error: Option<LlmError> = None;

@@ -23,6 +23,7 @@ use librefang_runtime::agent_loop::{
 };
 use librefang_runtime::audit::AuditLog;
 use librefang_runtime::drivers;
+use librefang_runtime::drivers::provider_supports_vision;
 use librefang_runtime::kernel_handle::{self, KernelHandle};
 use librefang_runtime::llm_driver::{
     CompletionRequest, CompletionResponse, DriverConfig, LlmDriver, LlmError, StreamEvent,
@@ -30,7 +31,7 @@ use librefang_runtime::llm_driver::{
 use librefang_runtime::python_runtime::{self, PythonConfig};
 use librefang_runtime::routing::ModelRouter;
 use librefang_runtime::sandbox::{SandboxConfig, WasmSandbox};
-use librefang_runtime::tool_runner::builtin_tool_definitions;
+use librefang_runtime::tool_runner::{builtin_tool_definitions, is_vision_requiring_tool};
 use librefang_types::agent::*;
 use librefang_types::capability::{glob_matches, Capability};
 use librefang_types::config::{AuthProfile, AutoRouteStrategy, KernelConfig};
@@ -3817,8 +3818,15 @@ system_prompt = "You are a helpful assistant."
         };
 
         let tools = self.available_tools(agent_id);
-        let tools = entry.mode.filter_tools((*tools).clone());
+        let mut tools = entry.mode.filter_tools((*tools).clone());
         let driver = self.resolve_driver(&entry.manifest)?;
+
+        // Filter vision-only tools (e.g. image_analyze) when the resolved
+        // driver does not support multimodal input — see
+        // `LlmDriver::supports_vision`.
+        if !driver.supports_vision() {
+            tools.retain(|t| !is_vision_requiring_tool(&t.name));
+        }
 
         // Look up model's actual context window from the catalog
         let ctx_window = self.model_catalog.read().ok().and_then(|cat| {
@@ -4889,15 +4897,7 @@ system_prompt = "You are a helpful assistant."
             });
 
         let tools = self.available_tools(agent_id);
-        let tools = entry.mode.filter_tools((*tools).clone());
-
-        info!(
-            agent = %entry.name,
-            agent_id = %agent_id,
-            tool_count = tools.len(),
-            tool_names = ?tools.iter().map(|t| t.name.as_str()).collect::<Vec<_>>(),
-            "Tools selected for LLM request"
-        );
+        let mut tools = entry.mode.filter_tools((*tools).clone());
 
         // Apply model routing if configured (disabled in Stable mode)
         let mut manifest = entry.manifest.clone();
@@ -4937,6 +4937,26 @@ system_prompt = "You are a helpful assistant."
                 }
             }
         }
+
+        // Filter vision-only tools (e.g. image_analyze) when the agent's
+        // effective provider does not back a multimodal LLM. This must run
+        // *after* default-provider resolution (so manifest.model.provider is
+        // concrete) and *before* the prompt context is built (so the system
+        // prompt's tool list matches what the LLM will actually receive).
+        // The model router runs later and may swap the model — but routing
+        // typically stays inside the same provider family, so the vision
+        // capability is stable enough at this point.
+        if !provider_supports_vision(&manifest.model.provider) {
+            tools.retain(|t| !is_vision_requiring_tool(&t.name));
+        }
+
+        info!(
+            agent = %entry.name,
+            agent_id = %agent_id,
+            tool_count = tools.len(),
+            tool_names = ?tools.iter().map(|t| t.name.as_str()).collect::<Vec<_>>(),
+            "Tools selected for LLM request"
+        );
 
         // Backfill thinking config from global config if per-agent is not set
         if manifest.thinking.is_none() {

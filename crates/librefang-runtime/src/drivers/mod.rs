@@ -627,6 +627,51 @@ fn find_provider(name: &str) -> Option<&'static ProviderEntry> {
         .find(|p| p.name == name || p.aliases.contains(&name))
 }
 
+// ── Vision Capability Lookup ─────────────────────────────────────
+
+/// Returns true when the named provider's underlying API format can carry
+/// inline image content (i.e. the LLM behind the driver is multimodal).
+///
+/// This sync lookup is used by the kernel to filter vision-only tools
+/// (e.g. `image_analyze`) from the tool list before the prompt is built.
+/// Calling `LlmDriver::supports_vision()` at that point would require
+/// resolving the driver twice (once before model routing, once after),
+/// so we go through the static provider registry instead.
+///
+/// Unknown providers conservatively return `false`.
+///
+/// Coherence with the per-driver `LlmDriver::supports_vision()` overrides
+/// is enforced by the `provider_vision_matches_driver_impl` test.
+pub fn provider_supports_vision(provider: &str) -> bool {
+    match find_provider(provider) {
+        Some(entry) => api_format_supports_vision(entry.api_format),
+        None => false,
+    }
+}
+
+/// Internal helper: maps an `ApiFormat` to its vision capability.
+///
+/// Match is exhaustive on purpose — adding a new `ApiFormat` variant
+/// will fail compilation here, forcing a deliberate vision/no-vision
+/// classification rather than silent default-false.
+const fn api_format_supports_vision(fmt: ApiFormat) -> bool {
+    match fmt {
+        // Multimodal HTTP APIs.
+        ApiFormat::OpenAI
+        | ApiFormat::Anthropic
+        | ApiFormat::Gemini
+        | ApiFormat::ClaudeCode
+        | ApiFormat::VertexAI
+        | ApiFormat::AzureOpenAI => true,
+        // CLI subprocess drivers without image-passing plumbing.
+        ApiFormat::QwenCode | ApiFormat::GeminiCli | ApiFormat::CodexCli | ApiFormat::Aider => {
+            false
+        }
+        // Web-scraper drivers — image upload is not implemented.
+        ApiFormat::ChatGpt | ApiFormat::Copilot => false,
+    }
+}
+
 // ── Provider Defaults (registry-backed, used by tests) ───────────
 
 /// Provider metadata: base URL and env var name for the API key.
@@ -1333,5 +1378,106 @@ mod tests {
         assert_eq!(cache.len(), 1);
         cache.clear();
         assert!(cache.is_empty());
+    }
+
+    // ── Vision capability lookup ─────────────────────────────────
+
+    #[test]
+    fn provider_supports_vision_known_providers() {
+        // Multimodal HTTP API providers.
+        assert!(provider_supports_vision("anthropic"));
+        assert!(provider_supports_vision("openai"));
+        assert!(provider_supports_vision("gemini"));
+        assert!(provider_supports_vision("google")); // alias of gemini
+        assert!(provider_supports_vision("vertex-ai"));
+        assert!(provider_supports_vision("azure-openai"));
+
+        // OpenAI-compatible providers all map to ApiFormat::OpenAI, which
+        // has vision in some models — we're conservative here and report
+        // capability at the format level, matching what the driver advertises.
+        assert!(provider_supports_vision("groq"));
+        assert!(provider_supports_vision("openrouter"));
+        assert!(provider_supports_vision("deepinfra"));
+        assert!(provider_supports_vision("xai"));
+        assert!(provider_supports_vision("moonshot"));
+
+        // Claude Code CLI accepts inline image paths.
+        assert!(provider_supports_vision("claude-code"));
+
+        // CLI drivers without image-passing plumbing.
+        assert!(!provider_supports_vision("qwen-code"));
+        assert!(!provider_supports_vision("gemini-cli"));
+        assert!(!provider_supports_vision("codex-cli"));
+        assert!(!provider_supports_vision("aider"));
+
+        // Web-scraper drivers — image upload not implemented.
+        assert!(!provider_supports_vision("chatgpt"));
+        assert!(!provider_supports_vision("github-copilot"));
+    }
+
+    #[test]
+    fn provider_supports_vision_unknown_returns_false() {
+        // Unknown providers fall back to false (conservative — caller will
+        // strip vision-only tools rather than risk a confused LLM).
+        assert!(!provider_supports_vision("nonexistent-provider"));
+        assert!(!provider_supports_vision(""));
+        assert!(!provider_supports_vision("random-name-12345"));
+    }
+
+    /// Coherence test: every provider for which `provider_supports_vision`
+    /// returns true MUST resolve to a concrete driver whose
+    /// `LlmDriver::supports_vision()` also returns true. Likewise for false.
+    ///
+    /// This catches the failure mode where someone adds a new
+    /// `ApiFormat::Foo` and updates `api_format_supports_vision` but
+    /// forgets the matching `impl LlmDriver::supports_vision` override
+    /// (or vice versa).
+    #[test]
+    fn provider_vision_matches_driver_impl() {
+        // (provider name, expected vision capability)
+        // For each entry, we build the actual driver and check that the
+        // trait method agrees with the standalone helper.
+        let cases: &[(&str, Option<&str>)] = &[
+            // (provider, base_url override for OpenAI-compat providers)
+            ("anthropic", None),
+            ("openai", None),
+            ("gemini", None),
+            ("groq", None),
+            ("openrouter", None),
+            ("claude-code", None),
+            ("qwen-code", None),
+            ("gemini-cli", None),
+            ("codex-cli", None),
+            ("aider", None),
+        ];
+
+        for (provider, base_url) in cases {
+            let helper = provider_supports_vision(provider);
+            let config = DriverConfig {
+                provider: provider.to_string(),
+                api_key: Some("test-dummy-key".to_string()),
+                base_url: base_url.map(|s| s.to_string()),
+                vertex_ai: librefang_types::config::VertexAiConfig::default(),
+                azure_openai: librefang_types::config::AzureOpenAiConfig::default(),
+                skip_permissions: true,
+                message_timeout_secs: 300,
+            };
+            let driver = match create_driver(&config) {
+                Ok(d) => d,
+                Err(e) => panic!(
+                    "create_driver({provider:?}) failed: {e:?} — \
+                     all providers in the coherence list must be constructible \
+                     with a dummy api key"
+                ),
+            };
+            let trait_says = driver.supports_vision();
+            assert_eq!(
+                helper, trait_says,
+                "Vision capability mismatch for provider {provider:?}: \
+                 provider_supports_vision = {helper}, driver.supports_vision() = {trait_says}. \
+                 Update either api_format_supports_vision in drivers/mod.rs or the \
+                 LlmDriver::supports_vision impl in drivers/{provider}.rs."
+            );
+        }
     }
 }
