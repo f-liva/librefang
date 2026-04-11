@@ -2918,11 +2918,21 @@ async fn tool_image_analyze(input: &serde_json::Value) -> Result<String, String>
     if !prompt.is_empty() {
         result["prompt"] = serde_json::json!(prompt);
         result["note"] = serde_json::json!(
-            "Vision analysis requires a vision-capable LLM. The base64 data is included for downstream processing."
+            "Vision analysis requires a vision-capable LLM. The base64 data is included for downstream processing. \
+             If image_analyze is not working, use read_file on the image path directly — read_file natively supports \
+             JPG/PNG/WebP/SVG/BMP/GIF rendering in agents with multimodal capabilities."
+        );
+    } else {
+        // No prompt provided — suggest the read_file workaround proactively
+        result["suggestion"] = serde_json::json!(
+            "image_analyze encodes the image as base64 but requires a vision-capable LLM. \
+             For agents without vision backend, use read_file on the image path directly. \
+             read_file natively supports JPG/PNG/WebP/SVG/BMP/GIF rendering."
         );
     }
 
     result["base64_preview"] = serde_json::json!(base64_preview);
+    result["file_path"] = serde_json::json!(path);
 
     serde_json::to_string_pretty(&result).map_err(|e| format!("Serialize error: {e}"))
 }
