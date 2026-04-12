@@ -4,7 +4,6 @@
 //! Otherwise, commands boot an in-process kernel (single-shot mode).
 
 mod bundled_agents;
-mod dotenv;
 mod http_client;
 pub mod i18n;
 mod launcher;
@@ -1396,7 +1395,7 @@ fn main() {
     }
 
     // Load ~/.librefang/.env into process environment (system env takes priority).
-    dotenv::load_dotenv();
+    librefang_types::librefang_types::dotenv::load_dotenv();
 
     let language = load_language_from_config().unwrap_or_else(|| "en".to_string());
     i18n::init(&language);
@@ -5103,7 +5102,7 @@ fn cmd_channel_setup(channel: Option<&str>) {
             maybe_write_channel_config("telegram", config_block);
 
             // Save token to .env
-            match dotenv::save_env_key("TELEGRAM_BOT_TOKEN", &token) {
+            match librefang_types::dotenv::save_env_key("TELEGRAM_BOT_TOKEN", &token) {
                 Ok(()) => ui::success(&i18n::t("channel-token-saved")),
                 Err(_) => println!("    export TELEGRAM_BOT_TOKEN={token}"),
             }
@@ -5133,7 +5132,7 @@ fn cmd_channel_setup(channel: Option<&str>) {
             let config_block = "\n[channels.discord]\nbot_token_env = \"DISCORD_BOT_TOKEN\"\ndefault_agent = \"coder\"\n";
             maybe_write_channel_config("discord", config_block);
 
-            match dotenv::save_env_key("DISCORD_BOT_TOKEN", &token) {
+            match librefang_types::dotenv::save_env_key("DISCORD_BOT_TOKEN", &token) {
                 Ok(()) => ui::success(&i18n::t("channel-token-saved")),
                 Err(_) => println!("    export DISCORD_BOT_TOKEN={token}"),
             }
@@ -5161,13 +5160,13 @@ fn cmd_channel_setup(channel: Option<&str>) {
             maybe_write_channel_config("slack", config_block);
 
             if !app_token.is_empty() {
-                match dotenv::save_env_key("SLACK_APP_TOKEN", &app_token) {
+                match librefang_types::dotenv::save_env_key("SLACK_APP_TOKEN", &app_token) {
                     Ok(()) => ui::success(&i18n::t("channel-app-token-saved")),
                     Err(_) => println!("    export SLACK_APP_TOKEN={app_token}"),
                 }
             }
             if !bot_token.is_empty() {
-                match dotenv::save_env_key("SLACK_BOT_TOKEN", &bot_token) {
+                match librefang_types::dotenv::save_env_key("SLACK_BOT_TOKEN", &bot_token) {
                     Ok(()) => ui::success(&i18n::t("channel-bot-token-saved")),
                     Err(_) => println!("    export SLACK_BOT_TOKEN={bot_token}"),
                 }
@@ -5201,7 +5200,7 @@ fn cmd_channel_setup(channel: Option<&str>) {
                 ("WA_VERIFY_TOKEN", &verify_token),
             ] {
                 if !val.is_empty() {
-                    match dotenv::save_env_key(key, val) {
+                    match librefang_types::dotenv::save_env_key(key, val) {
                         Ok(()) => ui::success(&i18n::t_args("channel-key-saved", &[("key", key)])),
                         Err(_) => println!("    export {key}={val}"),
                     }
@@ -5233,7 +5232,7 @@ fn cmd_channel_setup(channel: Option<&str>) {
             maybe_write_channel_config("email", &config_block);
 
             if !password.is_empty() {
-                match dotenv::save_env_key("EMAIL_PASSWORD", &password) {
+                match librefang_types::dotenv::save_env_key("EMAIL_PASSWORD", &password) {
                     Ok(()) => ui::success(&i18n::t("channel-password-saved")),
                     Err(_) => println!("    export EMAIL_PASSWORD=your_app_password"),
                 }
@@ -5267,7 +5266,7 @@ fn cmd_channel_setup(channel: Option<&str>) {
             maybe_write_channel_config("signal", config_block);
 
             if !phone.is_empty() {
-                match dotenv::save_env_key("SIGNAL_PHONE", &phone) {
+                match librefang_types::dotenv::save_env_key("SIGNAL_PHONE", &phone) {
                     Ok(()) => ui::success(&i18n::t("channel-phone-saved")),
                     Err(_) => println!("    export SIGNAL_PHONE={phone}"),
                 }
@@ -5300,9 +5299,9 @@ fn cmd_channel_setup(channel: Option<&str>) {
             let config_block = "\n[channels.matrix]\nhomeserver_env = \"MATRIX_HOMESERVER\"\naccess_token_env = \"MATRIX_ACCESS_TOKEN\"\ndefault_agent = \"router\"\n";
             maybe_write_channel_config("matrix", config_block);
 
-            let _ = dotenv::save_env_key("MATRIX_HOMESERVER", &homeserver);
+            let _ = librefang_types::dotenv::save_env_key("MATRIX_HOMESERVER", &homeserver);
             if !token.is_empty() {
-                match dotenv::save_env_key("MATRIX_ACCESS_TOKEN", &token) {
+                match librefang_types::dotenv::save_env_key("MATRIX_ACCESS_TOKEN", &token) {
                     Ok(()) => ui::success(&i18n::t("channel-token-saved")),
                     Err(_) => println!("    export MATRIX_ACCESS_TOKEN={token}"),
                 }
@@ -6248,7 +6247,7 @@ fn cmd_config_set_key(provider: &str) {
         return;
     }
 
-    match dotenv::save_env_key(&env_var, &key) {
+    match librefang_types::dotenv::save_env_key(&env_var, &key) {
         Ok(()) => {
             ui::success(&i18n::t_args("config-saved-key", &[("env_var", &env_var)]));
             // Test the key
@@ -6273,7 +6272,7 @@ fn cmd_config_set_key(provider: &str) {
 fn cmd_config_delete_key(provider: &str) {
     let env_var = provider_to_env_var(provider);
 
-    match dotenv::remove_env_key(&env_var) {
+    match librefang_types::dotenv::remove_env_key(&env_var) {
         Ok(()) => ui::success(&i18n::t_args(
             "config-removed-env",
             &[("env_var", &env_var)],

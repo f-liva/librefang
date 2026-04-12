@@ -11,6 +11,7 @@ pub mod approval;
 pub mod capability;
 pub mod comms;
 pub mod config;
+pub mod dotenv;
 pub mod error;
 pub mod event;
 pub mod goal;

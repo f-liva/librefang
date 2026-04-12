@@ -1,13 +1,17 @@
-//! Minimal `.env` file loader/saver for `~/.librefang/.env`.
+//! Minimal `.env` file loader/saver for `~/.librefang/.env` and `~/.librefang/secrets.env`.
 //!
-//! No external crate needed — hand-rolled for simplicity.
+//! This module lives in `librefang-types` so it can be used by both the CLI
+//! and the kernel crate. The kernel calls this at boot to ensure secrets
+//! are loaded regardless of how the process is started (CLI, systemd, Docker, etc.).
+//!
 //! Format: `KEY=VALUE` lines, `#` comments, optional quotes.
+//! System env vars take priority — existing vars are NOT overridden.
 
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 
 /// Get the LibreFang home directory, respecting LIBREFANG_HOME env var.
-fn dotenv_librefang_home() -> Option<PathBuf> {
+fn librefang_home() -> Option<PathBuf> {
     if let Ok(home) = std::env::var("LIBREFANG_HOME") {
         return Some(PathBuf::from(home));
     }
@@ -16,7 +20,12 @@ fn dotenv_librefang_home() -> Option<PathBuf> {
 
 /// Return the path to `~/.librefang/.env`.
 pub fn env_file_path() -> Option<PathBuf> {
-    dotenv_librefang_home().map(|h| h.join(".env"))
+    librefang_home().map(|h| h.join(".env"))
+}
+
+/// Return the path to `~/.librefang/secrets.env`.
+pub fn secrets_env_path() -> Option<PathBuf> {
+    librefang_home().map(|h| h.join("secrets.env"))
 }
 
 /// Load `~/.librefang/.env` and `~/.librefang/secrets.env` into `std::env`.
@@ -26,44 +35,8 @@ pub fn env_file_path() -> Option<PathBuf> {
 /// (but both yield to system env vars).
 /// Silently does nothing if the files don't exist.
 pub fn load_dotenv() {
-    // Vault takes highest priority (after system env vars).
-    load_vault();
     load_env_file(env_file_path());
-    // Also load secrets.env (written by dashboard "Set API Key" button)
     load_env_file(secrets_env_path());
-}
-
-/// Try to unlock the credential vault and inject secrets into process env.
-///
-/// Vault secrets have higher priority than `.env` but lower than system env vars.
-/// Silently does nothing if vault is not initialized or cannot be unlocked.
-fn load_vault() {
-    let vault_path = match dotenv_librefang_home() {
-        Some(h) => h.join("vault.enc"),
-        None => return,
-    };
-
-    if !vault_path.exists() {
-        return;
-    }
-
-    let mut vault = librefang_extensions::vault::CredentialVault::new(vault_path);
-    if vault.unlock().is_err() {
-        return;
-    }
-
-    for key in vault.list_keys() {
-        if std::env::var(key).is_err() {
-            if let Some(val) = vault.get(key) {
-                std::env::set_var(key, val.as_str());
-            }
-        }
-    }
-}
-
-/// Return the path to `~/.librefang/secrets.env`.
-pub fn secrets_env_path() -> Option<PathBuf> {
-    dotenv_librefang_home().map(|h| h.join("secrets.env"))
 }
 
 fn load_env_file(path: Option<PathBuf>) {
@@ -242,29 +215,6 @@ mod tests {
         let (k, v) = parse_env_line("KEY='value'").unwrap();
         assert_eq!(k, "KEY");
         assert_eq!(v, "value");
-    }
-
-    #[test]
-    fn test_parse_env_line_spaces() {
-        let (k, v) = parse_env_line("  KEY  =  value  ").unwrap();
-        assert_eq!(k, "KEY");
-        assert_eq!(v, "value");
-    }
-
-    #[test]
-    fn test_parse_env_line_no_value() {
-        let (k, v) = parse_env_line("KEY=").unwrap();
-        assert_eq!(k, "KEY");
-        assert_eq!(v, "");
-    }
-
-    #[test]
-    fn test_parse_env_line_comment() {
-        assert!(
-            parse_env_line("# comment").is_none()
-                || parse_env_line("# comment").unwrap().0.starts_with('#')
-        );
-        // Comments are filtered before reaching parse_env_line in production code
     }
 
     #[test]

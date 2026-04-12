@@ -669,6 +669,11 @@ impl LibreFangKernel {
     pub fn boot_with_config(mut config: KernelConfig) -> KernelResult<Self> {
         use librefang_types::config::KernelMode;
 
+        // Load .env and secrets.env into process environment.
+        // This ensures the kernel is self-sufficient — it doesn't rely on the
+        // parent process (CLI, systemd, Docker entrypoint) to have loaded secrets.
+        librefang_types::dotenv::load_dotenv();
+
         // Env var overrides — useful for Docker where config.toml is baked in.
         if let Ok(listen) = std::env::var("LIBREFANG_LISTEN") {
             config.api_listen = listen;
