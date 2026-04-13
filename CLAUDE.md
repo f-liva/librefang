@@ -172,6 +172,15 @@ taskkill //PID <pid> //F
 - **Worktree**: Use `git worktree add` on an external disk for new features; fall back to `/tmp/librefang-<feature>` only if no external disk is available. Never develop on the main worktree
 - **Worktree continuation = drive to PR**: When asked to continue half-done work in an existing worktree (uncommitted changes or unmerged commits), the workflow is **commit → push → open or update PR**. Don't stop at "local commits only". A new branch needs a fresh PR; an existing branch with an open PR gets a follow-up push to update it. If the dirty changes aren't real work (e.g., stale `Cargo.lock` after rebase on an already-merged branch), discard them with `git checkout` instead of half-committing
 
+## Live-Debug Workflow (MANDATORY)
+
+Work on a GitHub fork branch **and** in sync with the NAS runtime — every local edit must be mirrored to the running container so the Signore can smoke-test immediately. Applies to every task, not just production incidents.
+
+1. **Push the working branch to `fork` after every commit.** Even WIP commits go up. The fork branch is the authoritative record; the local branch is just a scratchpad. Never stay "only local" — that loses work on an accident and blocks remote review.
+2. **Mirror each change to the NAS container.** For runtime assets that live in `/data/` (gateway `index.js`, config files, MemPalace plugin, entrypoint): `scp` + `lzc-docker cp` into the container, then trigger the appropriate restart (`lzc-docker restart cloudlazycatapplibrefang-librefang-1` for kernel-spawned processes, or kill the subprocess for kernel auto-respawn). For Rust changes: the CI build + Docker pull + restart cycle is the canonical path — don't patch binaries in place.
+3. **Keep the fork branch and the NAS in lockstep.** After any local edit: (a) commit, (b) push, (c) mirror to NAS, (d) restart. Skipping step (b) or (c) makes "works on my machine" / "fixed in prod, lost at next deploy" failure modes. The NAS `/data/` volumes are persistent across container restarts but **get overwritten on image rebuild** — persistence requires the fork branch, not the NAS copy.
+4. **No PRs upstream without explicit user confirmation.** Fork branch = always. Upstream PR = only when the Signore says so. A push to `fork` is not a request to merge — it's just the backup + live-test vehicle.
+
 ## Common Gotchas
 - `librefang.exe` may be locked if daemon is running — use `--lib` flag or kill daemon first
 - `PeerRegistry` is `Option<PeerRegistry>` on kernel but `Option<Arc<PeerRegistry>>` on `AppState` — wrap with `.as_ref().map(|r| Arc::new(r.clone()))`
