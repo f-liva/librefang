@@ -334,7 +334,10 @@ mod tests {
         // failures we simulate the recovery window elapsing and verify that
         // `maybe_recover` clears both the error counter and the EWMA penalty.
         let fb = FallbackDriver::with_models(vec![
-            (Arc::new(FailDriver) as Arc<dyn LlmDriver>, "fail".to_string()),
+            (
+                Arc::new(FailDriver) as Arc<dyn LlmDriver>,
+                "fail".to_string(),
+            ),
             (Arc::new(OkDriver) as Arc<dyn LlmDriver>, "ok".to_string()),
         ]);
 
@@ -369,7 +372,10 @@ mod tests {
     #[tokio::test]
     async fn recover_is_noop_within_cooldown() {
         let fb = FallbackDriver::with_models(vec![
-            (Arc::new(FailDriver) as Arc<dyn LlmDriver>, "fail".to_string()),
+            (
+                Arc::new(FailDriver) as Arc<dyn LlmDriver>,
+                "fail".to_string(),
+            ),
             (Arc::new(OkDriver) as Arc<dyn LlmDriver>, "ok".to_string()),
         ]);
         let _ = fb.complete(test_request()).await;
