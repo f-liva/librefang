@@ -348,33 +348,52 @@ async fn transcode_oga_to_ogg_opus(input_bytes: &[u8]) -> Result<Vec<u8>, String
         });
     }
 
-    let wait = child.wait_with_output();
-    let result = match tokio::time::timeout(std::time::Duration::from_secs(30), wait).await {
-        Ok(r) => r.map_err(|e| format!("ffmpeg wait failed: {e}"))?,
+    // Read stdout / stderr concurrently with waiting so we can kill + reap
+    // the child explicitly on timeout (wait_with_output would move the
+    // Child handle and leak the process if the wrapping timeout fires).
+    use tokio::io::AsyncReadExt;
+    let mut stdout = child.stdout.take().expect("stdout piped");
+    let mut stderr = child.stderr.take().expect("stderr piped");
+    let stdout_task = tokio::spawn(async move {
+        let mut buf = Vec::new();
+        let _ = stdout.read_to_end(&mut buf).await;
+        buf
+    });
+    let stderr_task = tokio::spawn(async move {
+        let mut buf = Vec::new();
+        let _ = stderr.read_to_end(&mut buf).await;
+        buf
+    });
+
+    let status = match tokio::time::timeout(
+        std::time::Duration::from_secs(30),
+        child.wait(),
+    )
+    .await
+    {
+        Ok(Ok(s)) => s,
+        Ok(Err(e)) => return Err(format!("ffmpeg wait failed: {e}")),
         Err(_) => {
-            // Timeout: kill + reap to avoid a zombie. The child handle was
-            // moved into `wait_with_output`, so we can't kill by handle
-            // here; the spawned kernel signal via process group isn't
-            // portable. Best we can do is surface the timeout; ffmpeg
-            // itself exits when stdin EOF reaches it once the feeder task
-            // is dropped with the runtime.
+            let _ = child.start_kill();
+            let _ = child.wait().await;
             return Err("ffmpeg transcode timed out after 30s".to_string());
         }
     };
 
-    if !result.status.success() {
+    let out = stdout_task.await.unwrap_or_default();
+    let err = stderr_task.await.unwrap_or_default();
+
+    if !status.success() {
         return Err(format!(
             "ffmpeg exited with {}: {}",
-            result.status,
-            String::from_utf8_lossy(&result.stderr).trim()
+            status,
+            String::from_utf8_lossy(&err).trim()
         ));
     }
-
-    if result.stdout.is_empty() {
+    if out.is_empty() {
         return Err("ffmpeg produced an empty output stream".to_string());
     }
-
-    Ok(result.stdout)
+    Ok(out)
 }
 
 /// Detect which audio transcription provider is available.
