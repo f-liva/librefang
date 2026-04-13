@@ -1546,8 +1546,18 @@ async function downloadMedia(fullMsg) {
 /**
  * Upload a buffer to LibreFang via POST /api/agents/{id}/upload.
  * Returns { file_id, filename, content_type, size, transcription? } or throws.
+ *
+ * The backend's `MediaAttachment::validate` (crates/librefang-types/src/media.rs)
+ * does an exact string match against its MIME allowlist, so a Content-Type
+ * with RFC 2045 parameters — e.g. WhatsApp's `audio/ogg; codecs=opus` — is
+ * rejected even though `audio/ogg` is allowed. Upstream fix lives in PR #2362
+ * (MIME-param normalisation in the validator); until that binary ships, we
+ * strip the parameters here so uploads are accepted by the current server.
  */
 async function uploadToLibreFang(agentId, buffer, contentType, filename) {
+  const normalizedContentType = typeof contentType === 'string'
+    ? contentType.split(';')[0].trim() || 'application/octet-stream'
+    : 'application/octet-stream';
   async function attempt() {
     return new Promise((resolve, reject) => {
       const url = new URL(`${LIBREFANG_URL}/api/agents/${encodeURIComponent(agentId)}/upload`);
@@ -1558,7 +1568,7 @@ async function uploadToLibreFang(agentId, buffer, contentType, filename) {
           path: url.pathname,
           method: 'POST',
           headers: {
-            'Content-Type': contentType,
+            'Content-Type': normalizedContentType,
             'X-Filename': filename,
             'Content-Length': buffer.length,
           },
