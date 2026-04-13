@@ -1649,27 +1649,12 @@ impl LibreFangKernel {
 
     /// Boot the kernel with an explicit configuration.
     ///
-    /// # Caller contract: env must already be loaded
-    ///
-    /// `boot_with_config` **does not** mutate process environment. Callers
-    /// are expected to have loaded `.env` / `secrets.env` / vault into the
-    /// process env **before** calling this function — see
-    /// [`librefang_extensions::dotenv::load_dotenv`] for the canonical
-    /// helper.
-    ///
-    /// The reason is safety, not style: `std::env::set_var` is
-    /// [undefined behaviour][ub] in Rust 1.80+ once any other thread exists,
-    /// and by the time we reach `boot_with_config` we are already inside a
-    /// tokio runtime — reqwest, tracing, config parsers, and test harnesses
-    /// are all concurrently reading env. Mutating env from here raced with
-    /// those readers on older toolchains and is outright UB on current ones.
-    ///
-    /// Daemon entry points (`librefang-cli`, `librefang-desktop`,
-    /// `librefang_api::server::start_daemon`) all call `load_dotenv()` at
-    /// their synchronous `main()` boundary, before the runtime is spawned,
-    /// which is the only place that mutation is safe.
-    ///
-    /// [ub]: https://doc.rust-lang.org/std/env/fn.set_var.html
+    /// Callers must have loaded `.env` / `secrets.env` / vault into the
+    /// process env before calling this — use
+    /// [`librefang_extensions::dotenv::load_dotenv`] from a synchronous
+    /// `main()`. Mutating env from here would be UB: this function is
+    /// reached from inside a tokio runtime, and `std::env::set_var` is
+    /// unsound once other threads exist (Rust 1.80+).
     pub fn boot_with_config(mut config: KernelConfig) -> KernelResult<Self> {
         use librefang_types::config::KernelMode;
 
