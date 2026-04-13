@@ -313,6 +313,37 @@ struct QwenStreamEvent {
 /// surface raw JSON to the caller: if stdout looks like JSON but cannot be
 /// decomposed into events, we return an empty string plus a warning log,
 /// rather than letting the raw JSON leak into the chat transcript.
+fn absorb_events(events: Vec<QwenStreamEvent>, text: &mut String, usage: &mut TokenUsage) {
+    for ev in events {
+        match ev.r#type.as_str() {
+            "content" | "text" | "assistant" | "content_block_delta" => {
+                if let Some(c) = ev.content {
+                    text.push_str(&c);
+                }
+            }
+            "result" | "done" | "complete" => {
+                if text.is_empty() {
+                    if let Some(r) = ev.result {
+                        text.push_str(&r);
+                    }
+                }
+                if let Some(u) = ev.usage {
+                    *usage = TokenUsage {
+                        input_tokens: u.input_tokens,
+                        output_tokens: u.output_tokens,
+                        ..Default::default()
+                    };
+                }
+            }
+            _ => {
+                if let Some(c) = ev.content {
+                    text.push_str(&c);
+                }
+            }
+        }
+    }
+}
+
 fn extract_text_from_qwen_output(stdout: &str) -> (String, TokenUsage) {
     let trimmed = stdout.trim();
     if trimmed.is_empty() {
@@ -321,41 +352,11 @@ fn extract_text_from_qwen_output(stdout: &str) -> (String, TokenUsage) {
 
     let mut text = String::new();
     let mut usage = TokenUsage::default();
-    let mut absorb = |events: Vec<QwenStreamEvent>| {
-        for ev in events {
-            match ev.r#type.as_str() {
-                "content" | "text" | "assistant" | "content_block_delta" => {
-                    if let Some(c) = ev.content {
-                        text.push_str(&c);
-                    }
-                }
-                "result" | "done" | "complete" => {
-                    if text.is_empty() {
-                        if let Some(r) = ev.result {
-                            text.push_str(&r);
-                        }
-                    }
-                    if let Some(u) = ev.usage {
-                        usage = TokenUsage {
-                            input_tokens: u.input_tokens,
-                            output_tokens: u.output_tokens,
-                            ..Default::default()
-                        };
-                    }
-                }
-                _ => {
-                    if let Some(c) = ev.content {
-                        text.push_str(&c);
-                    }
-                }
-            }
-        }
-    };
 
     // Shape 1: a JSON array of events on a single line/blob.
     if trimmed.starts_with('[') && trimmed.ends_with(']') {
         if let Ok(events) = serde_json::from_str::<Vec<QwenStreamEvent>>(trimmed) {
-            absorb(events);
+            absorb_events(events, &mut text, &mut usage);
             if !text.is_empty() || usage.output_tokens > 0 {
                 return (text, usage);
             }
@@ -379,7 +380,7 @@ fn extract_text_from_qwen_output(stdout: &str) -> (String, TokenUsage) {
         }
     }
     if all_lines_parsed && !jsonl_events.is_empty() {
-        absorb(jsonl_events);
+        absorb_events(jsonl_events, &mut text, &mut usage);
         if !text.is_empty() || usage.output_tokens > 0 {
             return (text, usage);
         }
