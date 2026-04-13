@@ -14,6 +14,12 @@
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
+
+/// Gate for [`load_dotenv`]. After the first call the helper is a no-op, so
+/// repeated calls from different entry points (e.g. CLI → API → kernel) do
+/// not do redundant file I/O and do not race on vault-unlock state.
+static DOTENV_LOADED: OnceLock<()> = OnceLock::new();
 
 /// Get the LibreFang home directory, respecting `LIBREFANG_HOME` env var.
 fn librefang_home() -> Option<PathBuf> {
@@ -36,14 +42,24 @@ pub fn secrets_file_path() -> Option<PathBuf> {
 /// Load `.env`, `secrets.env`, and the credential vault into `std::env`.
 ///
 /// This is the **canonical** entry point for all LibreFang processes.
-/// Call this early in your `main()` or `boot()` function.
+/// Call this from your synchronous `main()` *before* spawning any tokio
+/// runtime — `std::env::set_var` is undefined behaviour in Rust 1.80+ once
+/// other threads exist.
+///
+/// Idempotent: wrapped in a `OnceLock`, so redundant calls from nested
+/// entry points (CLI → kernel → server) are cheap no-ops after the first.
 ///
 /// System env vars take priority — existing vars are **not** overridden.
-/// Silently does nothing if files don't exist.
+/// Silently does nothing if files don't exist; vault-unlock failures are
+/// logged to stderr but do not abort boot.
 pub fn load_dotenv() {
+    if DOTENV_LOADED.get().is_some() {
+        return;
+    }
     load_vault();
     load_env_file(env_file_path());
     load_env_file(secrets_file_path());
+    let _ = DOTENV_LOADED.set(());
 }
 
 /// Try to unlock the credential vault and inject secrets into process env.
@@ -60,8 +76,18 @@ fn load_vault() {
         return;
     }
 
-    let mut vault = crate::vault::CredentialVault::new(vault_path);
-    if vault.unlock().is_err() {
+    let mut vault = crate::vault::CredentialVault::new(vault_path.clone());
+    if let Err(e) = vault.unlock() {
+        // Leaving this silent used to mask genuine vault corruption /
+        // wrong-password scenarios: operators saw only a downstream
+        // "missing API key" error with no breadcrumb pointing at the
+        // vault. Log the concrete failure so the cause is discoverable
+        // without re-deriving it from symptoms.
+        eprintln!(
+            "librefang-dotenv: credential vault at {} could not be unlocked: {e}; \
+             skipping vault-provided secrets",
+            vault_path.display()
+        );
         return;
     }
 
@@ -271,5 +297,34 @@ mod tests {
     fn test_load_env_file_nonexistent() {
         // Should not panic
         load_env_file(Some(PathBuf::from("/nonexistent/.env")));
+    }
+
+    /// Contract test: `load_env_file` must **not** override existing process
+    /// env vars. This is the invariant that anchors the priority order
+    /// documented on [`load_dotenv`] (system > vault > .env > secrets.env).
+    ///
+    /// Writes to `std::env` so it must run single-threaded; keep this as the
+    /// only test in this module that mutates env.
+    #[test]
+    fn test_load_env_file_does_not_override_existing_var() {
+        // Use a unique key so we don't collide with anything the test
+        // runner or other tests may have set.
+        let key = "LIBREFANG_DOTENV_TEST_PRIORITY_OVERRIDE";
+        // SAFETY: single-threaded test, no other readers of this key.
+        unsafe { std::env::set_var(key, "system-value") };
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join(".env");
+        std::fs::write(&path, format!("{key}=file-value\n")).unwrap();
+
+        load_env_file(Some(path));
+
+        assert_eq!(
+            std::env::var(key).unwrap(),
+            "system-value",
+            "system env var must win over .env file contents"
+        );
+
+        unsafe { std::env::remove_var(key) };
     }
 }
