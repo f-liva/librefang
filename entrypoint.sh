@@ -25,4 +25,15 @@ if [ -d /data/mempalace ]; then
   '
 fi
 
+# Load secrets.env into the environment before launching the kernel.
+# Upstream PR #2359 makes the kernel load this file autonomously, but we
+# source it here too so older images keep working and so the env is
+# already populated when `gosu` execs into the librefang user.
+if [ -f /data/secrets.env ]; then
+  set -a
+  # shellcheck disable=SC1091
+  source /data/secrets.env
+  set +a
+fi
+
 exec gosu librefang librefang start --foreground
