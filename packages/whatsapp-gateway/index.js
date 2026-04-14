@@ -227,9 +227,7 @@ const AGENT_NAME = DEFAULT_AGENT;
 // Owner routing: build OWNER_JIDs set from config.toml owner_numbers
 const ownerNumbersFromEnv = process.env.WHATSAPP_OWNER_JID ? [process.env.WHATSAPP_OWNER_JID] : [];
 const OWNER_NUMBERS = ownerNumbersFromEnv.length > 0 ? ownerNumbersFromEnv : tomlConfig.owner_numbers;
-const OWNER_JIDS = new Set(
-  OWNER_NUMBERS.map(n => n.replace(/^\+/, '') + '@s.whatsapp.net')
-);
+const OWNER_JIDS = deriveOwnerJids(OWNER_NUMBERS);
 // Primary owner JID for unsolicited/scheduled messages only
 const OWNER_JID = OWNER_JIDS.size > 0 ? [...OWNER_JIDS][0] : '';
 
