@@ -2309,8 +2309,7 @@ async function sendMessage(to, text) {
   }
 
   // Preserve group JIDs (@g.us) as-is; normalize phone → JID for individuals
-  const jid = to.includes('@g.us') ? to
-    : to.replace(/^\+/, '').replace(/@.*$/, '') + '@s.whatsapp.net';
+  const jid = phoneToJid(to);
 
   const formatted = markdownToWhatsApp(text);
   const sent = await sock.sendMessage(jid, { text: formatted });
@@ -2336,8 +2335,7 @@ async function sendImage(to, imageUrl, caption) {
   }
 
   // Preserve group JIDs (@g.us) as-is; normalize phone → JID for individuals
-  const jid = to.includes('@g.us') ? to
-    : to.replace(/^\+/, '').replace(/@.*$/, '') + '@s.whatsapp.net';
+  const jid = phoneToJid(to);
 
   // Fetch image into buffer (Baileys needs buffer or local file)
   const buffer = await new Promise((resolve, reject) => {
@@ -2387,8 +2385,7 @@ async function sendAudio(to, audioUrl, ptt = true) {
   }
 
   // Preserve group JIDs (@g.us) as-is; normalize phone → JID for individuals
-  const jid = to.includes('@g.us') ? to
-    : to.replace(/^\+/, '').replace(/@.*$/, '') + '@s.whatsapp.net';
+  const jid = phoneToJid(to);
 
   // Fetch audio into buffer (Baileys needs buffer or local file)
   const buffer = await new Promise((resolve, reject) => {
