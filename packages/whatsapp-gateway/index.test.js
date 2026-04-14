@@ -26,6 +26,7 @@ const {
   forwardToLibreFang,
   forwardToLibreFangStreaming,
   shouldSkipCatchupForMissingJid,
+  resolveLidProactively,
 } = require('./index.js');
 
 // ---------------------------------------------------------------------------
@@ -434,6 +435,54 @@ describe('CS-01 forwardToLibreFang chatJid enforcement', () => {
     assert.equal(shouldSkipCatchupForMissingJid({ id: 3, jid: undefined }), true);
     assert.equal(shouldSkipCatchupForMissingJid({ id: 4, jid: '39123@s.whatsapp.net' }), false);
     assert.equal(shouldSkipCatchupForMissingJid(null), true);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// CS-02: proactive LID → PN resolution for first-seen LIDs
+// ---------------------------------------------------------------------------
+describe('CS-02 resolveLidProactively', () => {
+  it('Test 1: first-seen LID triggers onWhatsApp and populates cache', async () => {
+    const cache = new Map();
+    let calls = 0;
+    const sock = {
+      onWhatsApp: (lids) => {
+        calls += 1;
+        return Promise.resolve([{ jid: '39123@s.whatsapp.net', lid: lids[0] }]);
+      },
+    };
+    const result = await resolveLidProactively(sock, '999@lid', cache, 500);
+    assert.equal(result, 'resolved');
+    assert.equal(calls, 1);
+    assert.equal(cache.get('999@lid'), '39123@s.whatsapp.net');
+  });
+
+  it('Test 2: cached LID is NOT re-queried', async () => {
+    const cache = new Map([['999@lid', '39123@s.whatsapp.net']]);
+    let calls = 0;
+    const sock = { onWhatsApp: () => { calls += 1; return Promise.resolve([]); } };
+    const result = await resolveLidProactively(sock, '999@lid', cache, 500);
+    assert.equal(result, 'skipped');
+    assert.equal(calls, 0);
+  });
+
+  it('Test 3: onWhatsApp timeout does NOT block and does NOT populate cache', async () => {
+    const cache = new Map();
+    const sock = { onWhatsApp: () => new Promise(() => {}) }; // never resolves
+    const t0 = Date.now();
+    const result = await resolveLidProactively(sock, '999@lid', cache, 80);
+    const elapsed = Date.now() - t0;
+    assert.equal(result, 'timeout');
+    assert.ok(elapsed >= 70 && elapsed < 500, `elapsed=${elapsed}`);
+    assert.equal(cache.has('999@lid'), false);
+  });
+
+  it('Test 4: onWhatsApp returns [] → lid_resolve_empty tag, cache untouched', async () => {
+    const cache = new Map();
+    const sock = { onWhatsApp: () => Promise.resolve([]) };
+    const result = await resolveLidProactively(sock, '999@lid', cache, 500);
+    assert.equal(result, 'empty');
+    assert.equal(cache.has('999@lid'), false);
   });
 });
 

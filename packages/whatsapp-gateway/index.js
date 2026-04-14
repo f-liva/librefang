@@ -269,6 +269,43 @@ let ownJid = null;
 const lidToPnJid = new Map();    // '<digits>@lid' → '<digits>@s.whatsapp.net'
 const ownerLidJids = new Set();  // '<digits>@lid'
 
+// CS-02: proactive LID→PN resolution for first-seen LIDs. Races
+// sock.onWhatsApp([lid]) against a timeout; on success, populates the cache
+// so subsequent messages in the same burst find it synchronously. On
+// timeout or empty response, falls back to degraded-but-no-block behaviour
+// (the caller proceeds with the LID as-is; a later senderPn event may
+// still populate the cache naturally).
+//
+// Returns a string tag for observability: 'resolved' | 'empty' | 'timeout'
+// | 'skipped' | 'error'. Side-effect: writes to `cache` on 'resolved'.
+async function resolveLidProactively(sock, lid, cache, timeoutMs = 5000) {
+  if (!sock || !lid || !cache || typeof sock.onWhatsApp !== 'function') return 'skipped';
+  if (cache.has(lid)) return 'skipped';
+  let timer;
+  try {
+    const lookup = await Promise.race([
+      Promise.resolve(sock.onWhatsApp([lid])),
+      new Promise((_, r) => { timer = setTimeout(() => r(new Error('timeout')), timeoutMs); }),
+    ]);
+    if (Array.isArray(lookup) && lookup[0] && lookup[0].jid) {
+      cache.set(lid, lookup[0].jid);
+      console.log(`[gateway] lid_resolved lid=${lid} pn=${lookup[0].jid}`);
+      return 'resolved';
+    }
+    console.warn(`[gateway] lid_resolve_empty lid=${lid}`);
+    return 'empty';
+  } catch (e) {
+    if (e && e.message === 'timeout') {
+      console.warn(`[gateway] lid_resolve_timeout lid=${lid}`);
+      return 'timeout';
+    }
+    console.warn(`[gateway] lid_resolve_error lid=${lid} err=${e && e.message}`);
+    return 'error';
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
+}
+
 // ---------------------------------------------------------------------------
 // Message store for Baileys retry mechanism
 // ---------------------------------------------------------------------------
@@ -1023,6 +1060,13 @@ async function startConnection() {
       // Cache LID → phone-number JID when we see both on the same message.
       if (isLidJid && senderPnRaw) {
         lidToPnJid.set(sender, senderPnRaw);
+      }
+
+      // CS-02: first-seen LID without senderPn AND not in cache — proactively
+      // ask Baileys for the PN mapping with a 5s timeout. Populates cache so
+      // the next message in the burst resolves synchronously.
+      if (isLidJid && !senderPnRaw && !lidToPnJid.has(sender)) {
+        await resolveLidProactively(sock, sender, lidToPnJid, 5000);
       }
 
       // Resolve to a phone-number JID (or empty string if we cannot).
@@ -2536,4 +2580,5 @@ module.exports = {
   forwardToLibreFang,
   forwardToLibreFangStreaming,
   shouldSkipCatchupForMissingJid,
+  resolveLidProactively,
 };
