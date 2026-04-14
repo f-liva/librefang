@@ -8,6 +8,15 @@ const os = require('node:os');
 const { randomUUID } = require('node:crypto');
 const toml = require('toml');
 const { EchoTracker } = require('./lib/echo-tracker');
+const {
+  isLidJid,
+  isGroupJid,
+  normalizeDeviceScopedJid,
+  extractE164,
+  phoneToJid,
+  resolvePeerId,
+  deriveOwnerJids,
+} = require('./lib/identity');
 
 // ---------------------------------------------------------------------------
 // Echo tracker (EB-01, Phase 3 §A)
