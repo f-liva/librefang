@@ -157,7 +157,9 @@ fn is_ssrf_target(url: &str) -> Result<SsrfResolved, serde_json::Value> {
     match socket_addr.to_socket_addrs() {
         Ok(addrs) => {
             for addr in addrs {
-                let ip = addr.ip();
+                // Canonicalise IPv4-mapped IPv6 (::ffff:X.X.X.X) before any
+                // safety check — see canonical_ip below.
+                let ip = canonical_ip(&addr.ip());
                 if ip.is_loopback() || ip.is_unspecified() || is_private_ip(&ip) {
                     return Err(json!({"error": format!(
                         "SSRF blocked: {hostname} resolves to private IP {ip}"
@@ -183,8 +185,21 @@ fn is_ssrf_target(url: &str) -> Result<SsrfResolved, serde_json::Value> {
     })
 }
 
-fn is_private_ip(ip: &std::net::IpAddr) -> bool {
+/// Unwrap IPv4-mapped IPv6 (`::ffff:X.X.X.X`) to its IPv4 form. All other
+/// addresses are returned unchanged. Keeps downstream IP checks operating on
+/// the address the OS will actually connect to.
+fn canonical_ip(ip: &std::net::IpAddr) -> std::net::IpAddr {
     match ip {
+        std::net::IpAddr::V6(v6) => match v6.to_ipv4_mapped() {
+            Some(v4) => std::net::IpAddr::V4(v4),
+            None => std::net::IpAddr::V6(*v6),
+        },
+        std::net::IpAddr::V4(_) => *ip,
+    }
+}
+
+fn is_private_ip(ip: &std::net::IpAddr) -> bool {
+    match canonical_ip(ip) {
         std::net::IpAddr::V4(v4) => {
             let octets = v4.octets();
             matches!(
@@ -318,7 +333,7 @@ fn host_net_fetch(state: &GuestState, params: &serde_json::Value) -> serde_json:
     state.tokio_handle.block_on(async {
         // Build a DNS-pinned client so the HTTP request connects to the
         // same IPs we already validated (prevents DNS-rebinding TOCTOU).
-        let mut builder = crate::http_client::proxied_client_builder();
+        let mut builder = librefang_http::proxied_client_builder();
         for addr in &ssrf_result.resolved {
             builder = builder.resolve(&ssrf_result.hostname, *addr);
         }
@@ -362,6 +377,45 @@ fn extract_host_from_url(url: &str) -> String {
 // Shell (capability-checked)
 // ---------------------------------------------------------------------------
 
+/// Environment variables re-added after `env_clear` on a sandboxed child
+/// process. Mirrors the list in `librefang-runtime/src/subprocess_sandbox.rs`
+/// so that WASM guests invoking `shell_exec` get the same stripped-down
+/// environment as the top-level shell tool. Keeping the list inline (rather
+/// than taking a dependency on `librefang-runtime`) avoids a crate cycle.
+const WASM_SHELL_SAFE_ENV_VARS: &[&str] = &[
+    "PATH", "HOME", "TMPDIR", "TMP", "TEMP", "LANG", "LC_ALL", "TERM",
+];
+
+/// Clear the child's environment and re-add only the safe allowlist. The
+/// WASM sandbox path used to skip this, so an agent whose `ShellExec`
+/// capability was granted inherited the entire daemon environment — every
+/// LLM provider API key, vault master key override, cloud metadata token,
+/// etc. — regardless of how tightly its Wasm fuel and epoch budget were
+/// capped. This closes that exfiltration hole while leaving the capability
+/// gate above untouched.
+fn sanitize_shell_env(cmd: &mut std::process::Command) {
+    cmd.env_clear();
+    for var in WASM_SHELL_SAFE_ENV_VARS {
+        if let Ok(val) = std::env::var(var) {
+            cmd.env(var, val);
+        }
+    }
+    #[cfg(windows)]
+    for var in [
+        "USERPROFILE",
+        "SYSTEMROOT",
+        "APPDATA",
+        "LOCALAPPDATA",
+        "COMSPEC",
+        "WINDIR",
+        "PATHEXT",
+    ] {
+        if let Ok(val) = std::env::var(var) {
+            cmd.env(var, val);
+        }
+    }
+}
+
 fn host_shell_exec(state: &GuestState, params: &serde_json::Value) -> serde_json::Value {
     let command = match params.get("command").and_then(|c| c.as_str()) {
         Some(c) => c,
@@ -384,6 +438,7 @@ fn host_shell_exec(state: &GuestState, params: &serde_json::Value) -> serde_json
     // Each argument is passed directly to the process.
     let mut cmd = std::process::Command::new(command);
     cmd.args(&args);
+    sanitize_shell_env(&mut cmd);
     #[cfg(windows)]
     {
         use std::os::windows::process::CommandExt;
@@ -588,6 +643,51 @@ mod tests {
         assert!(err.contains("denied"));
     }
 
+    /// Regression: a WASM guest with an explicit `ShellExec("*")` capability
+    /// used to inherit the daemon's full environment, including every LLM
+    /// provider API key. The fix strips the env before exec so only the
+    /// hard-coded safe allowlist (PATH, HOME, LANG, …) survives. Stamp a
+    /// fake secret into the parent environment, drive the host call, and
+    /// verify that the child's `env` output does not contain it.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_shell_exec_strips_parent_env_secrets() {
+        // Use a unique key per run so concurrent tests don't collide.
+        let key = format!("LF_WASM_FAKE_SECRET_{}", std::process::id());
+        let value = "sk-should-not-reach-child";
+        std::env::set_var(&key, value);
+
+        let state = test_state(vec![Capability::ShellExec("*".to_string())]);
+        let result = host_shell_exec(
+            &state,
+            &json!({
+                "command": "/usr/bin/env",
+                "args": [],
+            }),
+        );
+
+        // Tidy up the parent env regardless of assertion outcome.
+        std::env::remove_var(&key);
+
+        let ok = result
+            .get("ok")
+            .expect("shell_exec should succeed with ShellExec(*) capability");
+        let stdout = ok
+            .get("stdout")
+            .and_then(|s| s.as_str())
+            .unwrap_or_default();
+        assert!(
+            !stdout.contains(&key) && !stdout.contains(value),
+            "WASM shell_exec child must not inherit parent secrets; got stdout:\n{stdout}"
+        );
+        // And PATH (on the safe allowlist) should still be present so
+        // legitimate shell invocations keep working.
+        assert!(
+            stdout.contains("PATH="),
+            "WASM shell_exec child must still see PATH; got stdout:\n{stdout}"
+        );
+    }
+
     #[tokio::test]
     async fn test_env_read_denied() {
         let state = test_state(vec![]);
@@ -686,6 +786,25 @@ mod tests {
         assert!(is_private_ip(&"169.254.169.254".parse::<IpAddr>().unwrap()));
         assert!(!is_private_ip(&"8.8.8.8".parse::<IpAddr>().unwrap()));
         assert!(!is_private_ip(&"1.1.1.1".parse::<IpAddr>().unwrap()));
+    }
+
+    #[test]
+    fn test_is_private_ip_recognises_ipv4_mapped_v6() {
+        use std::net::IpAddr;
+        // IPv4-mapped IPv6 (::ffff:X.X.X.X) must be canonicalised to its
+        // IPv4 form so the private-range checks actually fire. Without
+        // canonicalisation, the V6 branch only catches fc00::/7 + fe80::/10
+        // and leaves ::ffff:10.0.0.1, ::ffff:169.254.169.254 etc. as
+        // "public" — the exact bypass fixed in web_fetch.rs.
+        assert!(is_private_ip(&"::ffff:10.0.0.1".parse::<IpAddr>().unwrap()));
+        assert!(is_private_ip(
+            &"::ffff:169.254.169.254".parse::<IpAddr>().unwrap()
+        ));
+        assert!(is_private_ip(
+            &"::ffff:192.168.1.1".parse::<IpAddr>().unwrap()
+        ));
+        // Real IPv6 still takes the V6 branch.
+        assert!(!is_private_ip(&"2001:db8::1".parse::<IpAddr>().unwrap()));
     }
 
     #[test]
