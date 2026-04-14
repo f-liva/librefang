@@ -291,6 +291,51 @@ let ownJid = null;
 const lidToPnJid = new Map();    // '<digits>@lid' → '<digits>@s.whatsapp.net'
 const ownerLidJids = new Set();  // '<digits>@lid'
 
+// ---------------------------------------------------------------------------
+// Phase 2 §C — Group participant roster cache (GS-01 minimal)
+// ---------------------------------------------------------------------------
+// Populated lazily by `getGroupParticipants(sock, groupJid)` on first inbound
+// from a group; subsequent inbounds within GROUP_METADATA_TTL_MS reuse the
+// cached roster (no Baileys network call). The Baileys
+// `group-participants.update` event invalidates the matching entry so adds /
+// removes / promotions become visible at the next message.
+//
+// The roster is forwarded to the kernel inside the inbound payload's
+// `sender_context.metadata.group_participants` field; librefang-channels'
+// `should_process_group_message` consults it to decide whether the turn is
+// addressed to the bot or to another participant (OB-04, OB-05).
+const GROUP_METADATA_TTL_MS = 5 * 60 * 1000;
+const groupMetadataCache = new Map(); // groupJid -> { participants: [...], fetchedAt }
+
+async function getGroupParticipants(sock, groupJid) {
+  if (!groupJid || !groupJid.endsWith('@g.us')) return [];
+  const cached = groupMetadataCache.get(groupJid);
+  if (cached && (Date.now() - cached.fetchedAt) < GROUP_METADATA_TTL_MS) {
+    console.log(JSON.stringify({ event: 'group_roster_cache_hit', groupJid, size: cached.participants.length }));
+    return cached.participants;
+  }
+  try {
+    const meta = await sock.groupMetadata(groupJid);
+    const participants = (meta && Array.isArray(meta.participants) ? meta.participants : []).map(p => ({
+      jid: p.id || p.jid || '',
+      display_name: p.notify || p.name || (p.id ? String(p.id).split('@')[0] : ''),
+    }));
+    groupMetadataCache.set(groupJid, { participants, fetchedAt: Date.now() });
+    console.log(JSON.stringify({ event: 'group_roster_fetched', groupJid, size: participants.length }));
+    return participants;
+  } catch (err) {
+    console.log(JSON.stringify({ event: 'group_roster_fetch_failed', groupJid, error: String(err && err.message || err) }));
+    return [];
+  }
+}
+
+function invalidateGroupRoster(groupJid) {
+  if (!groupJid) return;
+  if (groupMetadataCache.delete(groupJid)) {
+    console.log(JSON.stringify({ event: 'group_roster_invalidated', groupJid }));
+  }
+}
+
 // CS-02: proactive LID→PN resolution for first-seen LIDs. Races
 // sock.onWhatsApp([lid]) against a timeout; on success, populates the cache
 // so subsequent messages in the same burst find it synchronously. On
@@ -858,6 +903,13 @@ async function startConnection() {
   // Save credentials whenever they update
   sock.ev.on('creds.update', saveCreds);
 
+  // Phase 2 §C / GS-01 — invalidate cached group roster on membership change
+  // so adds/removes/promotions become visible at the next inbound message.
+  sock.ev.on('group-participants.update', (update) => {
+    const id = update && update.id;
+    if (id) invalidateGroupRoster(id);
+  });
+
   // Connection state changes (QR code, connected, disconnected)
   sock.ev.on('connection.update', async (update) => {
     const { connection, lastDisconnect, qr } = update;
@@ -1321,8 +1373,13 @@ async function startConnection() {
           }
         };
 
+        // Phase 2 §C — fetch participant roster for groups (cached 5min).
+        // Empty for DMs and on fetch failure (graceful degradation per
+        // GS-01 minimal: addressee guard simply can't fire without roster).
+        const groupParticipants = isGroup ? await getGroupParticipants(sock, sender) : [];
+
         const rawResponse = await forwardToLibreFangStreaming(
-          messageToSend, systemPrefix, phone, pushName, isOwner, attachments, onProgress, sender, { isGroup, wasMentioned },
+          messageToSend, systemPrefix, phone, pushName, isOwner, attachments, onProgress, sender, { isGroup, wasMentioned, groupParticipants },
         );
         // Scrub NO_REPLY before markdown conversion — if the model emitted it
         // trailing or glued to an emoji it would otherwise reach WhatsApp.
@@ -1787,7 +1844,7 @@ function buildRelaySystemInstruction() {
 // ---------------------------------------------------------------------------
 const MAX_FORWARD_RETRIES = 1;
 
-async function forwardToLibreFang(text, systemPrefix, phone, pushName, isOwner, attachments, { isGroup = false, wasMentioned = false, chatJid = '' } = {}, retryCount = 0) {
+async function forwardToLibreFang(text, systemPrefix, phone, pushName, isOwner, attachments, { isGroup = false, wasMentioned = false, chatJid = '', groupParticipants = [] } = {}, retryCount = 0) {
   // CS-01: fail-fast — refuse to forward with an empty chatJid. A bare
   // `whatsapp` channel loses per-conversation session isolation; the kernel
   // would merge unrelated chats into the same session.
@@ -1826,6 +1883,13 @@ async function forwardToLibreFang(text, systemPrefix, phone, pushName, isOwner, 
   // Include attachments if present
   if (attachments && attachments.length > 0) {
     payload.attachments = attachments;
+  }
+
+  // Phase 2 §C — forward the group participant roster so the kernel's
+  // addressee guard (`is_addressed_to_other_participant`) can fire.
+  // Empty for DMs and for the catch-up path (no live `sock` to query).
+  if (isGroup && Array.isArray(groupParticipants) && groupParticipants.length > 0) {
+    payload.group_participants = groupParticipants;
   }
 
   const payloadStr = JSON.stringify(payload);
@@ -1917,7 +1981,7 @@ const STREAMING_EDIT_INTERVAL_MS = 2000;
  * @param {(text: string) => Promise<void>} onProgress
  * @returns {Promise<string>} complete response
  */
-async function forwardToLibreFangStreaming(text, systemPrefix, phone, pushName, isOwner, attachments, onProgress, chatJid = '', { isGroup = false, wasMentioned = false } = {}) {
+async function forwardToLibreFangStreaming(text, systemPrefix, phone, pushName, isOwner, attachments, onProgress, chatJid = '', { isGroup = false, wasMentioned = false, groupParticipants = [] } = {}) {
   // CS-01: fail-fast — refuse to forward with an empty chatJid (same
   // rationale as `forwardToLibreFang`). Keeps streaming parity.
   if (!chatJid) {
@@ -1950,6 +2014,14 @@ async function forwardToLibreFangStreaming(text, systemPrefix, phone, pushName, 
 
   if (attachments && attachments.length > 0) {
     payload.attachments = attachments;
+  }
+
+  // Phase 2 §C — see forwardToLibreFang. Streaming path also forwards roster
+  // for parity (kernel-side wiring still required to thread it into
+  // ChannelMessage.metadata — tracked as a follow-up; gating tests at the
+  // bridge layer cover the receive side).
+  if (isGroup && Array.isArray(groupParticipants) && groupParticipants.length > 0) {
+    payload.group_participants = groupParticipants;
   }
 
   const payloadStr = JSON.stringify(payload);
@@ -2627,4 +2699,8 @@ module.exports = {
   resolveLidProactively,
   checkHeartbeat,
   computeBackoffDelay,
+  getGroupParticipants,
+  invalidateGroupRoster,
+  groupMetadataCache,
+  GROUP_METADATA_TTL_MS,
 };
