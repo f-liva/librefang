@@ -326,7 +326,7 @@ const GROUP_METADATA_TTL_MS = 5 * 60 * 1000;
 const groupMetadataCache = new Map(); // groupJid -> { participants: [...], fetchedAt }
 
 async function getGroupParticipants(sock, groupJid) {
-  if (!groupJid || !groupJid.endsWith('@g.us')) return [];
+  if (!isGroupJid(groupJid)) return [];
   const cached = groupMetadataCache.get(groupJid);
   if (cached && (Date.now() - cached.fetchedAt) < GROUP_METADATA_TTL_MS) {
     console.log(JSON.stringify({ event: 'group_roster_cache_hit', groupJid, size: cached.participants.length }));
