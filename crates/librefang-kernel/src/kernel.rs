@@ -4179,7 +4179,7 @@ system_prompt = "You are a helpful assistant."
                     None
                 } else {
                     self.memory
-                        .canonical_context(agent_id, None)
+                        .canonical_context(agent_id, Some(effective_session_id), None)
                         .ok()
                         .and_then(|(s, _)| s)
                 },
@@ -4386,7 +4386,12 @@ system_prompt = "You are a helpful assistant."
                     let start = result.new_messages_start.min(session.messages.len());
                     if start < session.messages.len() {
                         let new_messages = session.messages[start..].to_vec();
-                        if let Err(e) = memory.append_canonical(agent_id, &new_messages, None) {
+                        if let Err(e) = memory.append_canonical(
+                            agent_id,
+                            &new_messages,
+                            None,
+                            Some(effective_session_id),
+                        ) {
                             warn!(agent_id = %agent_id, "Failed to update canonical session (streaming): {e}");
                         }
                     }
@@ -5305,7 +5310,7 @@ system_prompt = "You are a helpful assistant."
                     None
                 } else {
                     self.memory
-                        .canonical_context(agent_id, None)
+                        .canonical_context(agent_id, Some(effective_session_id), None)
                         .ok()
                         .and_then(|(s, _)| s)
                 },
@@ -5554,7 +5559,12 @@ system_prompt = "You are a helpful assistant."
         let start = result.new_messages_start.min(session.messages.len());
         if start < session.messages.len() {
             let new_messages = session.messages[start..].to_vec();
-            if let Err(e) = self.memory.append_canonical(agent_id, &new_messages, None) {
+            if let Err(e) = self.memory.append_canonical(
+                agent_id,
+                &new_messages,
+                None,
+                Some(effective_session_id),
+            ) {
                 warn!("Failed to update canonical session: {e}");
             }
         }
