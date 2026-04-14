@@ -1389,6 +1389,9 @@ struct FinalizeEndTurnResultData {
     experiment_context: Option<ExperimentContext>,
     directives: librefang_types::message::ReplyDirectives,
     new_messages_start: usize,
+    /// Accumulated owner notices captured during this turn via the
+    /// `notify_owner` tool. Multiple invocations join with "\n\n".
+    owner_notice: Option<String>,
 }
 
 struct EndTurnRetryContext<'a> {
@@ -1943,8 +1946,7 @@ async fn finalize_successful_end_turn(
         experiment_context: end_turn.experiment_context,
         latency_ms: 0,
         new_messages_start: end_turn.new_messages_start,
-        // Task 2 will populate this from notify_owner tool invocations.
-        owner_notice: None,
+        owner_notice: end_turn.owner_notice.clone(),
     })
 }
 
@@ -2144,6 +2146,9 @@ pub async fn run_agent_loop(
     let context_budget = ContextBudget::new(ctx_window);
     let mut any_tools_executed = false;
     let mut decision_traces: Vec<DecisionTrace> = Vec::new();
+    // §A — accumulated owner_notice payloads from notify_owner tool calls.
+    // Multiple invocations in the same turn are joined with "\n\n".
+    let mut pending_owner_notice: Option<String> = None;
     let mut hallucination_retried = false;
     let mut action_nudge_retried = false;
     let mut consecutive_all_failed: u32 = 0;
@@ -2388,6 +2393,7 @@ pub async fn run_agent_loop(
                         experiment_context: experiment_context.clone(),
                         directives: reply_directives_from_parsed(parsed_directives),
                         new_messages_start,
+                        owner_notice: pending_owner_notice.take(),
                     },
                 )
                 .await;
@@ -2438,6 +2444,14 @@ pub async fn run_agent_loop(
                         agent_id_str: agent_id_str.as_str(),
                     };
                     let executed = execute_single_tool_call(&mut tool_exec_ctx, tool_call).await?;
+
+                    // §A — capture owner_notice side-channel from notify_owner tool.
+                    if let Some(ref notice) = executed.result.owner_notice {
+                        pending_owner_notice = Some(match pending_owner_notice.take() {
+                            Some(prev) => format!("{prev}\n\n{notice}"),
+                            None => notice.clone(),
+                        });
+                    }
 
                     append_tool_result_block(
                         &mut tool_result_blocks,
@@ -3073,6 +3087,9 @@ pub async fn run_agent_loop_streaming(
     let context_budget = ContextBudget::new(ctx_window);
     let mut any_tools_executed = false;
     let mut decision_traces: Vec<DecisionTrace> = Vec::new();
+    // §A — accumulated owner_notice payloads from notify_owner tool calls.
+    // Multiple invocations in the same turn are joined with "\n\n".
+    let mut pending_owner_notice: Option<String> = None;
     let mut hallucination_retried = false;
     let mut action_nudge_retried = false;
     let mut consecutive_all_failed: u32 = 0;
@@ -3377,6 +3394,7 @@ pub async fn run_agent_loop_streaming(
                         experiment_context,
                         directives: reply_directives_from_parsed(parsed_directives_s),
                         new_messages_start,
+                        owner_notice: pending_owner_notice.take(),
                     },
                 )
                 .await;
