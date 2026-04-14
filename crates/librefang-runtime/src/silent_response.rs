@@ -22,7 +22,7 @@
 //! NOT silent. The runtime is conservative: when in doubt, deliver the reply.
 //!
 //! Historical compatibility: the legacy `is_no_reply` helper accepted a
-//! sentinel anywhere at the **end** of the text (e.g. `"Tutto bene. NO_REPLY"`).
+//! sentinel anywhere at the **end** of the text (e.g. `"all good. NO_REPLY"`).
 //! That is preserved here behind the trailing-suffix branch — many existing
 //! prompts accumulate trailing tokens and we cannot regress them silently.
 
@@ -101,7 +101,7 @@ pub fn is_silent_response(text: &str) -> bool {
     }
 
     // Trailing-suffix tolerance: legacy prompts sometimes put context BEFORE
-    // the sentinel ("Tutto bene. NO_REPLY"). The sentinel must follow a
+    // the sentinel ("all good. NO_REPLY"). The sentinel must follow a
     // non-word boundary (whitespace, punctuation, newline, or emoji), and
     // it must be the LAST token (after the same trailing-noise strip).
     ends_with_canonical(stripped)
