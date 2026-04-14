@@ -24,9 +24,9 @@ function fixtureMeta() {
   return {
     id: GROUP_JID,
     participants: [
-      { id: '391112223333@s.whatsapp.net', notify: 'Caterina' },
-      { id: '391999888777@s.whatsapp.net', notify: 'Ambrogio' },
-      { id: '393334445555@s.whatsapp.net', name: 'Marco' },
+      { id: '391112223333@s.whatsapp.net', notify: 'Alice' },
+      { id: '391999888777@s.whatsapp.net', notify: 'Botty' },
+      { id: '393334445555@s.whatsapp.net', name: 'Dave' },
     ],
   };
 }
@@ -63,8 +63,8 @@ describe('group roster cache', () => {
     assert.deepEqual(r1, r2);
     assert.deepEqual(r1, r3);
     // Display-name resolution: notify > name > id-prefix
-    assert.equal(r1[0].display_name, 'Caterina');
-    assert.equal(r1[2].display_name, 'Marco');
+    assert.equal(r1[0].display_name, 'Alice');
+    assert.equal(r1[2].display_name, 'Dave');
   });
 
   it('re-fetches after invalidation', async () => {

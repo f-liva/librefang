@@ -694,7 +694,7 @@ function extractNotifyOwner(responseText) {
 // The agent prompts instruct the LLM to emit a bare `NO_REPLY` token when it
 // decides a message doesn't warrant a reply. Ideally it is the entire
 // response, but in practice we see two leaks:
-//   1. Trailing token:  "Tutto bene, Signore.\nNO_REPLY"
+//   1. Trailing token:  "All good, Boss.\nNO_REPLY"
 //   2. Concatenated:    "...a Sua disposizione. 🎩NO_REPLY"   ← no separator
 // Both must be scrubbed before the text hits WhatsApp. The helper returns
 // the cleaned text, or `''` when the entire response was a NO_REPLY sentinel

@@ -1354,7 +1354,7 @@ fn addressee_guard_enabled() -> bool {
 /// Detect a leading-vocative `<Capitalized>[,!]` token in `text`.
 ///
 /// Returns the captured name (without the punctuation) when the turn opens
-/// with a vocative form like "Caterina,". The match is anchored at the start
+/// with a vocative form like "Alice,". The match is anchored at the start
 /// of the string after optional whitespace; only ASCII-style capitalized
 /// names are recognized (Italian/English vocatives — sufficient for §C).
 fn leading_vocative_name(text: &str) -> Option<String> {
@@ -1370,14 +1370,14 @@ fn leading_vocative_name(text: &str) -> Option<String> {
 /// Strict positional vocative-trigger match for `pattern` in `text`.
 ///
 /// True iff the (whole-word, case-sensitive — pattern is expected to be a
-/// proper name like "Signore") `pattern` appears either:
+/// proper name like "Boss") `pattern` appears either:
 ///  * at the start of the turn after optional whitespace, or
 ///  * immediately after a `[.!?]` punctuation boundary followed by whitespace.
 ///
 /// Additionally REJECTED when another capitalized vocative appears BEFORE
 /// the matched pattern — this captures the Beeper-screenshot case
-/// `"Caterina, chiedi al Signore..."` where "Signore" is mentioned but the
-/// turn is addressed to Caterina.
+/// `"Alice, ask the Boss..."` where "Boss" is mentioned but the
+/// turn is addressed to Alice.
 pub fn is_vocative_trigger(text: &str, pattern: &str) -> bool {
     if text.is_empty() || pattern.is_empty() {
         return false;
@@ -1412,8 +1412,8 @@ pub fn is_vocative_trigger(text: &str, pattern: &str) -> bool {
 }
 
 /// True when the turn opens with a vocative addressed to a participant other
-/// than the agent (e.g. `"Caterina, chiedi..."` in a group containing
-/// Caterina + the Bot).
+/// than the agent (e.g. `"Alice, ask..."` in a group containing
+/// Alice + the Bot).
 ///
 /// Heuristic: extract a leading `<Capitalized>[,!]` token and look it up
 /// (case-insensitively) in the participant roster. If found and not equal
@@ -1530,7 +1530,7 @@ fn should_process_group_message(
 
             // Trigger-pattern check. Under guard-on we additionally require
             // `is_vocative_trigger` (positional) on top of the substring match,
-            // so "Caterina, chiedi al Signore..." with pattern "Signore" no
+            // so "Alice, ask the Boss..." with pattern "Boss" no
             // longer triggers (the substring matches but the position is wrong
             // AND another vocative precedes it).
             let regex_triggered = if !was_mentioned && !is_command {
@@ -4642,68 +4642,65 @@ mod tests {
 
         #[test]
         fn matches_at_start_of_turn_with_comma() {
-            assert!(is_vocative_trigger("Signore, dimmi", "Signore"));
+            assert!(is_vocative_trigger("Boss, tell me", "Boss"));
         }
 
         #[test]
         fn matches_at_start_of_turn_with_space() {
-            assert!(is_vocative_trigger("Signore chiedi al bot", "Signore"));
+            assert!(is_vocative_trigger("Boss ask the bot", "Boss"));
         }
 
         #[test]
         fn matches_after_strong_punctuation() {
-            assert!(is_vocative_trigger("ciao. Signore, come va?", "Signore"));
+            assert!(is_vocative_trigger("hi. Boss, how are you?", "Boss"));
         }
 
         #[test]
         fn matches_with_leading_whitespace() {
-            assert!(is_vocative_trigger("  Signore, ...", "Signore"));
+            assert!(is_vocative_trigger("  Boss, ...", "Boss"));
         }
 
         #[test]
         fn rejects_other_capitalized_vocative_before_pattern() {
             // The Beeper-screenshot case (user directive).
             assert!(!is_vocative_trigger(
-                "Caterina, chiedi al Signore il pagamento",
-                "Signore"
+                "Alice, ask the Boss about the payment",
+                "Boss"
             ));
         }
 
         #[test]
         fn rejects_when_not_at_vocative_position() {
             assert!(!is_vocative_trigger(
-                "Ieri il Signore ha detto di...",
-                "Signore"
+                "Yesterday the Boss said to...",
+                "Boss"
             ));
         }
 
         #[test]
         fn rejects_lowercase_substring() {
-            // Pattern is "Signore" (proper-name); lowercase should not match.
-            assert!(!is_vocative_trigger("il signore è arrivato", "Signore"));
+            // Pattern is "Boss" (proper-name); lowercase should not match.
+            assert!(!is_vocative_trigger("the boss has arrived", "Boss"));
         }
 
         #[test]
-        fn rejects_with_alessandro_then_signore() {
-            assert!(!is_vocative_trigger(
-                "Alessandro, dopo chiama il Signore",
-                "Signore"
-            ));
+        fn rejects_with_bob_then_boss() {
+            assert!(!is_vocative_trigger("Bob, then call the Boss", "Boss"));
         }
 
         #[test]
-        fn word_boundary_signori_not_signore() {
-            assert!(!is_vocative_trigger("Signori, ascoltate", "Signore"));
+        fn word_boundary_bosses_not_boss() {
+            assert!(!is_vocative_trigger("Bosses, listen up", "Boss"));
         }
 
         #[test]
         fn empty_text_returns_false() {
-            assert!(!is_vocative_trigger("", "Signore"));
+            assert!(!is_vocative_trigger("", "Boss"));
         }
 
         #[test]
-        fn dammi_il_signore_rejected() {
-            assert!(!is_vocative_trigger("dammi il Signore", "Signore"));
+        fn give_me_the_boss_rejected() {
+            assert!(!is_vocative_trigger("give me the Boss", "Boss"));
         }
     }
 
@@ -4723,46 +4720,46 @@ mod tests {
         }
 
         #[test]
-        fn caterina_with_caterina_in_roster_returns_true() {
-            let r = roster(&["Caterina", "Ambrogio"]);
+        fn alice_with_alice_in_roster_returns_true() {
+            let r = roster(&["Alice", "Botty"]);
             assert!(is_addressed_to_other_participant(
-                "Caterina, chiedi...",
+                "Alice, ask...",
                 &r,
-                "Ambrogio"
+                "Botty"
             ));
         }
 
         #[test]
         fn agent_addressed_returns_false() {
-            let r = roster(&["Caterina", "Ambrogio"]);
+            let r = roster(&["Alice", "Botty"]);
             assert!(!is_addressed_to_other_participant(
-                "Ambrogio, vieni qui",
+                "Botty, come here",
                 &r,
-                "Ambrogio"
+                "Botty"
             ));
         }
 
         #[test]
         fn no_vocative_returns_false() {
-            let r = roster(&["Caterina", "Ambrogio"]);
+            let r = roster(&["Alice", "Botty"]);
             assert!(!is_addressed_to_other_participant(
-                "stamattina è bello",
+                "this morning is beautiful",
                 &r,
-                "Ambrogio"
+                "Botty"
             ));
         }
 
         #[test]
         fn exclamation_vocative_recognized() {
-            let r = roster(&["Caterina", "Bot"]);
-            assert!(is_addressed_to_other_participant("Caterina!", &r, "Bot"));
+            let r = roster(&["Alice", "Bot"]);
+            assert!(is_addressed_to_other_participant("Alice!", &r, "Bot"));
         }
 
         #[test]
         fn beeper_screenshot_full_turn() {
-            let r = roster(&["Caterina", "Bot"]);
+            let r = roster(&["Alice", "Bot"]);
             assert!(is_addressed_to_other_participant(
-                "Caterina, chiedi al Signore il pagamento",
+                "Alice, ask the Boss about the payment",
                 &r,
                 "Bot"
             ));
@@ -4770,12 +4767,12 @@ mod tests {
 
         #[test]
         fn name_not_in_roster_returns_false() {
-            // "Marco," is a vocative but Marco isn't a participant — guard
+            // "Dave," is a vocative but Dave isn't a participant — guard
             // does not fire (avoids false positives on names that happen to
             // start a sentence but aren't in the group).
-            let r = roster(&["Caterina", "Bot"]);
+            let r = roster(&["Alice", "Bot"]);
             assert!(!is_addressed_to_other_participant(
-                "Marco, dove sei?",
+                "Dave, where are you?",
                 &r,
                 "Bot"
             ));
@@ -4783,9 +4780,9 @@ mod tests {
 
         #[test]
         fn case_insensitive_match() {
-            let r = roster(&["caterina", "Bot"]);
+            let r = roster(&["alice", "Bot"]);
             assert!(is_addressed_to_other_participant(
-                "Caterina, vieni qui",
+                "Alice, come here",
                 &r,
                 "Bot"
             ));
@@ -4837,13 +4834,13 @@ mod tests {
         }
 
         #[test]
-        fn caterina_chiedi_al_signore_rejected_under_guard() {
+        fn alice_ask_the_boss_rejected_under_guard() {
             with_guard_on(|| {
-                let mut msg = group_text_message("Caterina, chiedi al Signore il pagamento");
-                inject_roster(&mut msg, &["Caterina", "Ambrogio"], "Ambrogio");
+                let mut msg = group_text_message("Alice, ask the Boss about the payment");
+                inject_roster(&mut msg, &["Alice", "Botty"], "Botty");
                 let overrides = ChannelOverrides {
                     group_policy: GroupPolicy::MentionOnly,
-                    group_trigger_patterns: vec!["Signore".to_string()],
+                    group_trigger_patterns: vec!["Boss".to_string()],
                     ..Default::default()
                 };
                 assert!(!should_process_group_message("whatsapp", &overrides, &msg));
@@ -4851,13 +4848,13 @@ mod tests {
         }
 
         #[test]
-        fn signore_at_start_passes_under_guard() {
+        fn boss_at_start_passes_under_guard() {
             with_guard_on(|| {
-                let mut msg = group_text_message("Signore, conferma il prossimo appuntamento");
-                inject_roster(&mut msg, &["Caterina", "Ambrogio"], "Ambrogio");
+                let mut msg = group_text_message("Boss, confirm the next appointment");
+                inject_roster(&mut msg, &["Alice", "Botty"], "Botty");
                 let overrides = ChannelOverrides {
                     group_policy: GroupPolicy::MentionOnly,
-                    group_trigger_patterns: vec!["Signore".to_string()],
+                    group_trigger_patterns: vec!["Boss".to_string()],
                     ..Default::default()
                 };
                 assert!(should_process_group_message("whatsapp", &overrides, &msg));
@@ -4868,13 +4865,13 @@ mod tests {
         fn owner_no_mention_no_pattern_rejected() {
             // OB-06: "owner-in-group" doesn't bypass mention_only — there's
             // no owner short-circuit in librefang-channels (audit confirms).
-            // A plain "ciao a tutti" with no mention is rejected.
+            // A plain "hi everyone" with no mention is rejected.
             with_guard_on(|| {
-                let mut msg = group_text_message("ciao a tutti, come va?");
-                inject_roster(&mut msg, &["Caterina", "Ambrogio"], "Ambrogio");
+                let mut msg = group_text_message("hi everyone, how are you?");
+                inject_roster(&mut msg, &["Alice", "Botty"], "Botty");
                 let overrides = ChannelOverrides {
                     group_policy: GroupPolicy::MentionOnly,
-                    group_trigger_patterns: vec!["Signore".to_string()],
+                    group_trigger_patterns: vec!["Boss".to_string()],
                     ..Default::default()
                 };
                 assert!(!should_process_group_message("whatsapp", &overrides, &msg));
@@ -4884,8 +4881,8 @@ mod tests {
         #[test]
         fn owner_explicit_mention_passes() {
             with_guard_on(|| {
-                let mut msg = group_text_message("@Bot rispondimi");
-                inject_roster(&mut msg, &["Caterina", "Ambrogio"], "Ambrogio");
+                let mut msg = group_text_message("@Bot reply to me");
+                inject_roster(&mut msg, &["Alice", "Botty"], "Botty");
                 msg.metadata
                     .insert("was_mentioned".to_string(), json!(true));
                 let overrides = ChannelOverrides {
@@ -4901,10 +4898,10 @@ mod tests {
             // Backward compat: with the flag default-off (rollback path)
             // the pre-Phase-2 substring matcher remains authoritative.
             with_guard_off(|| {
-                let msg = group_text_message("Caterina, chiedi al Signore il pagamento");
+                let msg = group_text_message("Alice, ask the Boss about the payment");
                 let overrides = ChannelOverrides {
                     group_policy: GroupPolicy::MentionOnly,
-                    group_trigger_patterns: vec!["(?i)\\bSignore\\b".to_string()],
+                    group_trigger_patterns: vec!["(?i)\\bBoss\\b".to_string()],
                     ..Default::default()
                 };
                 // Legacy behavior: substring matches → returns true.
