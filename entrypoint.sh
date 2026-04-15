@@ -11,8 +11,11 @@ if [ -d /opt/librefang/packages/whatsapp-gateway ]; then
   # Source files (overwrite every boot so image updates propagate)
   cp -f /opt/librefang/packages/whatsapp-gateway/index.js      /data/whatsapp-gateway/index.js
   cp -f /opt/librefang/packages/whatsapp-gateway/package.json  /data/whatsapp-gateway/package.json
-  cp -rf /opt/librefang/packages/whatsapp-gateway/lib          /data/whatsapp-gateway/lib
-  cp -rf /opt/librefang/packages/whatsapp-gateway/scripts      /data/whatsapp-gateway/scripts 2>/dev/null || true
+  # Use `src/.` + explicit mkdir so that when /data/.../lib already exists
+  # the image contents are copied INTO it, not nested as /data/.../lib/lib.
+  mkdir -p /data/whatsapp-gateway/lib /data/whatsapp-gateway/scripts
+  cp -rf /opt/librefang/packages/whatsapp-gateway/lib/.        /data/whatsapp-gateway/lib/
+  cp -rf /opt/librefang/packages/whatsapp-gateway/scripts/.    /data/whatsapp-gateway/scripts/ 2>/dev/null || true
   # Remove stale pre-2026-04-14 bundle that shipped as index.cjs
   rm -f /data/whatsapp-gateway/index.cjs /data/whatsapp-gateway/index.cjs.hash
 
