@@ -177,7 +177,6 @@ function TotpSection() {
   const statusQuery = useQuery({
     queryKey: ["totp", "status"],
     queryFn: totpStatus,
-    staleTime: 30_000,
   });
 
   const status = statusQuery.data;
@@ -272,6 +271,7 @@ function TotpSection() {
             )}
           </div>
         </SettingRow>
+
 
         {status?.confirmed && status.remaining_recovery_codes <= 2 && (
           <div className="px-1 py-2 text-sm text-warning flex items-center gap-2">

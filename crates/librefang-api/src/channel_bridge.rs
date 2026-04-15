@@ -551,7 +551,11 @@ impl ChannelBridgeHandle for KernelBridgeAdapter {
             .send_message_with_sender_context(agent_id, message, sender)
             .await
             .map_err(|e| format!("{e}"))?;
-        Ok(result.response)
+        if result.silent {
+            Ok(String::new())
+        } else {
+            Ok(result.response)
+        }
     }
 
     async fn send_message_with_blocks_and_sender(
@@ -578,7 +582,11 @@ impl ChannelBridgeHandle for KernelBridgeAdapter {
             .send_message_with_blocks_and_sender(agent_id, &text, blocks, sender)
             .await
             .map_err(|e| format!("{e}"))?;
-        Ok(result.response)
+        if result.silent {
+            Ok(String::new())
+        } else {
+            Ok(result.response)
+        }
     }
 
     async fn send_message_ephemeral(
@@ -752,6 +760,7 @@ impl ChannelBridgeHandle for KernelBridgeAdapter {
                 librefang_types::model_catalog::AuthStatus::CliNotInstalled => "CLI not installed",
                 librefang_types::model_catalog::AuthStatus::ValidatedKey => "key validated",
                 librefang_types::model_catalog::AuthStatus::InvalidKey => "invalid key",
+                librefang_types::model_catalog::AuthStatus::AutoDetected => "auto-detected",
             };
             msg.push_str(&format!(
                 "  {} — {} [{}, {} model(s)]\n",

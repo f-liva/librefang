@@ -717,10 +717,20 @@ impl LibreFangKernel {
                 .map(|(id, base_url, key_env)| {
                     let kernel = Arc::clone(&self);
                     tokio::spawn(async move {
-                        let key = match std::env::var(&key_env) {
-                            Ok(k) if !k.trim().is_empty() => k,
-                            _ => return,
-                        };
+                        // Resolve the actual key via primary env var, alt env var,
+                        // and credential files. This is needed for AutoDetected
+                        // providers whose key lives in a fallback env var (e.g.
+                        // GOOGLE_API_KEY for gemini, not GEMINI_API_KEY).
+                        let key = librefang_runtime::drivers::resolve_provider_api_key(&id)
+                            .or_else(|| {
+                                std::env::var(&key_env)
+                                    .ok()
+                                    .filter(|k| !k.trim().is_empty())
+                            })
+                            .unwrap_or_default();
+                        if key.is_empty() {
+                            return;
+                        }
                         let result =
                             librefang_runtime::model_catalog::probe_api_key(&id, &base_url, &key)
                                 .await;
@@ -1369,6 +1379,15 @@ impl LibreFangKernel {
 
         let memory = Arc::new(substrate);
 
+        // Check if Ollama is reachable on localhost:11434 (TCP probe, 500ms timeout).
+        fn is_ollama_reachable() -> bool {
+            std::net::TcpStream::connect_timeout(
+                &std::net::SocketAddr::from(([127, 0, 0, 1], 11434)),
+                std::time::Duration::from_millis(500),
+            )
+            .is_ok()
+        }
+
         // Resolve "auto" provider: scan environment for the first available API key.
         if config.default_model.provider == "auto" || config.default_model.provider.is_empty() {
             if let Some((provider, model_hint, env_var)) = drivers::detect_available_provider() {
@@ -1390,10 +1409,20 @@ impl LibreFangKernel {
                 config.default_model.provider = provider.to_string();
                 config.default_model.model = model;
                 config.default_model.api_key_env = env_var.to_string();
-            } else {
-                warn!("No API keys detected in environment — defaulting to ollama (local)");
+            } else if is_ollama_reachable() {
+                // Ollama is running locally — use the catalog's default model, not a hardcoded one.
+                let model = librefang_runtime::model_catalog::ModelCatalog::default()
+                    .default_model_for_provider("ollama")
+                    .unwrap_or_else(|| {
+                        warn!("Model catalog has no default for ollama — falling back to gemma4");
+                        "gemma4".to_string()
+                    });
+                info!(
+                    model = %model,
+                    "No API keys detected — Ollama is running locally, using as default"
+                );
                 config.default_model.provider = "ollama".to_string();
-                config.default_model.model = "llama3.2".to_string();
+                config.default_model.model = model;
                 config.default_model.api_key_env = String::new();
                 if !config.provider_urls.contains_key("ollama") {
                     config.provider_urls.insert(
@@ -1401,6 +1430,11 @@ impl LibreFangKernel {
                         "http://localhost:11434/v1".to_string(),
                     );
                 }
+            } else {
+                warn!(
+                    "No API keys detected and Ollama is not running. \
+                     Set an API key or start Ollama to enable LLM features."
+                );
             }
         }
 
@@ -1694,6 +1728,7 @@ impl LibreFangKernel {
         // Initialize model catalog, detect provider auth, and apply URL overrides
         let mut model_catalog =
             librefang_runtime::model_catalog::ModelCatalog::new(&config.home_dir);
+        model_catalog.load_suppressed(&config.home_dir.join("suppressed_providers.json"));
         model_catalog.detect_auth();
         // Apply region selections first (lower priority than explicit provider_urls)
         if !config.provider_regions.is_empty() {
@@ -3635,10 +3670,18 @@ system_prompt = "You are a helpful assistant."
         }
 
         // LLM agent: true streaming via agent loop
-        // Derive session ID: channel-specific sessions are always deterministic
-        // per-channel. For non-channel invocations, respect the agent's session_mode.
+        // Derive session ID: channel-specific sessions are deterministic per
+        // (channel, chat_id). Including chat_id prevents context bleed between
+        // a group and a DM that share the same (agent, channel). For non-channel
+        // invocations, respect the agent's session_mode.
         let effective_session_id = match sender_context {
-            Some(ctx) if !ctx.channel.is_empty() => SessionId::for_channel(agent_id, &ctx.channel),
+            Some(ctx) if !ctx.channel.is_empty() => {
+                let scope = match &ctx.chat_id {
+                    Some(cid) if !cid.is_empty() => format!("{}:{}", ctx.channel, cid),
+                    _ => ctx.channel.clone(),
+                };
+                SessionId::for_channel(agent_id, &scope)
+            }
             _ => match entry.manifest.session_mode {
                 librefang_types::agent::SessionMode::Persistent => entry.session_id,
                 librefang_types::agent::SessionMode::New => SessionId::new(),
@@ -4749,12 +4792,19 @@ system_prompt = "You are a helpful assistant."
             .check_quota(agent_id, &entry.manifest.resources)
             .map_err(KernelError::LibreFang)?;
 
-        // Derive session ID: channel-specific sessions are always deterministic
-        // per-channel and are not affected by session_mode. For non-channel
+        // Derive session ID: channel-specific sessions are deterministic per
+        // (channel, chat_id). Including chat_id prevents context bleed between
+        // a group and a DM that share the same (agent, channel). For non-channel
         // invocations (background ticks, triggers, agent_send), resolve the
         // effective session mode: per-trigger override > agent manifest default.
         let effective_session_id = match sender_context {
-            Some(ctx) if !ctx.channel.is_empty() => SessionId::for_channel(agent_id, &ctx.channel),
+            Some(ctx) if !ctx.channel.is_empty() => {
+                let scope = match &ctx.chat_id {
+                    Some(cid) if !cid.is_empty() => format!("{}:{}", ctx.channel, cid),
+                    _ => ctx.channel.clone(),
+                };
+                SessionId::for_channel(agent_id, &scope)
+            }
             _ => {
                 let mode = session_mode_override.unwrap_or(entry.manifest.session_mode);
                 match mode {
@@ -7623,29 +7673,30 @@ system_prompt = "You are a helpful assistant."
                 }
             }
         } else if !state_path.exists() {
-            // First boot: activate all registry hands then pause them (pre-install).
-            // This creates full workspace structure (AGENT.json, SOUL.md, memory/, etc.)
-            // without leaving agents running.
+            // First boot: scaffold workspace directories and identity files for all
+            // registry hands without activating them. Activation (DB entries, session
+            // spawning, agent registration) only happens when the user explicitly
+            // enables a hand — not unconditionally on every fresh install.
             let defs = self.hand_registry.list_definitions();
             if !defs.is_empty() {
                 info!(
-                    "First boot — pre-installing {} hand(s) (activate + pause)",
+                    "First boot — scaffolding {} hand workspace(s) (files only, no activation)",
                     defs.len()
                 );
+                let hands_ws_dir = cfg.effective_hands_workspaces_dir();
                 for def in &defs {
-                    match self.activate_hand(&def.id, std::collections::HashMap::new()) {
-                        Ok(inst) => {
-                            if let Err(e) = self.pause_hand(inst.instance_id) {
-                                warn!(hand = %def.id, error = %e, "Failed to pause pre-installed hand");
-                            } else {
-                                info!(hand = %def.id, "Pre-installed hand (paused)");
-                            }
+                    for (role, agent) in &def.agents {
+                        let safe_hand = safe_path_component(&def.id, "hand");
+                        let safe_role = safe_path_component(role, "agent");
+                        let workspace = hands_ws_dir.join(&safe_hand).join(&safe_role);
+                        if let Err(e) = ensure_workspace(&workspace) {
+                            warn!(hand = %def.id, role = %role, error = %e, "Failed to scaffold hand workspace");
+                            continue;
                         }
-                        Err(e) => {
-                            warn!(hand = %def.id, error = %e, "Failed to pre-install hand");
-                        }
+                        generate_identity_files(&workspace, &agent.manifest);
                     }
                 }
+                // Write an empty state file so subsequent boots skip this block.
                 self.persist_hand_state();
             }
         }
@@ -10434,10 +10485,27 @@ impl KernelHandle for LibreFangKernel {
         assigned_to: Option<&str>,
         created_by: Option<&str>,
     ) -> Result<String, String> {
-        self.memory
+        let task_id = self
+            .memory
             .task_post(title, description, assigned_to, created_by)
             .await
-            .map_err(|e| format!("Task post failed: {e}"))
+            .map_err(|e| format!("Task post failed: {e}"))?;
+
+        let event = librefang_types::event::Event::new(
+            AgentId::new(), // system-originated
+            librefang_types::event::EventTarget::Broadcast,
+            librefang_types::event::EventPayload::System(
+                librefang_types::event::SystemEvent::TaskPosted {
+                    task_id: task_id.clone(),
+                    title: title.to_string(),
+                    assigned_to: assigned_to.map(String::from),
+                    created_by: created_by.map(String::from),
+                },
+            ),
+        );
+        self.publish_event(event).await;
+
+        Ok(task_id)
     }
 
     async fn task_claim(&self, agent_id: &str) -> Result<Option<serde_json::Value>, String> {
@@ -10456,17 +10524,49 @@ impl KernelHandle for LibreFangKernel {
                 }
             },
         };
-        self.memory
+        let result = self
+            .memory
             .task_claim(&resolved)
             .await
-            .map_err(|e| format!("Task claim failed: {e}"))
+            .map_err(|e| format!("Task claim failed: {e}"))?;
+
+        if let Some(ref task) = result {
+            let task_id = task["id"].as_str().unwrap_or("").to_string();
+            let event = librefang_types::event::Event::new(
+                AgentId::new(), // system-originated
+                librefang_types::event::EventTarget::Broadcast,
+                librefang_types::event::EventPayload::System(
+                    librefang_types::event::SystemEvent::TaskClaimed {
+                        task_id,
+                        claimed_by: resolved.clone(),
+                    },
+                ),
+            );
+            self.publish_event(event).await;
+        }
+
+        Ok(result)
     }
 
     async fn task_complete(&self, task_id: &str, result: &str) -> Result<(), String> {
         self.memory
             .task_complete(task_id, result)
             .await
-            .map_err(|e| format!("Task complete failed: {e}"))
+            .map_err(|e| format!("Task complete failed: {e}"))?;
+
+        let event = librefang_types::event::Event::new(
+            AgentId::new(), // system-originated
+            librefang_types::event::EventTarget::Broadcast,
+            librefang_types::event::EventPayload::System(
+                librefang_types::event::SystemEvent::TaskCompleted {
+                    task_id: task_id.to_string(),
+                    result: result.to_string(),
+                },
+            ),
+        );
+        self.publish_event(event).await;
+
+        Ok(())
     }
 
     async fn task_list(&self, status: Option<&str>) -> Result<Vec<serde_json::Value>, String> {
