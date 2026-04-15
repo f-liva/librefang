@@ -9,6 +9,7 @@ const { randomUUID } = require('node:crypto');
 const toml = require('toml');
 const { EchoTracker } = require('./lib/echo-tracker');
 const lidCache = require('./lib/lid-cache');
+const groupActivation = require('./lib/group-activation');
 const {
   isLidJid,
   isGroupJid,
@@ -92,6 +93,24 @@ if (LID_PERSIST_ENABLED) {
       event: 'lid_cache_init_failed',
       error: err.message,
     }));
+  }
+}
+
+// Phase 5 §A (GA-01): per-group activation mode (always|mention|off).
+try {
+  groupActivation.init(db);
+} catch (err) {
+  console.warn(JSON.stringify({
+    event: 'group_activation_init_failed',
+    error: err.message,
+  }));
+}
+
+function resolveGroupMode(groupJid) {
+  try {
+    return groupActivation.get(db, groupJid) || groupActivation.DEFAULT_MODE;
+  } catch (_) {
+    return groupActivation.DEFAULT_MODE;
   }
 }
 
@@ -1537,6 +1556,61 @@ async function startConnection() {
         // ownJid is normalized like "1234567890@s.whatsapp.net"
         const ownNumber = ownJid.replace(/@.*$/, '');
         wasMentioned = mentionedJids.some(jid => jid.replace(/@.*$/, '') === ownNumber);
+      }
+
+      // Phase 5 §A (GA-01) — `/activation` command + per-group gating.
+      // Owner can change the mode; everyone is gated by the stored mode.
+      if (isGroup) {
+        const cmd = isOwner ? groupActivation.parseCommand(text) : null;
+        if (cmd) {
+          if (cmd.error === 'invalid_mode') {
+            await sock.sendMessage(sender, {
+              text: `Modalità non valida: \`${cmd.arg}\`. Usa una di: ${groupActivation.MODES.join(', ')}.`,
+            }).catch(() => {});
+          } else if (cmd.query) {
+            const current = resolveGroupMode(sender);
+            await sock.sendMessage(sender, {
+              text: `Attivazione corrente: *${current}*. Modalità disponibili: ${groupActivation.MODES.join(', ')}.`,
+            }).catch(() => {});
+          } else if (cmd.mode) {
+            try {
+              groupActivation.set(db, sender, cmd.mode);
+              await sock.sendMessage(sender, {
+                text: `Attivazione aggiornata: *${cmd.mode}*.`,
+              }).catch(() => {});
+              console.log(JSON.stringify({
+                event: 'group_activation_set',
+                group_jid: sender,
+                mode: cmd.mode,
+              }));
+            } catch (err) {
+              console.warn(JSON.stringify({
+                event: 'group_activation_set_failed',
+                group_jid: sender,
+                error: err.message,
+              }));
+            }
+          }
+          continue; // command processed, do not forward to the agent
+        }
+
+        const groupMode = resolveGroupMode(sender);
+        if (groupMode === 'off') {
+          console.log(JSON.stringify({
+            event: 'group_gating_skip',
+            reason: 'mode_off',
+            group_jid: sender,
+          }));
+          continue;
+        }
+        if (groupMode === 'mention' && !wasMentioned && !isOwner) {
+          console.log(JSON.stringify({
+            event: 'group_gating_skip',
+            reason: 'mention_required',
+            group_jid: sender,
+          }));
+          continue;
+        }
       }
 
       // Rate limiting for strangers and group messages
@@ -3124,4 +3198,7 @@ module.exports = {
   sessionRecoveryMap,
   SESSION_RECOVERY_COOLDOWN_MS,
   SESSION_RECOVERY_MAX_ATTEMPTS,
+  // Phase 5 §A — group activation (testing + introspection)
+  groupActivation,
+  resolveGroupMode,
 };
