@@ -41,6 +41,8 @@ const {
   lidMapSet,
   db,
   LID_PERSIST_ENABLED,
+  computeReadiness,
+  HEARTBEAT_MS,
   normalizeBaseJid,
   sessionRecoveryMap,
   SESSION_RECOVERY_COOLDOWN_MS,
@@ -1015,6 +1017,87 @@ describe('normalizeBaseJid', () => {
 
   it('leaves group JID unchanged (no :N pattern)', () => {
     assert.equal(normalizeBaseJid('120363123@g.us'), '120363123@g.us');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Phase 5 §B (ST-03) — computeReadiness
+// ---------------------------------------------------------------------------
+describe('computeReadiness', () => {
+  it('is ready when connected, agent resolved, heartbeat fresh', () => {
+    const r = computeReadiness({
+      connStatus: 'connected',
+      agentId: 'abc-123',
+      lastInboundAt: Date.now(),
+      now: Date.now(),
+      heartbeatMs: 60_000,
+    });
+    assert.equal(r.ready, true);
+    assert.deepEqual(r.reasons, []);
+  });
+
+  it('reports wa_disconnected when socket is not connected', () => {
+    const r = computeReadiness({
+      connStatus: 'disconnected',
+      agentId: 'abc-123',
+      lastInboundAt: Date.now(),
+    });
+    assert.equal(r.ready, false);
+    assert.ok(r.reasons.includes('wa_disconnected'));
+  });
+
+  it('reports wa_qr_ready when socket is pairing', () => {
+    const r = computeReadiness({
+      connStatus: 'qr_ready',
+      agentId: 'abc-123',
+      lastInboundAt: Date.now(),
+    });
+    assert.equal(r.ready, false);
+    assert.ok(r.reasons.includes('wa_qr_ready'));
+  });
+
+  it('reports agent_unresolved when agentId missing', () => {
+    const r = computeReadiness({
+      connStatus: 'connected',
+      agentId: null,
+      lastInboundAt: Date.now(),
+    });
+    assert.equal(r.ready, false);
+    assert.ok(r.reasons.includes('agent_unresolved'));
+  });
+
+  it('reports heartbeat_stale when last inbound is older than threshold', () => {
+    const now = 10_000_000;
+    const r = computeReadiness({
+      connStatus: 'connected',
+      agentId: 'abc-123',
+      lastInboundAt: now - 500_000,
+      now,
+      heartbeatMs: 60_000,
+    });
+    assert.equal(r.ready, false);
+    assert.ok(r.reasons.includes('heartbeat_stale'));
+  });
+
+  it('accumulates multiple reasons', () => {
+    const now = 10_000_000;
+    const r = computeReadiness({
+      connStatus: 'disconnected',
+      agentId: null,
+      lastInboundAt: now - 500_000,
+      now,
+      heartbeatMs: 60_000,
+    });
+    assert.equal(r.ready, false);
+    assert.equal(r.reasons.length, 3);
+    assert.ok(r.reasons.includes('wa_disconnected'));
+    assert.ok(r.reasons.includes('agent_unresolved'));
+    assert.ok(r.reasons.includes('heartbeat_stale'));
+  });
+
+  it('HEARTBEAT_MS export is a positive number', () => {
+    assert.equal(typeof HEARTBEAT_MS, 'number');
+    assert.ok(HEARTBEAT_MS > 0);
   });
 });
 

@@ -319,6 +319,26 @@ function checkHeartbeat(now, lastInboundAt, thresholdMs) {
   return (now - lastInboundAt) > thresholdMs;
 }
 
+// Phase 5 §B (ST-03) — readiness predicate used by /health/ready. Decoupled
+// from the endpoint so it can be unit-tested without an HTTP server. Returns
+// { ready: boolean, reasons: string[] } so callers can log *why* we're not
+// ready instead of a single opaque bit.
+function computeReadiness({
+  connStatus,
+  agentId,
+  lastInboundAt,
+  now = Date.now(),
+  heartbeatMs = HEARTBEAT_MS,
+} = {}) {
+  const reasons = [];
+  if (connStatus !== 'connected') reasons.push(`wa_${connStatus || 'disconnected'}`);
+  if (!agentId) reasons.push('agent_unresolved');
+  if (lastInboundAt && checkHeartbeat(now, lastInboundAt, heartbeatMs)) {
+    reasons.push('heartbeat_stale');
+  }
+  return { ready: reasons.length === 0, reasons };
+}
+
 // ST-02: exponential backoff with ±25% jitter, cap 30s, factor 1.8, NO hard
 // stop. `rng` is injected for deterministic tests (defaults to Math.random).
 // Matches openclaw/extensions/whatsapp/src/reconnect.ts semantics.
@@ -3078,6 +3098,24 @@ const server = http.createServer(async (req, res) => {
       });
     }
 
+    // GET /health/ready — readiness probe (Phase 5 §B, ST-03). Returns 503
+    // with the failing reasons when socket is disconnected, agent unresolved,
+    // or heartbeat stale so orchestration can defer traffic until recovery.
+    if (req.method === 'GET' && path === '/health/ready') {
+      const r = computeReadiness({
+        connStatus,
+        agentId: cachedAgentId,
+        lastInboundAt,
+      });
+      return jsonResponse(req, res, r.ready ? 200 : 503, {
+        ready: r.ready,
+        reasons: r.reasons,
+        connected: connStatus === 'connected',
+        agent_resolved: Boolean(cachedAgentId),
+        heartbeat_age_ms: Date.now() - lastInboundAt,
+      });
+    }
+
     // 404
     jsonResponse(req, res, 404, { error: 'Not found' });
   } catch (err) {
@@ -3201,4 +3239,7 @@ module.exports = {
   // Phase 5 §A — group activation (testing + introspection)
   groupActivation,
   resolveGroupMode,
+  // Phase 5 §B — readiness predicate (testing)
+  computeReadiness,
+  HEARTBEAT_MS,
 };
