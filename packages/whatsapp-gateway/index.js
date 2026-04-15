@@ -1560,9 +1560,16 @@ async function startConnection() {
 
       // Determine sender type. Owner check accepts either the resolved
       // phone-number JID or a LID previously bound to an owner number.
+      // For groups (`sender` is @g.us) the real author is in
+      // `msg.key.participant` / `msg.key.participantPn` — consult those too
+      // so owner-in-group is recognised as owner, not as a group member.
+      const participantPn = msg.key.participantPn || '';
+      const participantLid = msg.key.participant || '';
       const isOwner = OWNER_JIDS.size > 0 && (
         (senderPnJid && OWNER_JIDS.has(senderPnJid)) ||
-        (isLid && ownerLidJids.has(sender))
+        (isLid && ownerLidJids.has(sender)) ||
+        (participantPn && OWNER_JIDS.has(participantPn)) ||
+        (participantLid && ownerLidJids.has(normalizeDeviceScopedJid(participantLid)))
       );
       const isStranger = !isGroup && OWNER_JIDS.size > 0 && !isOwner;
 
