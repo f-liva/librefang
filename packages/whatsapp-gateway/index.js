@@ -11,6 +11,7 @@ const { EchoTracker } = require('./lib/echo-tracker');
 const lidCache = require('./lib/lid-cache');
 const groupActivation = require('./lib/group-activation');
 const groupAllowFrom = require('./lib/group-allow-from');
+const pendingGroupHistory = require('./lib/pending-group-history');
 const {
   isLidJid,
   isGroupJid,
@@ -115,6 +116,36 @@ try {
     event: 'group_allow_from_init_failed',
     error: err.message,
   }));
+}
+
+// Phase 3 completion (GA-03): history-for-skipped. Skipped group messages
+// are buffered here so the agent has context when it next replies.
+try {
+  pendingGroupHistory.init(db);
+} catch (err) {
+  console.warn(JSON.stringify({
+    event: 'pending_group_history_init_failed',
+    error: err.message,
+  }));
+}
+
+function recordPendingGroupHistory(groupJid, senderName, senderJid, bodyText, skipReason) {
+  try {
+    pendingGroupHistory.append(db, {
+      group_jid: groupJid,
+      sender_name: senderName,
+      sender_jid: senderJid,
+      text: bodyText,
+      skip_reason: skipReason,
+      timestamp: Date.now(),
+    });
+  } catch (err) {
+    console.warn(JSON.stringify({
+      event: 'pending_group_history_append_failed',
+      group_jid: groupJid,
+      error: err.message,
+    }));
+  }
 }
 
 function resolveGroupMode(groupJid) {
@@ -657,6 +688,11 @@ setInterval(() => {
   for (const [key, entry] of sessionRecoveryMap) {
     if (now - entry.lastAttemptAt > SESSION_RECOVERY_EXPIRE_MS) sessionRecoveryMap.delete(key);
   }
+  // Phase 3 completion (GA-03) — age out pending group history rows so
+  // a group that never triggers a forward never grows unbounded.
+  try {
+    pendingGroupHistory.pruneOlderThan(db, pendingGroupHistory.DEFAULT_MAX_AGE_MS);
+  } catch (_) { /* best-effort */ }
 }, 60_000).unref();
 
 // ---------------------------------------------------------------------------
@@ -1737,8 +1773,17 @@ async function startConnection() {
       }
 
       if (isGroup) {
+        // Identify the real author once — used both for allowlist checks
+        // and for buffering skipped messages into pending_group_history.
+        const participantPn = msg.key.participantPn || '';
+        const participantLidNorm = msg.key.participant
+          ? normalizeDeviceScopedJid(msg.key.participant)
+          : '';
+        const skippedSenderJid = participantPn || participantLidNorm || sender;
+
         const groupMode = resolveGroupMode(sender);
         if (groupMode === 'off') {
+          recordPendingGroupHistory(sender, pushName || '', skippedSenderJid, text, 'mode_off');
           console.log(JSON.stringify({
             event: 'group_gating_skip',
             reason: 'mode_off',
@@ -1747,6 +1792,7 @@ async function startConnection() {
           continue;
         }
         if (groupMode === 'mention' && !wasMentioned && !isOwner) {
+          recordPendingGroupHistory(sender, pushName || '', skippedSenderJid, text, 'mention_required');
           console.log(JSON.stringify({
             event: 'group_gating_skip',
             reason: 'mention_required',
@@ -1759,14 +1805,11 @@ async function startConnection() {
         // always allowed. The participant JID may be either a phone or a
         // LID depending on the contact; try both forms.
         if (!isOwner && groupAllowFrom.hasAny(db, sender)) {
-          const participantPn = msg.key.participantPn || '';
-          const participantLidNorm = msg.key.participant
-            ? normalizeDeviceScopedJid(msg.key.participant)
-            : '';
           const allowed =
             (participantPn && groupAllowFrom.isAllowed(db, sender, participantPn)) ||
             (participantLidNorm && groupAllowFrom.isAllowed(db, sender, participantLidNorm));
           if (!allowed) {
+            recordPendingGroupHistory(sender, pushName || '', skippedSenderJid, text, 'allowlist_miss');
             console.log(JSON.stringify({
               event: 'group_gating_skip',
               reason: 'allowlist_miss',
@@ -1921,8 +1964,30 @@ async function startConnection() {
         let systemPrefix = '';
 
         if (isGroup) {
+          // Phase 3 completion (GA-03) — drain the pending history buffer
+          // for this group and prepend it so the agent sees what was said
+          // while it was silent. drain() both reads and deletes atomically
+          // so the next turn won't see the same entries again.
+          let historyPreamble = '';
+          try {
+            const history = pendingGroupHistory.drain(db, sender);
+            historyPreamble = pendingGroupHistory.formatPreamble(history);
+            if (history.length > 0) {
+              console.log(JSON.stringify({
+                event: 'pending_group_history_drained',
+                group_jid: sender,
+                entries: history.length,
+              }));
+            }
+          } catch (err) {
+            console.warn(JSON.stringify({
+              event: 'pending_group_history_drain_failed',
+              group_jid: sender,
+              error: err.message,
+            }));
+          }
           // Include sender identity so the LLM knows who is talking in the group
-          messageToSend = `[Group message from ${pushName || phone}]\n${messageText}`;
+          messageToSend = historyPreamble + `[Group message from ${pushName || phone}]\n${messageText}`;
         } else if (isStranger) {
           const strangerContext = buildStrangerContext(pushName, phone, sender);
           messageToSend = strangerContext + messageText;
@@ -3394,6 +3459,8 @@ module.exports = {
   resolveGroupMode,
   // Phase 3 completion — group allow-from (testing)
   groupAllowFrom,
+  // Phase 3 completion — pending group history (testing)
+  pendingGroupHistory,
   // Phase 5 §B — readiness predicate (testing)
   computeReadiness,
   HEARTBEAT_MS,
