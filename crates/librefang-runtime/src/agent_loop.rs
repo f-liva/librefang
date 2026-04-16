@@ -98,16 +98,15 @@ fn is_no_reply(text: &str) -> bool {
 ///
 /// Heuristic is intentionally narrow to avoid swallowing legitimate replies:
 /// - Trimmed length ≤ 120 chars (progress preambles are short)
-/// - Ends with `...`, `…`, or `..` (ellipsis marker the model uses for
-///   "continuing shortly")
-/// - No letters-after-ellipsis (avoid matching a full sentence that just
-///   happens to include `"...",` mid-text)
+/// - Ends with `...` or `…`. Two-dot `..` is intentionally excluded —
+///   models almost never emit it deliberately, and skipping it avoids
+///   clipping truncated abbreviations like `"See p.."`.
 fn is_progress_text_leak(text: &str) -> bool {
     let t = text.trim();
     if t.is_empty() || t.chars().count() > 120 {
         return false;
     }
-    t.ends_with("...") || t.ends_with("…") || t.ends_with("..")
+    t.ends_with("...") || t.ends_with("…")
 }
 
 /// Returns true if this tool-error content is a "soft" error — one the LLM is
@@ -4813,13 +4812,16 @@ mod tests {
         assert!(is_progress_text_leak("Let me check that..."));
         assert!(is_progress_text_leak("Processing..."));
         assert!(is_progress_text_leak("One moment…"));
-        assert!(is_progress_text_leak("Running..")); // two-dot ellipsis
         assert!(is_progress_text_leak("   Checking...   ")); // whitespace
 
         // Negatives — real replies must never be flagged as leaks
         assert!(!is_progress_text_leak(""));
         assert!(!is_progress_text_leak("Done."));
         assert!(!is_progress_text_leak("Here is the result."));
+        // Two-dot `..` is intentionally not a trigger (too broad, catches
+        // truncated abbreviations). See the `is_progress_text_leak` doc.
+        assert!(!is_progress_text_leak("Running.."));
+        assert!(!is_progress_text_leak("See p.."));
         // Not an ellipsis, real reply
         assert!(!is_progress_text_leak("The script ran successfully."));
         // Over 120 chars — even ending with ellipsis, treat as real content
