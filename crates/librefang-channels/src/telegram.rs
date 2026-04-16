@@ -447,7 +447,7 @@ impl TelegramAdapter {
                 return Ok(());
             }
 
-            warn!("Telegram {endpoint} failed ({status}): {body_text}");
+            return Err(format!("Telegram {endpoint} failed ({status}): {body_text}").into());
         }
         Ok(())
     }
@@ -553,7 +553,9 @@ impl TelegramAdapter {
                 return Ok(());
             }
 
-            warn!("Telegram sendDocument upload failed ({status}): {body_text}");
+            return Err(
+                format!("Telegram sendDocument upload failed ({status}): {body_text}").into(),
+            );
         }
         Ok(())
     }
