@@ -1,25 +1,9 @@
 //! Channel-aware audio normalizer.
 //!
-//! Callers of `channel_send` / `send_audio` shouldn't need to know that
-//! WhatsApp Web refuses anything that isn't an Ogg/Opus PTT voice note,
-//! that Telegram splits `sendVoice` and `sendAudio`, or that Signal's
-//! bridge prefers raw attachments. This module takes a local audio file
-//! plus a destination channel and returns the bytes already shaped for
-//! that channel, along with the metadata the adapter needs to dispatch
-//! via the correct endpoint.
-//!
-//! Responsibility boundary — this module:
-//! - detects the source container/codec,
-//! - picks the profile for the destination channel,
-//! - transcodes via `ffmpeg` when the source doesn't already match the
-//!   channel's profile,
-//! - caches the output under a short-lived temp file,
-//! - refuses non-audio inputs with an explicit error.
-//!
-//! What it does NOT do:
-//! - talk to the outbound HTTP gateway / bot API (adapter concern),
-//! - modify in-flight gateway code (Baileys, Telegram Bot API),
-//! - handle video or image payloads (see `media_understanding` for those).
+//! Reshape a local audio file into the bytes + MIME that the target
+//! channel's adapter expects (Ogg/Opus PTT for WhatsApp, voice-vs-music
+//! split for Telegram, pass-through elsewhere), so `channel_send` callers
+//! never touch ffmpeg flags or PTT bits directly.
 
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -120,11 +104,23 @@ pub struct NormalizedAudio {
     _temp: Option<TempFile>,
 }
 
-/// RAII guard for the transcode output file: removed when dropped so
-/// we don't accumulate throwaway Ogg files if the agent loop panics
-/// mid-dispatch.
+/// File extensions we accept as audio without invoking ffprobe.
+/// Shared by `tool_channel_send`'s routing guard and
+/// [`looks_like_audio`]'s fast path so drift can't leave one in sync
+/// while the other falls behind.
+pub const AUDIO_EXTENSIONS: &[&str] = &["mp3", "ogg", "oga", "opus", "wav", "m4a", "aac", "flac"];
+
+/// Return true when a MIME string describes an Opus / Ogg voice note,
+/// i.e. the form that maps to WhatsApp's `ptt:true` bubble and
+/// Telegram's `sendVoice`. Both adapters need the same heuristic —
+/// centralised here so it can't drift between them.
+pub fn mime_is_voice_note(mime: &str) -> bool {
+    mime.contains("opus") || mime.contains("ogg")
+}
+
+/// RAII guard for the transcode output file.
 #[derive(Debug, Clone)]
-pub struct TempFile {
+pub(crate) struct TempFile {
     path: PathBuf,
 }
 
@@ -243,8 +239,8 @@ async fn normalize_whatsapp_voice_note(
     );
 
     let (data, tmp) = if needs_transcode {
-        let (bytes, path) = run_ffmpeg_opus_mono(src_path, 16_000, 32_000).await?;
-        (bytes, Some(TempFile { path }))
+        let (bytes, guard) = run_ffmpeg_opus_mono(src_path, 16_000, 32_000).await?;
+        (bytes, Some(guard))
     } else {
         let bytes = tokio::fs::read(src_path)
             .await
@@ -272,8 +268,8 @@ async fn normalize_opus_voice_note(
 ) -> Result<NormalizedAudio, String> {
     let needs_transcode = !probe.is_opus_mono_voice_compatible();
     let (data, tmp) = if needs_transcode {
-        let (bytes, path) = run_ffmpeg_opus_mono(src_path, 48_000, 64_000).await?;
-        (bytes, Some(TempFile { path }))
+        let (bytes, guard) = run_ffmpeg_opus_mono(src_path, 48_000, 64_000).await?;
+        (bytes, Some(guard))
     } else {
         let bytes = tokio::fs::read(src_path)
             .await
@@ -298,7 +294,7 @@ async fn transcode_to_mp3(
     filename_hint: &str,
     profile: ChannelProfile,
 ) -> Result<NormalizedAudio, String> {
-    let (bytes, path) = run_ffmpeg_mp3(src_path).await?;
+    let (bytes, guard) = run_ffmpeg_mp3(src_path).await?;
     Ok(NormalizedAudio {
         data: bytes,
         mime_type: "audio/mpeg".to_string(),
@@ -307,7 +303,7 @@ async fn transcode_to_mp3(
         is_voice_note: false,
         profile,
         transcoded: true,
-        _temp: Some(TempFile { path }),
+        _temp: Some(guard),
     })
 }
 
@@ -509,126 +505,99 @@ fn probe_by_extension(src_path: &Path) -> AudioProbe {
     }
 }
 
-/// Transcode arbitrary audio → Ogg/Opus mono at the requested sample
-/// rate / bitrate. Writes to a scratch file so we can stream large
-/// sources without buffering them twice.
+/// Run ffmpeg to re-encode `src_path` into a scratch file under
+/// `$TMPDIR/librefang_audio_norm/` and return the output bytes plus
+/// an RAII guard for the scratch path.
+///
+/// The guard is constructed immediately after spawn success so that
+/// every subsequent `?` propagates cleanup via `Drop` even if the
+/// read-back fails or the tokio task is cancelled.
+async fn run_ffmpeg_to_tempfile(
+    src_path: &Path,
+    out_ext: &str,
+    codec_args: &[&str],
+) -> Result<(Vec<u8>, TempFile), String> {
+    use std::process::Stdio;
+
+    let tmp_dir = std::env::temp_dir().join("librefang_audio_norm");
+    tokio::fs::create_dir_all(&tmp_dir)
+        .await
+        .map_err(|e| format!("create tmp dir: {e}"))?;
+    let dst_path = tmp_dir.join(format!("{}.{out_ext}", uuid::Uuid::new_v4()));
+
+    let mut child = tokio::process::Command::new("ffmpeg")
+        .args(["-hide_banner", "-loglevel", "error", "-y", "-i"])
+        .arg(src_path)
+        .args(codec_args)
+        .arg(&dst_path)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|e| format!("spawn ffmpeg: {e}"))?;
+
+    // Guard the output path from the moment ffmpeg might have started
+    // writing it; every `?` below will drop this and unlink the scratch
+    // file, even on disk-read failure or timeout.
+    let guard = TempFile {
+        path: dst_path.clone(),
+    };
+
+    let mut stderr = child.stderr.take().expect("stderr piped");
+
+    let status = match tokio::time::timeout(FFMPEG_TIMEOUT, child.wait()).await {
+        Ok(Ok(s)) => s,
+        Ok(Err(e)) => return Err(format!("ffmpeg wait failed: {e}")),
+        Err(_) => {
+            let _ = child.start_kill();
+            let _ = child.wait().await;
+            return Err("ffmpeg timed out while transcoding".to_string());
+        }
+    };
+
+    let mut err_buf = Vec::new();
+    let _ = stderr.read_to_end(&mut err_buf).await;
+
+    if !status.success() {
+        return Err(format!(
+            "ffmpeg exited with {}: {}",
+            status,
+            String::from_utf8_lossy(&err_buf).trim()
+        ));
+    }
+
+    let bytes = tokio::fs::read(&dst_path)
+        .await
+        .map_err(|e| format!("read ffmpeg output: {e}"))?;
+    if bytes.is_empty() {
+        return Err("ffmpeg produced an empty output".to_string());
+    }
+    Ok((bytes, guard))
+}
+
 async fn run_ffmpeg_opus_mono(
     src_path: &Path,
     sample_rate: u32,
     bitrate_bps: u32,
-) -> Result<(Vec<u8>, PathBuf), String> {
-    use std::process::Stdio;
-
-    let tmp_dir = std::env::temp_dir().join("librefang_audio_norm");
-    tokio::fs::create_dir_all(&tmp_dir)
-        .await
-        .map_err(|e| format!("create tmp dir: {e}"))?;
-    let dst_path = tmp_dir.join(format!("{}.ogg", uuid::Uuid::new_v4()));
-
+) -> Result<(Vec<u8>, TempFile), String> {
     let ar = sample_rate.to_string();
     let bitrate = format!("{}k", bitrate_bps / 1000);
-
-    let mut child = tokio::process::Command::new("ffmpeg")
-        .args(["-hide_banner", "-loglevel", "error", "-y", "-i"])
-        .arg(src_path)
-        .args([
+    run_ffmpeg_to_tempfile(
+        src_path,
+        "ogg",
+        &[
             "-vn", "-ac", "1", "-ar", &ar, "-c:a", "libopus", "-b:a", &bitrate, "-f", "ogg",
-        ])
-        .arg(&dst_path)
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .map_err(|e| format!("spawn ffmpeg: {e}"))?;
-
-    let mut stderr = child.stderr.take().expect("stderr piped");
-
-    let status = match tokio::time::timeout(FFMPEG_TIMEOUT, child.wait()).await {
-        Ok(Ok(s)) => s,
-        Ok(Err(e)) => return Err(format!("ffmpeg wait failed: {e}")),
-        Err(_) => {
-            let _ = child.start_kill();
-            let _ = child.wait().await;
-            let _ = tokio::fs::remove_file(&dst_path).await;
-            return Err("ffmpeg timed out while transcoding".to_string());
-        }
-    };
-
-    let mut err_buf = Vec::new();
-    let _ = stderr.read_to_end(&mut err_buf).await;
-
-    if !status.success() {
-        let _ = tokio::fs::remove_file(&dst_path).await;
-        return Err(format!(
-            "ffmpeg exited with {}: {}",
-            status,
-            String::from_utf8_lossy(&err_buf).trim()
-        ));
-    }
-
-    let bytes = tokio::fs::read(&dst_path)
-        .await
-        .map_err(|e| format!("read ffmpeg output: {e}"))?;
-    if bytes.is_empty() {
-        let _ = tokio::fs::remove_file(&dst_path).await;
-        return Err("ffmpeg produced an empty output".to_string());
-    }
-    Ok((bytes, dst_path))
+        ],
+    )
+    .await
 }
 
-/// Transcode arbitrary audio → MP3 for platforms that prefer a
-/// widely-compatible music container.
-async fn run_ffmpeg_mp3(src_path: &Path) -> Result<(Vec<u8>, PathBuf), String> {
-    use std::process::Stdio;
-
-    let tmp_dir = std::env::temp_dir().join("librefang_audio_norm");
-    tokio::fs::create_dir_all(&tmp_dir)
-        .await
-        .map_err(|e| format!("create tmp dir: {e}"))?;
-    let dst_path = tmp_dir.join(format!("{}.mp3", uuid::Uuid::new_v4()));
-
-    let mut child = tokio::process::Command::new("ffmpeg")
-        .args(["-hide_banner", "-loglevel", "error", "-y", "-i"])
-        .arg(src_path)
-        .args(["-vn", "-c:a", "libmp3lame", "-b:a", "128k", "-f", "mp3"])
-        .arg(&dst_path)
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .map_err(|e| format!("spawn ffmpeg: {e}"))?;
-
-    let mut stderr = child.stderr.take().expect("stderr piped");
-
-    let status = match tokio::time::timeout(FFMPEG_TIMEOUT, child.wait()).await {
-        Ok(Ok(s)) => s,
-        Ok(Err(e)) => return Err(format!("ffmpeg wait failed: {e}")),
-        Err(_) => {
-            let _ = child.start_kill();
-            let _ = child.wait().await;
-            let _ = tokio::fs::remove_file(&dst_path).await;
-            return Err("ffmpeg timed out while transcoding".to_string());
-        }
-    };
-
-    let mut err_buf = Vec::new();
-    let _ = stderr.read_to_end(&mut err_buf).await;
-
-    if !status.success() {
-        let _ = tokio::fs::remove_file(&dst_path).await;
-        return Err(format!(
-            "ffmpeg exited with {}: {}",
-            status,
-            String::from_utf8_lossy(&err_buf).trim()
-        ));
-    }
-
-    let bytes = tokio::fs::read(&dst_path)
-        .await
-        .map_err(|e| format!("read ffmpeg output: {e}"))?;
-    if bytes.is_empty() {
-        let _ = tokio::fs::remove_file(&dst_path).await;
-        return Err("ffmpeg produced an empty output".to_string());
-    }
-    Ok((bytes, dst_path))
+async fn run_ffmpeg_mp3(src_path: &Path) -> Result<(Vec<u8>, TempFile), String> {
+    run_ffmpeg_to_tempfile(
+        src_path,
+        "mp3",
+        &["-vn", "-c:a", "libmp3lame", "-b:a", "128k", "-f", "mp3"],
+    )
+    .await
 }
 
 fn force_extension(name: &str, ext: &str) -> String {
@@ -639,23 +608,21 @@ fn force_extension(name: &str, ext: &str) -> String {
     format!("{stem}.{ext}")
 }
 
-/// Best-effort check that the supplied path resolves to something that
-/// probably is an audio file. Used by `tool_channel_send` as a
-/// pre-normaliser guard so we can return a clear error instead of a
-/// gateway-side "unsupported content type" surprise.
+/// Best-effort audio-shape check used by `tool_channel_send` before
+/// handing off to the normalizer. The extension allowlist runs first
+/// so the hot path never spawns `ffprobe` for common audio inputs;
+/// ffprobe only fires for extensionless or unrecognised names, where
+/// paying a subprocess round-trip is genuinely the least-bad option.
 pub async fn looks_like_audio(src_path: &Path) -> bool {
-    if probe_with_ffprobe(src_path).await.is_ok() {
-        return true;
-    }
     let ext = src_path
         .extension()
         .and_then(|e| e.to_str())
         .unwrap_or("")
         .to_ascii_lowercase();
-    matches!(
-        ext.as_str(),
-        "ogg" | "oga" | "opus" | "mp3" | "m4a" | "aac" | "wav" | "flac"
-    )
+    if !ext.is_empty() {
+        return AUDIO_EXTENSIONS.contains(&ext.as_str());
+    }
+    probe_with_ffprobe(src_path).await.is_ok()
 }
 
 // Simple in-process waveform writer, meant for tests. Produces a valid

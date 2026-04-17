@@ -3105,10 +3105,7 @@ async fn tool_channel_send(
             .and_then(|e| e.to_str())
             .unwrap_or("")
             .to_lowercase();
-        let is_audio_ext = matches!(
-            ext.as_str(),
-            "mp3" | "ogg" | "oga" | "opus" | "wav" | "m4a" | "aac" | "flac"
-        );
+        let is_audio_ext = crate::audio_normalizer::AUDIO_EXTENSIONS.contains(&ext.as_str());
 
         // Derive filename from the path if not explicitly provided
         let filename_hint = input["filename"]

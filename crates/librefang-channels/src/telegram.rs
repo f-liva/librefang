@@ -602,12 +602,8 @@ impl TelegramAdapter {
         data: Vec<u8>,
         filename: &str,
         mime_type: &str,
-        caption: Option<&str>,
         thread_id: Option<i64>,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        let extra: Vec<(&str, String)> = caption
-            .map(|c| vec![("caption", c.to_string())])
-            .unwrap_or_default();
         self.api_send_media_upload(
             "sendVoice",
             "voice",
@@ -615,36 +611,21 @@ impl TelegramAdapter {
             data,
             filename,
             mime_type,
-            if extra.is_empty() { None } else { Some(&extra) },
+            None,
             thread_id,
         )
         .await
     }
 
-    /// Upload a generic audio file via `sendAudio` (MP3 / M4A / etc.
-    /// with optional title / performer metadata).
-    #[allow(clippy::too_many_arguments)]
+    /// Upload a generic audio file via `sendAudio`.
     async fn api_send_audio_upload(
         &self,
         chat_id: i64,
         data: Vec<u8>,
         filename: &str,
         mime_type: &str,
-        caption: Option<&str>,
-        title: Option<&str>,
-        performer: Option<&str>,
         thread_id: Option<i64>,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        let mut extra: Vec<(&str, String)> = Vec::new();
-        if let Some(c) = caption {
-            extra.push(("caption", c.to_string()));
-        }
-        if let Some(t) = title {
-            extra.push(("title", t.to_string()));
-        }
-        if let Some(p) = performer {
-            extra.push(("performer", p.to_string()));
-        }
         self.api_send_media_upload(
             "sendAudio",
             "audio",
@@ -652,7 +633,7 @@ impl TelegramAdapter {
             data,
             filename,
             mime_type,
-            if extra.is_empty() { None } else { Some(&extra) },
+            None,
             thread_id,
         )
         .await
@@ -1532,15 +1513,11 @@ impl TelegramAdapter {
                 let is_voice_note =
                     is_audio && (mime_type.contains("opus") || mime_type.contains("ogg"));
                 if is_voice_note {
-                    self.api_send_voice_upload(
-                        chat_id, data, &filename, &mime_type, None, thread_id,
-                    )
-                    .await?;
+                    self.api_send_voice_upload(chat_id, data, &filename, &mime_type, thread_id)
+                        .await?;
                 } else if is_audio {
-                    self.api_send_audio_upload(
-                        chat_id, data, &filename, &mime_type, None, None, None, thread_id,
-                    )
-                    .await?;
+                    self.api_send_audio_upload(chat_id, data, &filename, &mime_type, thread_id)
+                        .await?;
                 } else {
                     self.api_send_document_upload(chat_id, data, &filename, &mime_type, thread_id)
                         .await?;

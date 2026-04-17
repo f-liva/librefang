@@ -190,8 +190,7 @@ impl WhatsAppAdapter {
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let spool_dir = std::env::temp_dir().join("librefang_audio_out");
         tokio::fs::create_dir_all(&spool_dir).await?;
-        let ext = if ext_hint.is_empty() { "bin" } else { ext_hint };
-        let path = spool_dir.join(format!("{}.{}", uuid::Uuid::new_v4(), ext));
+        let path = spool_dir.join(format!("{}.{ext_hint}", uuid::Uuid::new_v4()));
         tokio::fs::write(&path, data).await?;
 
         let url = format!("{}/message/send-audio", gateway_url.trim_end_matches('/'));
@@ -292,6 +291,9 @@ impl ChannelAdapter for WhatsAppAdapter {
             } = content
             {
                 if mime_type.starts_with("audio/") {
+                    // Mirrors `librefang_runtime::audio_normalizer::mime_is_voice_note`;
+                    // duplicated inline because librefang-channels cannot depend on
+                    // librefang-runtime (would create a cycle).
                     let is_voice_note = mime_type.contains("opus") || mime_type.contains("ogg");
                     let ext = std::path::Path::new(filename.as_str())
                         .extension()
