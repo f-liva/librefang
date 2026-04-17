@@ -550,6 +550,7 @@ async fn summarize_messages(
     );
 
     let request = CompletionRequest {
+        agent_id: None,
         model: model.to_string(),
         messages: vec![Message {
             role: Role::User,
@@ -673,6 +674,7 @@ async fn summarize_in_chunks(
     );
 
     let merge_request = CompletionRequest {
+        agent_id: None,
         model: model.to_string(),
         messages: vec![Message {
             role: Role::User,

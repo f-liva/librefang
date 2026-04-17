@@ -63,7 +63,7 @@ pub enum LlmError {
 }
 
 /// A request to an LLM for completion.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct CompletionRequest {
     /// Model identifier.
     pub model: String,
@@ -101,6 +101,14 @@ pub struct CompletionRequest {
     /// When keys conflict with standard parameters (temperature, max_tokens, etc.),
     /// values from `extra_body` take precedence (last-wins in JSON serialization).
     pub extra_body: Option<HashMap<String, serde_json::Value>>,
+    /// Identity of the agent issuing this completion, when known.
+    ///
+    /// Drivers that expose LibreFang's built-in tools back to the LLM (e.g.
+    /// the Claude Code MCP bridge) use this to route the inbound
+    /// `tools/call` request to the right workspace and context. `None` for
+    /// any request that is not bound to a LibreFang agent — ad-hoc utility
+    /// calls, HTTP `/mcp` playground sessions, tests.
+    pub agent_id: Option<String>,
 }
 
 /// A response from an LLM completion.
@@ -414,6 +422,7 @@ mod tests {
             response_format: None,
             timeout_secs: None,
             extra_body: None,
+            agent_id: None,
         };
 
         let response = driver.stream(request, tx).await.unwrap();

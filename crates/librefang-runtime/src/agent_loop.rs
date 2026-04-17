@@ -2339,6 +2339,7 @@ pub async fn run_agent_loop(
             } else {
                 Some(manifest.model.extra_params.clone())
             },
+            agent_id: Some(agent_id_str.clone()),
         };
 
         // Notify phase: Thinking
@@ -3338,6 +3339,7 @@ pub async fn run_agent_loop_streaming(
             } else {
                 Some(manifest.model.extra_params.clone())
             },
+            agent_id: Some(agent_id_str.clone()),
         };
 
         // Notify phase: on first iteration emit Streaming; on subsequent
