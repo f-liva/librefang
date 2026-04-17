@@ -58,6 +58,31 @@ upstream/main ──────────────────────
 
 **Never push to upstream** — always via PR from a branch on fork.
 
+## MANDATORY: Live-test on fork/custom before any upstream PR
+
+No feature or fix is allowed to leave the fork as an upstream PR until
+it has first been **committed to `fork/custom`, built by the fork CI,
+deployed on the NAS, and exercised live by the Signore**. Upstream
+reviewers should never be the first people to see a behavioural
+change.
+
+Procedure:
+
+1. Implement on `feat/<feature>` branched from `upstream/main`.
+2. Push the feature branch to `fork` (visibility only — no PR yet).
+3. Cherry-pick the commit to `fork/custom`.
+4. `git push fork custom` — CI builds `fliva/librefang:latest`.
+5. NAS: `lzc-docker pull fliva/librefang:latest` + `lzc-docker compose
+   up -d --force-recreate librefang`.
+6. Signore smoke-tests the real behaviour end-to-end.
+7. Only after a green live test (and Signore's explicit OK) may an
+   upstream PR be opened from the feature branch.
+
+Skipping the live test — even for "trivial" changes — is not allowed.
+The audio-normalizer waveform incident (2026-04-17) landed the wrong
+implementation in a fork PR before any fork-custom live run; the
+redo cost a whole task cycle.
+
 ## CI workflow (on fork/custom)
 
 `.github/workflows/sync-build.yml`:
