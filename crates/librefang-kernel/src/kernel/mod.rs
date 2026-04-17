@@ -11365,6 +11365,7 @@ impl KernelHandle for LibreFangKernel {
             data,
             filename: filename.to_string(),
             mime_type: mime_type.to_string(),
+            voice_waveform: None,
         };
 
         if let Some(tid) = thread_id {
@@ -11381,6 +11382,63 @@ impl KernelHandle for LibreFangKernel {
 
         Ok(format!(
             "File '{}' sent to {} via {}",
+            filename, recipient, channel
+        ))
+    }
+
+    async fn send_channel_voice_data(
+        &self,
+        channel: &str,
+        recipient: &str,
+        data: Vec<u8>,
+        filename: &str,
+        mime_type: &str,
+        waveform: Option<Vec<u8>>,
+        thread_id: Option<&str>,
+    ) -> Result<String, String> {
+        let adapter = self
+            .channel_adapters
+            .get(channel)
+            .ok_or_else(|| {
+                let available: Vec<String> = self
+                    .channel_adapters
+                    .iter()
+                    .map(|e| e.key().clone())
+                    .collect();
+                format!(
+                    "Channel '{}' not found. Available channels: {:?}",
+                    channel, available
+                )
+            })?
+            .clone();
+
+        let user = librefang_channels::types::ChannelUser {
+            platform_id: recipient.to_string(),
+            display_name: recipient.to_string(),
+            librefang_user: None,
+        };
+
+        let content = librefang_channels::types::ChannelContent::FileData {
+            data,
+            filename: filename.to_string(),
+            mime_type: mime_type.to_string(),
+            voice_waveform: waveform,
+        };
+
+        if let Some(tid) = thread_id {
+            adapter
+                .send_in_thread(&user, content, tid)
+                .await
+                .map_err(|e| format!("Channel voice send failed: {e}"))?;
+        } else {
+            adapter
+                .send(&user, content)
+                .await
+                .map_err(|e| format!("Channel voice send failed: {e}"))?;
+        }
+
+        Ok(format!(
+            "Voice '{}' sent to {} via {}",
             filename, recipient, channel
         ))
     }

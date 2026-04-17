@@ -316,6 +316,31 @@ pub trait KernelHandle: Send + Sync {
         Err("Channel file data send not available".to_string())
     }
 
+    /// Send a voice-note audio payload with an optional precomputed
+    /// waveform envelope. Used by the `channel_send` tool when the
+    /// audio normalizer has shaped the payload for a PTT-style
+    /// channel (WhatsApp) and produced the 64-byte RMS summary that
+    /// clients render as voice-bubble waves.
+    ///
+    /// Default impl drops the waveform and falls back to
+    /// [`send_channel_file_data`] so existing non-kernel handles
+    /// (tests, stubs) stay compatible.
+    #[allow(clippy::too_many_arguments)]
+    async fn send_channel_voice_data(
+        &self,
+        channel: &str,
+        recipient: &str,
+        data: Vec<u8>,
+        filename: &str,
+        mime_type: &str,
+        waveform: Option<Vec<u8>>,
+        thread_id: Option<&str>,
+    ) -> Result<String, String> {
+        let _ = waveform;
+        self.send_channel_file_data(channel, recipient, data, filename, mime_type, thread_id)
+            .await
+    }
+
     #[allow(clippy::too_many_arguments)]
     async fn send_channel_poll(
         &self,

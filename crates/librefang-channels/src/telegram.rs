@@ -1503,6 +1503,11 @@ impl TelegramAdapter {
                 data,
                 filename,
                 mime_type,
+                // Telegram Bot API doesn't expose a waveform field on
+                // `sendVoice`; the client generates the waveform from
+                // the decoded Opus stream itself, so the field from
+                // the normalizer is intentionally ignored here.
+                voice_waveform: _,
             } => {
                 // Audio payloads take the voice / audio path so the
                 // chat renders a voice bubble or a music card instead

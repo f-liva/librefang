@@ -3106,7 +3106,7 @@ async function loadAudioBytes(sourceRef) {
   });
 }
 
-async function sendAudio(to, audioUrl, ptt = true) {
+async function sendAudio(to, audioUrl, ptt = true, waveform = null) {
   if (!sock || connStatus !== 'connected') {
     throw new Error('WhatsApp not connected');
   }
@@ -3122,6 +3122,15 @@ async function sendAudio(to, audioUrl, ptt = true) {
 
   // ptt: true sends as a voice note (push-to-talk bubble); false sends as audio file
   const audioMsg = { audio: buffer, mimetype: 'audio/ogg; codecs=opus', ptt };
+
+  // Waveform is computed upstream by the Rust audio normalizer and
+  // handed to us as a 64-byte RMS envelope. Baileys injects it into
+  // the `AudioMessage` protobuf; WhatsApp Web uses it to render real
+  // voice-bubble waves instead of the flat placeholder bar that
+  // shows up when the field is missing.
+  if (ptt && waveform && Buffer.isBuffer(waveform) && waveform.length === 64) {
+    audioMsg.waveform = waveform;
+  }
 
   const sent = await sock.sendMessage(jid, audioMsg);
   dbSaveMessage({
@@ -3271,14 +3280,27 @@ const server = http.createServer(async (req, res) => {
     // POST /message/send-audio — send audio file or voice note via URL
     if (req.method === 'POST' && path === '/message/send-audio') {
       const body = await parseBody(req);
-      const { to, audio_url, ptt } = body;
+      const { to, audio_url, ptt, waveform } = body;
 
       if (!to || !audio_url) {
         return jsonResponse(req, res, 400, { error: 'Missing "to" or "audio_url" field' });
       }
 
+      // Waveform arrives as base64 from the Rust audio normalizer.
+      // Must decode to a 64-byte Buffer; anything else is ignored so
+      // a malformed client can't crash the send path.
+      let waveformBuf = null;
+      if (typeof waveform === 'string' && waveform.length > 0) {
+        try {
+          const decoded = Buffer.from(waveform, 'base64');
+          if (decoded.length === 64) {
+            waveformBuf = decoded;
+          }
+        } catch { /* malformed base64 → drop, send without waveform */ }
+      }
+
       // ptt (push-to-talk) defaults to true — sends as voice note bubble
-      await sendAudio(to, audio_url, ptt !== false);
+      await sendAudio(to, audio_url, ptt !== false, waveformBuf);
       return jsonResponse(req, res, 200, { success: true, message: 'Audio sent' });
     }
 

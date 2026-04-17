@@ -179,7 +179,11 @@ impl WhatsAppAdapter {
     /// reads `/tmp/librefang_*` directly, so we can avoid a round-trip
     /// through a loopback HTTP server. `ptt=true` makes Baileys deliver
     /// the payload as a voice-note bubble; `false` surfaces it as a
-    /// generic audio attachment.
+    /// generic audio attachment. `waveform`, when provided, is a
+    /// 64-byte RMS envelope computed upstream by the audio normalizer;
+    /// it's base64-encoded into the request body so the gateway can
+    /// feed it straight into Baileys' `AudioMessage.waveform` without
+    /// re-running ffmpeg itself.
     async fn gateway_send_audio_bytes(
         &self,
         gateway_url: &str,
@@ -187,6 +191,7 @@ impl WhatsAppAdapter {
         data: &[u8],
         ptt: bool,
         ext_hint: &str,
+        waveform: Option<&[u8]>,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let spool_dir = std::env::temp_dir().join("librefang_audio_out");
         tokio::fs::create_dir_all(&spool_dir).await?;
@@ -194,11 +199,16 @@ impl WhatsAppAdapter {
         tokio::fs::write(&path, data).await?;
 
         let url = format!("{}/message/send-audio", gateway_url.trim_end_matches('/'));
-        let body = serde_json::json!({
+        let mut body = serde_json::json!({
             "to": to,
             "audio_url": format!("file://{}", path.display()),
             "ptt": ptt,
         });
+        if let Some(wf) = waveform {
+            use base64::Engine;
+            let encoded = base64::engine::general_purpose::STANDARD.encode(wf);
+            body["waveform"] = serde_json::Value::String(encoded);
+        }
         let resp = self.client.post(&url).json(&body).send().await;
 
         // Best-effort cleanup: the gateway reads the file synchronously
@@ -288,6 +298,7 @@ impl ChannelAdapter for WhatsAppAdapter {
                 ref data,
                 ref filename,
                 ref mime_type,
+                ref voice_waveform,
             } = content
             {
                 if mime_type.starts_with("audio/") {
@@ -299,8 +310,15 @@ impl ChannelAdapter for WhatsAppAdapter {
                         .extension()
                         .and_then(|e| e.to_str())
                         .unwrap_or(if is_voice_note { "ogg" } else { "mp3" });
-                    self.gateway_send_audio_bytes(gw, &user.platform_id, data, is_voice_note, ext)
-                        .await?;
+                    self.gateway_send_audio_bytes(
+                        gw,
+                        &user.platform_id,
+                        data,
+                        is_voice_note,
+                        ext,
+                        voice_waveform.as_deref(),
+                    )
+                    .await?;
                     return Ok(());
                 }
             }

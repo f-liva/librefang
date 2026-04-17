@@ -132,6 +132,12 @@ pub enum ChannelContent {
         data: Vec<u8>,
         filename: String,
         mime_type: String,
+        /// Optional 64-byte WhatsApp/Signal voice-note waveform envelope.
+        /// Populated by the audio normalizer for PTT deliveries so the
+        /// client renders real waves instead of a flat bar. Ignored by
+        /// non-voice callers and by adapters that don't surface it.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        voice_waveform: Option<Vec<u8>>,
     },
     Voice {
         url: String,

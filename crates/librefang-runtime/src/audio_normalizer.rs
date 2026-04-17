@@ -99,6 +99,12 @@ pub struct NormalizedAudio {
     /// True when we actually ran `ffmpeg`. False means the source
     /// already matched the profile and we just read the bytes back.
     pub transcoded: bool,
+    /// 64-byte RMS envelope, normalised 0–100, for WhatsApp voice
+    /// notes. `None` when the profile doesn't use a waveform or when
+    /// the extraction step failed — adapters treat `None` as "send
+    /// without waveform" rather than as an error so a flat-bar
+    /// voice note is still delivered.
+    pub waveform: Option<Vec<u8>>,
     /// Temporary on-disk artefact, cleaned up when this guard drops.
     /// Present only when transcode ran.
     _temp: Option<TempFile>,
@@ -116,6 +122,145 @@ pub const AUDIO_EXTENSIONS: &[&str] = &["mp3", "ogg", "oga", "opus", "wav", "m4a
 /// centralised here so it can't drift between them.
 pub fn mime_is_voice_note(mime: &str) -> bool {
     mime.contains("opus") || mime.contains("ogg")
+}
+
+/// Voice-note waveform: 64 bytes, one per window of RMS amplitude
+/// scaled to 0..=100 with a small floor so no bar renders as a
+/// completely invisible pixel.
+const WAVEFORM_SAMPLES: usize = 64;
+const WAVEFORM_FLOOR: u8 = 3;
+const WAVEFORM_TIMEOUT: Duration = Duration::from_secs(3);
+
+/// Compute the 64-byte WhatsApp voice-note waveform for an Ogg/Opus
+/// payload. Pipes the buffer through ffmpeg to PCM mono s16le 8 kHz,
+/// chunks the samples into 64 equal-size windows, takes the RMS of
+/// each window, normalises the peak window to 100, clamps below
+/// `WAVEFORM_FLOOR`. Returns `None` on any failure (missing ffmpeg,
+/// corrupt input, timeout, empty output) so the caller can fall back
+/// to sending without a waveform — a flat-bar voice note is still
+/// better than a failed send.
+pub async fn compute_voice_waveform(ogg_bytes: &[u8]) -> Option<Vec<u8>> {
+    if ogg_bytes.is_empty() {
+        return None;
+    }
+
+    use std::process::Stdio;
+    use tokio::io::AsyncWriteExt;
+
+    let mut child = match tokio::process::Command::new("ffmpeg")
+        .args([
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-f",
+            "ogg",
+            "-i",
+            "pipe:0",
+            "-vn",
+            "-ac",
+            "1",
+            "-ar",
+            "8000",
+            "-f",
+            "s16le",
+            "pipe:1",
+        ])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+    {
+        Ok(c) => c,
+        Err(e) => {
+            warn!("audio_normalizer: waveform ffmpeg spawn failed: {e}");
+            return None;
+        }
+    };
+
+    // Feed stdin concurrently so ffmpeg's stdout pipe doesn't fill up
+    // before we've written the whole input.
+    if let Some(mut stdin) = child.stdin.take() {
+        let bytes = ogg_bytes.to_vec();
+        tokio::spawn(async move {
+            let _ = stdin.write_all(&bytes).await;
+            let _ = stdin.shutdown().await;
+        });
+    }
+
+    let mut stdout = child.stdout.take().expect("stdout piped");
+    let stdout_task = tokio::spawn(async move {
+        let mut buf = Vec::new();
+        let _ = stdout.read_to_end(&mut buf).await;
+        buf
+    });
+
+    let status = match tokio::time::timeout(WAVEFORM_TIMEOUT, child.wait()).await {
+        Ok(Ok(s)) => s,
+        Ok(Err(e)) => {
+            warn!("audio_normalizer: waveform ffmpeg wait failed: {e}");
+            return None;
+        }
+        Err(_) => {
+            let _ = child.start_kill();
+            let _ = child.wait().await;
+            warn!("audio_normalizer: waveform ffmpeg timed out");
+            return None;
+        }
+    };
+
+    if !status.success() {
+        warn!("audio_normalizer: waveform ffmpeg exit {}", status);
+        return None;
+    }
+
+    let pcm = stdout_task.await.unwrap_or_default();
+    if pcm.len() < 2 {
+        return None;
+    }
+
+    let sample_count = pcm.len() / 2;
+    let window = std::cmp::max(1, sample_count / WAVEFORM_SAMPLES);
+    let mut rms = [0f64; WAVEFORM_SAMPLES];
+    let mut peak = 0f64;
+
+    for (i, slot) in rms.iter_mut().enumerate() {
+        let start = i * window;
+        let end = if i == WAVEFORM_SAMPLES - 1 {
+            sample_count
+        } else {
+            std::cmp::min(sample_count, start + window)
+        };
+        if start >= end {
+            continue;
+        }
+        let mut sum_sq = 0f64;
+        let mut count = 0usize;
+        for j in start..end {
+            let lo = pcm[j * 2] as i16;
+            let hi = pcm[j * 2 + 1] as i16;
+            let s = ((hi << 8) | (lo & 0xff)) as f64;
+            sum_sq += s * s;
+            count += 1;
+        }
+        let r = if count > 0 {
+            (sum_sq / count as f64).sqrt()
+        } else {
+            0.0
+        };
+        *slot = r;
+        if r > peak {
+            peak = r;
+        }
+    }
+
+    let mut out = vec![WAVEFORM_FLOOR; WAVEFORM_SAMPLES];
+    if peak > 0.0 {
+        for (i, &r) in rms.iter().enumerate() {
+            let normalised = ((r / peak) * 100.0).round() as i32;
+            out[i] = normalised.max(WAVEFORM_FLOOR as i32).min(100) as u8;
+        }
+    }
+    Some(out)
 }
 
 /// RAII guard for the transcode output file.
@@ -248,6 +393,12 @@ async fn normalize_whatsapp_voice_note(
         (bytes, None)
     };
 
+    // WhatsApp Web renders a flat bar when `AudioMessage.waveform` is
+    // absent. Compute the 64-byte RMS envelope from the Ogg we're
+    // about to send; on any failure, log and deliver without a
+    // waveform (better than a failed send).
+    let waveform = compute_voice_waveform(&data).await;
+
     Ok(NormalizedAudio {
         data,
         mime_type: "audio/ogg; codecs=opus".to_string(),
@@ -256,6 +407,7 @@ async fn normalize_whatsapp_voice_note(
         is_voice_note: true,
         profile: ChannelProfile::WhatsApp,
         transcoded: needs_transcode,
+        waveform,
         _temp: tmp,
     })
 }
@@ -284,6 +436,7 @@ async fn normalize_opus_voice_note(
         is_voice_note: true,
         profile,
         transcoded: needs_transcode,
+        waveform: None,
         _temp: tmp,
     })
 }
@@ -303,6 +456,7 @@ async fn transcode_to_mp3(
         is_voice_note: false,
         profile,
         transcoded: true,
+        waveform: None,
         _temp: Some(guard),
     })
 }
@@ -326,6 +480,7 @@ async fn pass_through(
         is_voice_note,
         profile,
         transcoded: false,
+        waveform: None,
         _temp: None,
     })
 }
@@ -831,6 +986,29 @@ mod tests {
         assert!(out.transcoded);
         // First 4 bytes of an Ogg stream are always "OggS".
         assert_eq!(&out.data[..4], b"OggS", "output is not an Ogg container");
+
+        // Waveform must be attached for WhatsApp voice notes: 64 bytes,
+        // every value in 0..=100, peak == 100, floor respected.
+        let waveform = out.waveform.as_ref().expect("waveform present for WA");
+        assert_eq!(waveform.len(), 64, "waveform is always 64 bytes");
+        for (i, &v) in waveform.iter().enumerate() {
+            assert!(v <= 100, "waveform[{i}] = {v} > 100");
+            assert!(
+                v >= WAVEFORM_FLOOR,
+                "waveform[{i}] = {v} < floor {WAVEFORM_FLOOR}"
+            );
+        }
+        let peak = waveform.iter().copied().max().unwrap_or(0);
+        assert_eq!(
+            peak, 100,
+            "peak window must be normalised to 100, got {peak}"
+        );
+    }
+
+    #[tokio::test]
+    async fn compute_voice_waveform_returns_none_on_empty_input() {
+        let out = compute_voice_waveform(&[]).await;
+        assert!(out.is_none(), "empty input must produce no waveform");
     }
 
     #[tokio::test]
