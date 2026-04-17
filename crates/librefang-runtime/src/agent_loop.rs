@@ -9,7 +9,9 @@ use crate::context_engine::ContextEngine;
 use crate::context_overflow::{recover_from_overflow, RecoveryStage};
 use crate::embedding::EmbeddingDriver;
 use crate::kernel_handle::KernelHandle;
-use crate::llm_driver::{CompletionRequest, LlmDriver, LlmError, StreamEvent};
+use crate::llm_driver::{
+    CompletionRequest, LlmDriver, LlmError, StreamEvent, PHASE_RESPONSE_COMPLETE,
+};
 use crate::llm_errors;
 use crate::loop_guard::{LoopGuard, LoopGuardConfig, LoopGuardVerdict};
 use crate::mcp::McpConnection;
@@ -64,6 +66,20 @@ const MAX_CONSECUTIVE_ALL_FAILED: u32 = 3;
 /// Marker included in timeout error messages when partial output was delivered.
 /// Used by channel_bridge to detect this case without fragile string matching.
 pub const TIMEOUT_PARTIAL_OUTPUT_MARKER: &str = "[partial_output_delivered]";
+
+/// Notify the stream consumer that the LLM has finished producing text for
+/// this turn so the UI can unblock input before the agent loop's remaining
+/// post-processing (session persistence, proactive memory extraction) lands
+/// the final `response` event. Fire-and-forget: send failures are ignored
+/// because a disconnected consumer is not fatal to the turn.
+async fn signal_response_complete(tx: &mpsc::Sender<StreamEvent>) {
+    let _ = tx
+        .send(StreamEvent::PhaseChange {
+            phase: PHASE_RESPONSE_COMPLETE.to_string(),
+            detail: None,
+        })
+        .await;
+}
 
 /// Check if a response is a silent-reply sentinel.
 ///
@@ -3695,6 +3711,8 @@ pub async fn run_agent_loop_streaming(
                 );
                 final_response = text.clone();
 
+                signal_response_complete(&stream_tx).await;
+
                 return finalize_successful_end_turn(
                     FinalizeEndTurnContext {
                         manifest,
@@ -3925,6 +3943,7 @@ pub async fn run_agent_loop_streaming(
                         }),
                     };
                     fire_hook_best_effort(hooks, &ctx);
+                    signal_response_complete(&stream_tx).await;
                     return Ok(AgentLoopResult {
                         response: text,
                         total_usage,
@@ -4764,14 +4783,14 @@ mod tests {
     /// to the allow-list with rationale.
     ///
     /// Allow-list rationale:
-    /// - silent_response.rs           — canonical detector + tests
-    /// - agent_loop.rs                — kept for the heartbeat back-write
-    ///                                  ("[no reply needed]") and tests
-    /// - session_repair.rs            — heartbeat-prune predicate (delegates)
-    /// - reply_directives.rs          — back-compat parse-through test
-    /// - prompt_builder.rs            — explanatory prompt text (post-rewrite
-    ///                                  references the token internally)
-    /// - drivers/claude_code.rs       — driver-side suppression (delegates)
+    /// - silent_response.rs — canonical detector + tests
+    /// - agent_loop.rs — kept for the heartbeat back-write
+    ///   ("[no reply needed]") and tests
+    /// - session_repair.rs — heartbeat-prune predicate (delegates)
+    /// - reply_directives.rs — back-compat parse-through test
+    /// - prompt_builder.rs — explanatory prompt text (post-rewrite
+    ///   references the token internally)
+    /// - drivers/claude_code.rs — driver-side suppression (delegates)
     #[test]
     fn silent_response_single_source_of_truth() {
         use std::process::Command;
