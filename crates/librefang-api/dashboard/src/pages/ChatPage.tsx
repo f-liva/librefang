@@ -1,12 +1,18 @@
-import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { formatCost } from "../lib/format";
 import { memo, useEffect, useMemo, useRef, useState, useCallback } from "react";
 import rehypeKatex from "rehype-katex";
 import remarkMath from "remark-math";
 import { useTranslation } from "react-i18next";
 import { useNavigate, useSearch } from "@tanstack/react-router";
-import { buildAuthenticatedWebSocketUrl, listAgents, sendAgentMessage, loadAgentSession, listPendingApprovals, resolveApproval, getFullConfig, listAgentSessions, createAgentSession, switchAgentSession, deleteSession, listModels, patchAgentConfig, listMediaProviders, listActiveHands } from "../api";
+import { buildAuthenticatedWebSocketUrl, sendAgentMessage, loadAgentSession } from "../api";
 import type { ApprovalItem, SessionListItem, ModelItem, AgentTool, AgentItem } from "../api";
+import { useFullConfig } from "../lib/queries/config";
+import { useMediaProviders } from "../lib/queries/media";
+import { useModels, modelQueries } from "../lib/queries/models";
+import { usePendingApprovals } from "../lib/queries/approvals";
+import { useAgents, useAgentSessions } from "../lib/queries/agents";
+import { useActiveHandsWhen } from "../lib/queries/hands";
+import { approvalKeys } from "../lib/queries/keys";
 import { groupedPicker } from "../lib/chatPicker";
 import { normalizeToolOutput } from "../lib/chat";
 import { useTtsManager } from "../lib/tts";
@@ -19,6 +25,13 @@ import { ToolCallCard } from "../components/ui/ToolCallCard";
 import { filterVisible } from "../lib/hiddenModels";
 import { useVoiceInput } from "../lib/useVoiceInput";
 import { Typewriter_v2 } from "../components/Typewriter_v2";
+import {
+  useCreateAgentSession,
+  useDeleteAgentSession,
+  usePatchAgentConfig,
+  useResolveApproval,
+  useSwitchAgentSession,
+} from "../lib/mutations/agents";
 import "katex/dist/katex.min.css";
 
 const isAuthUnavailable = (status?: string) =>
@@ -167,6 +180,17 @@ function useChatMessages(agentId: string | null, agents: any[] = [], sessionVers
       return next;
     });
   }, []);
+  // Tracks the bot message id of the most recent send per agent. Message
+  // handlers for an older turn must NOT clear `isLoading` when a newer turn
+  // is already in flight (user can now type + send while the previous turn's
+  // `response` event is still pending — see `ChatInput` inputDisabled split).
+  const latestTurnRef = useRef<Record<string, string>>({});
+  const finishTurnIfCurrent = useCallback((agent: string, botId: string) => {
+    if (latestTurnRef.current[agent] === botId) {
+      setAgentLoading(agent, false);
+      delete latestTurnRef.current[agent];
+    }
+  }, [setAgentLoading]);
   // Garbage-collect loading flags for agents that no longer exist so the
   // map doesn't accumulate dead entries over a long session.
   useEffect(() => {
@@ -179,6 +203,11 @@ function useChatMessages(agentId: string | null, agents: any[] = [], sessionVers
       }
       return changed ? next : prev;
     });
+
+    const latestTurns = latestTurnRef.current;
+    for (const id of Object.keys(latestTurns)) {
+      if (!alive.has(id)) delete latestTurns[id];
+    }
   }, [agents]);
   const { ws, wsConnected, onDropRef } = useWebSocket(agentId);
   const addSkillOutput = useUIStore((s) => s.addSkillOutput);
@@ -384,6 +413,7 @@ function useChatMessages(agentId: string | null, agents: any[] = [], sessionVers
 
     setMessages(prev => [...prev, userMsg, botMsg]);
     setAgentLoading(sendAgentId, true);
+    latestTurnRef.current[sendAgentId] = botMsg.id;
 
     // Helper: send via HTTP (used as primary fallback and WS drop recovery)
     const sendViaHttp = async () => {
@@ -418,7 +448,7 @@ function useChatMessages(agentId: string | null, agents: any[] = [], sessionVers
           m.id === botMsg.id ? { ...m, isStreaming: false, error: errorMsg } : m
         ));
       } finally {
-        setAgentLoading(sendAgentId, false);
+        finishTurnIfCurrent(sendAgentId, botMsg.id);
       }
     };
 
@@ -520,7 +550,7 @@ function useChatMessages(agentId: string | null, agents: any[] = [], sessionVers
               }
             } else if (data.type === "silent_complete") {
               updateAgentMessages(sendAgentId, prev => prev.filter(m => m.id !== botMsg.id));
-              setAgentLoading(sendAgentId, false);
+              finishTurnIfCurrent(sendAgentId, botMsg.id);
               cleanup();
             } else if (data.type === "error") {
               const error = data.content || "WebSocket error";
@@ -548,7 +578,7 @@ function useChatMessages(agentId: string | null, agents: any[] = [], sessionVers
                     }
                   : m
               ));
-              setAgentLoading(sendAgentId, false);
+              finishTurnIfCurrent(sendAgentId, botMsg.id);
               cleanup();
             }
           } catch {
@@ -586,7 +616,7 @@ function useChatMessages(agentId: string | null, agents: any[] = [], sessionVers
 
     // HTTP fallback — direct, no fake streaming
     await sendViaHttp();
-  }, [agentId, agents, wsConnected, ws, deepThinking, showThinkingProcess]);
+  }, [agentId, agents, wsConnected, ws, deepThinking, showThinkingProcess, finishTurnIfCurrent]);
 
   const clearHistory = useCallback(() => setMessages([]), []);
 
@@ -803,7 +833,7 @@ const MessageBubble = memo(function MessageBubble({ message, usageFooter, onCopy
 });
 
 // Input box - with shortcut hints
-function ChatInput({ onSend, disabled, placeholder, authMissing, authStatus, providerName, supportsThinking, sttAvailable }: { onSend: (msg: string) => void; disabled: boolean; placeholder: string; authMissing?: boolean; authStatus?: string; providerName?: string; supportsThinking?: boolean; sttAvailable?: boolean }) {
+function ChatInput({ onSend, disabled, inputDisabled, placeholder, authMissing, authStatus, providerName, supportsThinking, sttAvailable }: { onSend: (msg: string) => void; disabled: boolean; inputDisabled?: boolean; placeholder: string; authMissing?: boolean; authStatus?: string; providerName?: string; supportsThinking?: boolean; sttAvailable?: boolean }) {
   const { t } = useTranslation();
   const [message, setMessage] = useState("");
   const [activeIndex, setActiveIndex] = useState(-1);
@@ -826,12 +856,7 @@ function ChatInput({ onSend, disabled, placeholder, authMissing, authStatus, pro
     [isSlashPrefix, message],
   );
 
-  const modelQuery = useQuery({
-    queryKey: ["models", "completion"],
-    queryFn: () => listModels(),
-    enabled: isModelArg,
-    staleTime: 60_000,
-  });
+  const modelQuery = useModels({}, { enabled: isModelArg });
 
   const modelArg = isModelArg ? message.slice(message.indexOf(" ") + 1).toLowerCase() : "";
   const filteredModels = useMemo(() => {
@@ -905,6 +930,12 @@ function ChatInput({ onSend, disabled, placeholder, authMissing, authStatus, pro
   }, [message]);
 
   const effectiveDisabled = disabled || !!authMissing;
+  // Textarea only locked while the agent is actively streaming text. Once the
+  // model emits `typing:stop` the user can start composing the next message
+  // even while background post-processing (memory save) is still running —
+  // the send button stays gated on `effectiveDisabled` until the `response`
+  // event arrives with final tokens/cost.
+  const textareaDisabled = (inputDisabled ?? disabled) || !!authMissing;
 
   return (
     <form onSubmit={handleSubmit} className="space-y-2">
@@ -995,7 +1026,7 @@ function ChatInput({ onSend, disabled, placeholder, authMissing, authStatus, pro
               }
             }}
             placeholder={voiceInput.isRecording ? t("chat.voice_recording") : voiceInput.isTranscribing ? t("chat.voice_transcribing") : placeholder}
-            disabled={effectiveDisabled}
+            disabled={textareaDisabled}
             rows={1}
             className="w-full min-h-[44px] sm:min-h-[52px] max-h-[150px] rounded-2xl border border-border-subtle bg-surface px-3 sm:px-5 py-2.5 sm:py-3.5 text-sm focus:border-brand focus:ring-2 focus:ring-brand/10 outline-none resize-none placeholder:text-text-dim/40 shadow-sm"
           />
@@ -1004,7 +1035,7 @@ function ChatInput({ onSend, disabled, placeholder, authMissing, authStatus, pro
           <button
             type="button"
             onClick={sttAvailable ? voiceInput.toggleRecording : undefined}
-            disabled={!sttAvailable || effectiveDisabled || voiceInput.isTranscribing}
+            disabled={!sttAvailable || textareaDisabled || voiceInput.isTranscribing}
             title={!sttAvailable ? t("chat.voice_not_configured") : voiceInput.isRecording ? t("chat.voice_stop") : t("chat.voice_input")}
             className={`group relative px-3 sm:px-3.5 py-2.5 sm:py-3.5 rounded-2xl font-bold text-sm transition-all duration-300 disabled:opacity-40 disabled:cursor-not-allowed ${
               voiceInput.isRecording
@@ -1042,6 +1073,7 @@ function ConnectionBar({ agentName, isLoading, messageCount, onClear, onExport, 
   webSearchAvailable?: boolean;
 }) {
   const { t } = useTranslation();
+  const queryClient = useQueryClient();
   const [sessionOpen, setSessionOpen] = useState(false);
   const dropdownRef = useRef<HTMLDivElement>(null);
 
@@ -1059,6 +1091,7 @@ function ConnectionBar({ agentName, isLoading, messageCount, onClear, onExport, 
 
   const hiddenModelKeys = useUIStore((s) => s.hiddenModelKeys);
   const hiddenSet = useMemo(() => new Set(hiddenModelKeys), [hiddenModelKeys]);
+  const patchAgentConfigMutation = usePatchAgentConfig();
 
   // Clear optimistic model once the real modelName catches up
   useEffect(() => {
@@ -1098,11 +1131,11 @@ function ConnectionBar({ agentName, isLoading, messageCount, onClear, onExport, 
     if (!modelOpen || models.length > 0 || modelLoading) return;
     setModelLoading(true);
     setModelFetchError(null);
-    listModels({ available: true })
-      .then(res => setModels(res.models))
+    queryClient.fetchQuery(modelQueries.list({ available: true }))
+      .then((res: { models: ModelItem[] }) => setModels(res.models))
       .catch(() => setModelFetchError(t("chat.unable_to_load_models")))
       .finally(() => setModelLoading(false));
-  }, [modelOpen, models.length, modelLoading]);
+  }, [modelOpen, models.length, modelLoading, queryClient, t]);
 
   const visibleModels = useMemo(() => filterVisible(models, hiddenSet), [models, hiddenSet]);
 
@@ -1143,7 +1176,10 @@ function ConnectionBar({ agentName, isLoading, messageCount, onClear, onExport, 
     setPatchPending(true);
     setPatchError(null);
     try {
-      await patchAgentConfig(agentId, { model: model.id, provider: model.provider });
+      await patchAgentConfigMutation.mutateAsync({
+        agentId,
+        config: { model: model.id, provider: model.provider },
+      });
       setModelOpen(false);
       setSelectedProvider("");
       setModelSearch("");
@@ -1448,17 +1484,12 @@ function ConnectionBar({ agentName, isLoading, messageCount, onClear, onExport, 
 // ---------------------------------------------------------------------------
 function useApprovalPoller(agentId: string | null) {
   const queryClient = useQueryClient();
-  const approvalsQuery = useQuery({
-    queryKey: ["approvals", "pending", agentId],
-    queryFn: () => listPendingApprovals(agentId!),
-    enabled: !!agentId,
-    refetchInterval: 5000,
-  });
+  const approvalsQuery = usePendingApprovals(agentId ?? undefined);
 
   const remove = useCallback((id: string) => {
     queryClient.setQueryData<ApprovalItem[]>(
-      ["approvals", "pending", agentId],
-      (prev) => prev?.filter((a) => a.id !== id) ?? [],
+      approvalKeys.pending(agentId),
+      (prev) => prev?.filter((a: ApprovalItem) => a.id !== id) ?? [],
     );
   }, [agentId, queryClient]);
 
@@ -1485,11 +1516,12 @@ function riskStyle(level?: string) {
 function ApprovalCard({ approval, onResolved }: { approval: ApprovalItem; onResolved: (id: string) => void }) {
   const { t } = useTranslation();
   const [resolving, setResolving] = useState<"approve" | "deny" | null>(null);
+  const resolveApprovalMutation = useResolveApproval();
 
   const handleResolve = async (approved: boolean) => {
     setResolving(approved ? "approve" : "deny");
     try {
-      await resolveApproval(approval.id, approved);
+      await resolveApprovalMutation.mutateAsync({ id: approval.id, approved });
       onResolved(approval.id);
     } catch {
       // Approval may have already been resolved or timed out
@@ -1566,7 +1598,6 @@ function ApprovalCard({ approval, onResolved }: { approval: ApprovalItem; onReso
 
 export function ChatPage() {
   const { t } = useTranslation();
-  const queryClient = useQueryClient();
   const navigate = useNavigate();
   const search = useSearch({ from: "/chat" });
   const initialAgentId = search?.agentId || "";
@@ -1574,6 +1605,10 @@ export function ChatPage() {
   const messagesEndRef = useRef<HTMLDivElement>(null);
   const [copiedMessageId, setCopiedMessageId] = useState<string | null>(null);
   const addToast = useUIStore((s) => s.addToast);
+  const createSessionMutation = useCreateAgentSession();
+  const switchSessionMutation = useSwitchAgentSession();
+  const deleteSessionMutation = useDeleteAgentSession();
+  const patchAgentConfigMutation = usePatchAgentConfig();
 
   // Sync agent selection to URL search params
   const selectAgent = useCallback((id: string) => {
@@ -1582,11 +1617,7 @@ export function ChatPage() {
   }, [navigate]);
 
   // Check TTS provider availability
-  const mediaProvidersQuery = useQuery({
-    queryKey: ["media-providers"],
-    queryFn: listMediaProviders,
-    staleTime: 60000,
-  });
+  const mediaProvidersQuery = useMediaProviders();
   const ttsAvailable = useMemo(
     () => (mediaProvidersQuery.data ?? []).some(p => p.configured && p.capabilities.includes("text_to_speech")),
     [mediaProvidersQuery.data],
@@ -1601,7 +1632,7 @@ export function ChatPage() {
     }
   }, [addToast, t]);
 
-  const configQuery = useQuery({ queryKey: ["config"], queryFn: getFullConfig, staleTime: 60000 });
+  const configQuery = useFullConfig();
   const usageFooter = (configQuery.data as Record<string, unknown>)?.usage_footer as string | undefined ?? "full";
   const mediaConfigRaw = (configQuery.data as Record<string, unknown>)?.media as Record<string, unknown> | undefined;
   const sttAvailable = mediaConfigRaw?.stt_available === true;
@@ -1654,20 +1685,10 @@ export function ChatPage() {
     );
   }, [showHandAgents]);
 
-  const agentsQuery = useQuery({
-    queryKey: ["agents", "list", "chat", showHandAgents],
-    queryFn: () => listAgents({ includeHands: showHandAgents }),
-    staleTime: 30000,
-  });
+  const agentsQuery = useAgents({ includeHands: showHandAgents });
   // Check if web search is available (any search API key configured)
   const webSearchAvailable = ((configQuery.data as any)?.web?.search_available === true);
-  const handsQuery = useQuery({
-    queryKey: ["hands", "active", "chat"],
-    queryFn: listActiveHands,
-    enabled: showHandAgents,
-    staleTime: 30000,
-    refetchInterval: 30000,
-  });
+  const handsQuery = useActiveHandsWhen(showHandAgents);
 
   const sortedAgents = useMemo(
     () =>
@@ -1705,8 +1726,13 @@ export function ChatPage() {
     selectedAgentId || null,
     agents,
     sessionVersion,
-    () => queryClient.invalidateQueries({ queryKey: ["agents", "list"] }),
+      () => void agentsQuery.refetch(),
   );
+  // Track LLM text streaming (cleared on `typing:stop`) independently of
+  // `isLoading`, which stays true through post-processing until the final
+  // `response` event. Textarea unblocks as soon as streaming ends so the user
+  // can compose the next message immediately.
+  const isStreaming = messages.some(m => m.role === "assistant" && m.isStreaming);
 
   // Export current conversation as a markdown file. Keeps the local
   // timestamp, role, content, and (when present) tool call summaries
@@ -1752,12 +1778,7 @@ export function ChatPage() {
   const selectedAgent = agents.find(a => a.id === selectedAgentId);
 
   // Per-agent session list
-  const sessionsQuery = useQuery({
-    queryKey: ["agent-sessions", selectedAgentId],
-    queryFn: () => listAgentSessions(selectedAgentId!),
-    enabled: !!selectedAgentId,
-    staleTime: 10_000,
-  });
+  const sessionsQuery = useAgentSessions(selectedAgentId);
   const activeSessionId = useMemo(() => {
     const active = sessionsQuery.data?.find((s: any) => s.active);
     return active?.session_id;
@@ -1765,25 +1786,20 @@ export function ChatPage() {
 
   const handleSwitchSession = useCallback(async (sessionId: string) => {
     if (!selectedAgentId) return;
-    await switchAgentSession(selectedAgentId, sessionId);
-    queryClient.invalidateQueries({ queryKey: ["agents"] });
-    queryClient.invalidateQueries({ queryKey: ["agent-sessions", selectedAgentId] });
+    await switchSessionMutation.mutateAsync({ agentId: selectedAgentId, sessionId });
     setSessionVersion(v => v + 1);
-  }, [selectedAgentId, queryClient]);
+  }, [selectedAgentId, switchSessionMutation]);
 
   const handleNewSession = useCallback(async () => {
     if (!selectedAgentId) return;
-    const result = await createAgentSession(selectedAgentId);
-    await switchAgentSession(selectedAgentId, result.session_id);
-    queryClient.invalidateQueries({ queryKey: ["agents"] });
-    queryClient.invalidateQueries({ queryKey: ["agent-sessions", selectedAgentId] });
+    const result = await createSessionMutation.mutateAsync({ agentId: selectedAgentId });
+    await switchSessionMutation.mutateAsync({ agentId: selectedAgentId, sessionId: result.session_id });
     setSessionVersion(v => v + 1);
-  }, [selectedAgentId, queryClient]);
+  }, [selectedAgentId, createSessionMutation, switchSessionMutation]);
 
   const handleDeleteSession = useCallback(async (sessionId: string) => {
-    await deleteSession(sessionId);
-    queryClient.invalidateQueries({ queryKey: ["agent-sessions", selectedAgentId] });
-  }, [selectedAgentId, queryClient]);
+    await deleteSessionMutation.mutateAsync({ sessionId, agentId: selectedAgentId });
+  }, [deleteSessionMutation, selectedAgentId]);
 
   // If the current selection is no longer visible (e.g. hand agents toggled
   // off while a hand-spawned agent was selected), clear it so the auto-select
@@ -1881,7 +1897,7 @@ export function ChatPage() {
             <h1 className="text-xl sm:text-3xl font-extrabold tracking-tight">{t("chat.title")}</h1>
           </div>
           <button
-            onClick={() => queryClient.invalidateQueries({ queryKey: ["agents", "list"] })}
+            onClick={() => void agentsQuery.refetch()}
             className="p-2 sm:p-2.5 rounded-xl hover:bg-surface-hover text-text-dim hover:text-brand transition-colors"
           >
             <RefreshCw className={`h-4 w-4 ${agentsQuery.isFetching ? "animate-spin" : ""}`} />
@@ -1993,14 +2009,16 @@ export function ChatPage() {
               onNewSession={handleNewSession}
               onDeleteSession={handleDeleteSession}
               agentId={selectedAgentId}
-              onModelChange={() => queryClient.invalidateQueries({ queryKey: ["agents", "list"] })}
+                onModelChange={() => void agentsQuery.refetch()}
               webSearchAugmentation={selectedAgent?.web_search_augmentation}
               webSearchAvailable={webSearchAvailable}
               onWebSearchChange={async (mode) => {
                 try {
-                  await patchAgentConfig(selectedAgentId, { web_search_augmentation: mode });
-                  queryClient.invalidateQueries({ queryKey: ["agents", "list"] });
-                  queryClient.invalidateQueries({ queryKey: ["dashboard", "snapshot"] });
+                  await patchAgentConfigMutation.mutateAsync({
+                    agentId: selectedAgentId,
+                    config: { web_search_augmentation: mode },
+                  });
+                  await agentsQuery.refetch();
                 } catch {}
               }}
             />
@@ -2059,7 +2077,8 @@ export function ChatPage() {
             <ChatInput
               onSend={sendMessage}
               disabled={isLoading}
-              placeholder={isLoading ? t("chat.generating") : selectedAgentId ? t("chat.input_placeholder_with_agent", { name: selectedAgent?.name }) : t("chat.transmit_command")}
+              inputDisabled={isStreaming}
+              placeholder={isStreaming ? t("chat.generating") : selectedAgentId ? t("chat.input_placeholder_with_agent", { name: selectedAgent?.name }) : t("chat.transmit_command")}
               authMissing={isAuthUnavailable(selectedAgent?.auth_status)}
               authStatus={selectedAgent?.auth_status}
               providerName={selectedAgent?.model_provider}
@@ -2072,3 +2091,4 @@ export function ChatPage() {
     </div>
   );
 }
+import { useQueryClient } from "@tanstack/react-query";

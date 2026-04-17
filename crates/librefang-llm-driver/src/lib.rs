@@ -101,6 +101,17 @@ pub struct CompletionRequest {
     /// When keys conflict with standard parameters (temperature, max_tokens, etc.),
     /// values from `extra_body` take precedence (last-wins in JSON serialization).
     pub extra_body: Option<HashMap<String, serde_json::Value>>,
+    /// Caller agent identity.
+    ///
+    /// When a CLI driver re-exposes LibreFang tools to the model through an
+    /// MCP bridge (e.g. `claude-code`'s `--mcp-config`), the bridge has no
+    /// implicit way to know which agent spawned the CLI. This field carries
+    /// the owning agent's ID so the driver can forward it (as an HTTP
+    /// header on the bridge connection) and the bridge can resolve the
+    /// agent's workspace, tool allowlist, and skill allowlist from the
+    /// registry. `None` for out-of-band callers (compaction, routing
+    /// probes, tests) that have no agent identity to propagate.
+    pub agent_id: Option<String>,
 }
 
 /// A response from an LLM completion.
@@ -130,6 +141,12 @@ impl CompletionResponse {
             .join("")
     }
 }
+
+/// Phase name emitted via `StreamEvent::PhaseChange` to signal that the final
+/// LLM text for the turn has been streamed and the agent loop is about to
+/// enter post-processing (session save, proactive memory). Consumers use
+/// this to unblock user input before the full response payload is ready.
+pub const PHASE_RESPONSE_COMPLETE: &str = "response_complete";
 
 /// Events emitted during streaming LLM completion.
 #[derive(Debug, Clone)]
@@ -416,6 +433,7 @@ mod tests {
             response_format: None,
             timeout_secs: None,
             extra_body: None,
+            agent_id: None,
         };
 
         let response = driver.stream(request, tx).await.unwrap();

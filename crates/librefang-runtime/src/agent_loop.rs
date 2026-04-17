@@ -9,7 +9,9 @@ use crate::context_engine::ContextEngine;
 use crate::context_overflow::{recover_from_overflow, RecoveryStage};
 use crate::embedding::EmbeddingDriver;
 use crate::kernel_handle::KernelHandle;
-use crate::llm_driver::{CompletionRequest, LlmDriver, LlmError, StreamEvent};
+use crate::llm_driver::{
+    CompletionRequest, LlmDriver, LlmError, StreamEvent, PHASE_RESPONSE_COMPLETE,
+};
 use crate::llm_errors;
 use crate::loop_guard::{LoopGuard, LoopGuardConfig, LoopGuardVerdict};
 use crate::mcp::McpConnection;
@@ -64,6 +66,20 @@ const MAX_CONSECUTIVE_ALL_FAILED: u32 = 3;
 /// Marker included in timeout error messages when partial output was delivered.
 /// Used by channel_bridge to detect this case without fragile string matching.
 pub const TIMEOUT_PARTIAL_OUTPUT_MARKER: &str = "[partial_output_delivered]";
+
+/// Notify the stream consumer that the LLM has finished producing text for
+/// this turn so the UI can unblock input before the agent loop's remaining
+/// post-processing (session persistence, proactive memory extraction) lands
+/// the final `response` event. Fire-and-forget: send failures are ignored
+/// because a disconnected consumer is not fatal to the turn.
+async fn signal_response_complete(tx: &mpsc::Sender<StreamEvent>) {
+    let _ = tx
+        .send(StreamEvent::PhaseChange {
+            phase: PHASE_RESPONSE_COMPLETE.to_string(),
+            detail: None,
+        })
+        .await;
+}
 
 /// Check if a response is a NO_REPLY. Matches:
 /// - Exact `"NO_REPLY"` (original behaviour)
@@ -1123,6 +1139,10 @@ pub struct AgentLoopResult {
     /// own index — which would go stale if the loop trims session history.
     /// Always in range [0, session.messages.len()] after the loop returns.
     pub new_messages_start: usize,
+    /// True when the agent used enough tool calls that skill evolution review
+    /// is recommended. The kernel checks this to trigger background skill
+    /// creation/improvement suggestions. Threshold: 5+ tool calls.
+    pub skill_evolution_suggested: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -1904,6 +1924,7 @@ async fn generate_search_queries(
         response_format: None,
         timeout_secs: Some(15),
         extra_body: None,
+        agent_id: None,
     };
 
     let response =
@@ -2039,6 +2060,7 @@ fn build_silent_agent_loop_result(
         experiment_context,
         latency_ms: 0,
         new_messages_start,
+        skill_evolution_suggested: false,
     }
 }
 
@@ -2213,6 +2235,7 @@ async fn finalize_successful_end_turn(
     };
     fire_hook_best_effort(ctx.hooks, &hook_ctx);
 
+    let tool_call_count = end_turn.decision_traces.len();
     Ok(AgentLoopResult {
         response: end_turn.final_response,
         total_usage: end_turn.total_usage,
@@ -2228,6 +2251,9 @@ async fn finalize_successful_end_turn(
         experiment_context: end_turn.experiment_context,
         latency_ms: 0,
         new_messages_start: end_turn.new_messages_start,
+        // Suggest skill evolution when the agent used 5+ tool calls,
+        // indicating a non-trivial task that might be worth saving as a skill.
+        skill_evolution_suggested: tool_call_count >= 5,
     })
 }
 
@@ -2520,6 +2546,7 @@ pub async fn run_agent_loop(
             } else {
                 Some(manifest.model.extra_params.clone())
             },
+            agent_id: Some(agent_id_str.clone()),
         };
 
         // Notify phase: Thinking
@@ -2907,6 +2934,7 @@ pub async fn run_agent_loop(
                         cost_usd: None,
                         silent: false,
                         directives: reply_directives_from_parsed(parsed_directives),
+                        skill_evolution_suggested: decision_traces.len() >= 5,
                         decision_traces,
                         memories_saved,
                         memories_used,
@@ -3494,6 +3522,7 @@ pub async fn run_agent_loop_streaming(
             } else {
                 Some(manifest.model.extra_params.clone())
             },
+            agent_id: Some(agent_id_str.clone()),
         };
 
         // Notify phase: on first iteration emit Streaming; on subsequent
@@ -3679,6 +3708,8 @@ pub async fn run_agent_loop_streaming(
                     "Empty response from LLM (streaming) — guard activated",
                 );
                 final_response = text.clone();
+
+                signal_response_complete(&stream_tx).await;
 
                 return finalize_successful_end_turn(
                     FinalizeEndTurnContext {
@@ -3910,6 +3941,7 @@ pub async fn run_agent_loop_streaming(
                         }),
                     };
                     fire_hook_best_effort(hooks, &ctx);
+                    signal_response_complete(&stream_tx).await;
                     return Ok(AgentLoopResult {
                         response: text,
                         total_usage,
@@ -3917,6 +3949,7 @@ pub async fn run_agent_loop_streaming(
                         cost_usd: None,
                         silent: false,
                         directives: reply_directives_from_parsed(parsed_directives),
+                        skill_evolution_suggested: decision_traces.len() >= 5,
                         decision_traces,
                         memories_saved,
                         memories_used,
