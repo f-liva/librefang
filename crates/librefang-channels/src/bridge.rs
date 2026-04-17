@@ -1008,7 +1008,7 @@ impl BridgeManager {
                                         ref url, ref caption, ref mime_type
                                     } = message.content {
                                         match download_image_to_blocks(url, caption.as_deref(), mime_type.as_deref()).await {
-                                            blocks if blocks.iter().any(|b| matches!(b, ContentBlock::Image { .. })) => Some(blocks),
+                                            blocks if blocks.iter().any(|b| matches!(b, ContentBlock::Image { .. } | ContentBlock::ImageFile { .. })) => Some(blocks),
                                             _ => None,
                                         }
                                     } else {
@@ -2158,10 +2158,18 @@ async fn dispatch_message(
     } = message.content
     {
         let blocks = download_image_to_blocks(url, caption.as_deref(), mime_type.as_deref()).await;
-        if blocks
-            .iter()
-            .any(|b| matches!(b, ContentBlock::Image { .. }))
-        {
+        // Accept both the legacy inline-base64 `Image` block and the
+        // path-referenced `ImageFile` block introduced by #2098. Without the
+        // `ImageFile` arm, any successfully downloaded photo saved to
+        // `/tmp/librefang_uploads/` would silently fall through to the text
+        // fallback below, so the LLM would see `[User sent a photo: URL]`
+        // instead of real vision content.
+        if blocks.iter().any(|b| {
+            matches!(
+                b,
+                ContentBlock::Image { .. } | ContentBlock::ImageFile { .. }
+            )
+        }) {
             // We have actual image data — send as structured blocks for vision
             dispatch_with_blocks(
                 blocks,
