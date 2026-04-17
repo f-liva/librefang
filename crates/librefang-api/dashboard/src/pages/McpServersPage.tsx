@@ -1,13 +1,12 @@
-import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 import {
-  listMcpServers, addMcpServer, updateMcpServer, deleteMcpServer,
   getMcpAuthStatus, startMcpAuth, revokeMcpAuth,
-  listAvailableIntegrations,
   type McpServerConfigured, type McpServerConnected, type McpServerTransport,
   type IntegrationTemplate,
 } from "../api";
+import { useMcpServers, useAvailableIntegrations } from "../lib/queries/mcp";
+import { useAddMcpServer, useUpdateMcpServer, useDeleteMcpServer } from "../lib/mutations/mcp";
 import { Card } from "../components/ui/Card";
 import { Button } from "../components/ui/Button";
 import { Badge } from "../components/ui/Badge";
@@ -24,8 +23,6 @@ import {
   Shield, ShieldCheck, ShieldAlert, ShieldX, Check, ExternalLink,
   Search, Clock, Filter, Store, Key, Download,
 } from "lucide-react";
-
-const REFRESH_MS = 30000;
 
 type TransportType = "stdio" | "sse" | "http";
 type StatusFilter = "all" | "connected" | "disconnected";
@@ -58,7 +55,7 @@ function formToPayload(form: ServerFormState): McpServerConfigured {
     transport = {
       type: "stdio",
       command: form.command,
-      args: form.args.filter(Boolean),
+      args: form.args.map(s => s.trim()).filter(Boolean),
     };
   } else {
     transport = { type: form.transportType, url: form.url };
@@ -69,7 +66,7 @@ function formToPayload(form: ServerFormState): McpServerConfigured {
     name: form.name,
     transport,
     timeout_secs: form.timeout || 30,
-    env: form.env.filter(Boolean),
+    env: form.env.map(s => s.trim()).filter(Boolean),
   };
   // Only include headers if user explicitly entered values, to avoid
   // overwriting server-side headers that the list API may not return.
@@ -108,6 +105,7 @@ function getTransportDetail(server: McpServerConfigured): string {
 // ── ArgsEditor ──────────────────────────────────────────────────────
 
 function ArgsEditor({ items, onChange }: { items: string[]; onChange: (items: string[]) => void }) {
+  const { t } = useTranslation();
   const inputRefs = useRef<(HTMLInputElement | null)[]>([]);
 
   function addItem() {
@@ -144,7 +142,7 @@ function ArgsEditor({ items, onChange }: { items: string[]; onChange: (items: st
             type="button"
             onClick={() => removeItem(idx)}
             className="shrink-0 flex items-center justify-center w-6 h-6 rounded-md text-text-dim hover:text-error hover:bg-error/8 transition-colors"
-            aria-label="Remove argument"
+            aria-label={t("mcp.remove_argument")}
           >
             <X className="h-3.5 w-3.5" />
           </button>
@@ -156,7 +154,7 @@ function ArgsEditor({ items, onChange }: { items: string[]; onChange: (items: st
         className="flex items-center gap-1 text-[10px] font-bold text-text-dim hover:text-brand transition-colors py-0.5"
       >
         <Plus className="h-3 w-3" />
-        Add argument
+        {t("mcp.add_argument")}
       </button>
     </div>
   );
@@ -165,6 +163,7 @@ function ArgsEditor({ items, onChange }: { items: string[]; onChange: (items: st
 // ── EnvEditor ───────────────────────────────────────────────────────
 
 function EnvEditor({ items, onChange }: { items: string[]; onChange: (items: string[]) => void }) {
+  const { t } = useTranslation();
   const inputRefs = useRef<(HTMLInputElement | null)[]>([]);
 
   function addItem() {
@@ -194,14 +193,14 @@ function EnvEditor({ items, onChange }: { items: string[]; onChange: (items: str
             type="text"
             value={item}
             onChange={(e) => updateItem(idx, e.target.value)}
-            placeholder="KEY=VALUE"
+            placeholder={t("mcp.env_placeholder")}
             className="flex-1 rounded-lg border border-border-subtle bg-surface px-3 py-1.5 text-sm font-mono text-text-main placeholder:text-text-dim/40 focus:border-brand focus:outline-none focus:ring-2 focus:ring-brand/10 hover:border-brand/20 transition-colors duration-200 shadow-sm"
           />
           <button
             type="button"
             onClick={() => removeItem(idx)}
             className="shrink-0 flex items-center justify-center w-6 h-6 rounded-md text-text-dim hover:text-error hover:bg-error/8 transition-colors"
-            aria-label="Remove variable"
+            aria-label={t("mcp.remove_variable")}
           >
             <X className="h-3.5 w-3.5" />
           </button>
@@ -213,7 +212,7 @@ function EnvEditor({ items, onChange }: { items: string[]; onChange: (items: str
         className="flex items-center gap-1 text-[10px] font-bold text-text-dim hover:text-brand transition-colors py-0.5"
       >
         <Plus className="h-3 w-3" />
-        Add variable
+        {t("mcp.add_variable")}
       </button>
     </div>
   );
@@ -531,7 +530,6 @@ function ServerCard({
 
 export function McpServersPage() {
   const { t } = useTranslation();
-  const queryClient = useQueryClient();
   const addToast = useUIStore((s) => s.addToast);
 
   const [tab, setTab] = useState<"servers" | "registry">("servers");
@@ -548,53 +546,12 @@ export function McpServersPage() {
 
   useCreateShortcut(() => setShowAddModal(true));
 
-  const serversQuery = useQuery({
-    queryKey: ["mcp-servers"],
-    queryFn: listMcpServers,
-    refetchInterval: REFRESH_MS,
-  });
+  const serversQuery = useMcpServers();
+  const registryQuery = useAvailableIntegrations({ enabled: tab === "registry" });
 
-  const registryQuery = useQuery({
-    queryKey: ["integrations-available"],
-    queryFn: listAvailableIntegrations,
-    enabled: tab === "registry",
-  });
-
-  const addMutation = useMutation({
-    mutationFn: (server: McpServerConfigured) => addMcpServer(server),
-    onSuccess: () => {
-      queryClient.invalidateQueries({ queryKey: ["mcp-servers"] });
-      queryClient.invalidateQueries({ queryKey: ["integrations-available"] });
-      setShowAddModal(false);
-      setInstallingTemplate(null);
-      setEnvInputs({});
-      setForm(defaultForm);
-      addToast(t("mcp.add_success"), "success");
-    },
-    onError: (e: any) => addToast(e?.message || t("mcp.add_failed"), "error"),
-  });
-
-  const updateMutation = useMutation({
-    mutationFn: ({ name, server }: { name: string; server: Partial<McpServerConfigured> }) => updateMcpServer(name, server),
-    onSuccess: () => {
-      queryClient.invalidateQueries({ queryKey: ["mcp-servers"] });
-      setEditingServer(null);
-      setForm(defaultForm);
-      addToast(t("mcp.update_success"), "success");
-    },
-    onError: (e: any) => addToast(e?.message || t("mcp.update_failed"), "error"),
-  });
-
-  const deleteMutation = useMutation({
-    mutationFn: (name: string) => deleteMcpServer(name),
-    onSuccess: () => {
-      queryClient.invalidateQueries({ queryKey: ["mcp-servers"] });
-      queryClient.invalidateQueries({ queryKey: ["integrations-available"] });
-      setDeletingServer(null);
-      addToast(t("mcp.delete_success"), "success");
-    },
-    onError: (e: any) => addToast(e?.message || t("mcp.delete_failed"), "error"),
-  });
+  const addMutation = useAddMcpServer();
+  const updateMutation = useUpdateMcpServer();
+  const deleteMutation = useDeleteMcpServer();
 
   const data = serversQuery.data;
   const configured = data?.configured ?? [];
@@ -647,9 +604,28 @@ export function McpServersPage() {
   function handleSubmit() {
     const payload = formToPayload(form);
     if (editingServer) {
-      updateMutation.mutate({ name: editingServer.name, server: payload });
+      updateMutation.mutate(
+        { name: editingServer.name, server: payload },
+        {
+          onSuccess: () => {
+            setEditingServer(null);
+            setForm(defaultForm);
+            addToast(t("mcp.update_success"), "success");
+          },
+          onError: (e: any) => addToast(e?.message || t("mcp.update_failed"), "error"),
+        },
+      );
     } else {
-      addMutation.mutate(payload);
+      addMutation.mutate(payload, {
+        onSuccess: () => {
+          setShowAddModal(false);
+          setInstallingTemplate(null);
+          setEnvInputs({});
+          setForm(defaultForm);
+          addToast(t("mcp.add_success"), "success");
+        },
+        onError: (e: any) => addToast(e?.message || t("mcp.add_failed"), "error"),
+      });
     }
   }
 
@@ -683,13 +659,31 @@ export function McpServersPage() {
       setEnvInputs(defaults);
       setInstallingTemplate(tpl);
     } else {
-      addMutation.mutate(buildPayloadFromTemplate(tpl));
+      addMutation.mutate(buildPayloadFromTemplate(tpl), {
+        onSuccess: () => {
+          setShowAddModal(false);
+          setInstallingTemplate(null);
+          setEnvInputs({});
+          setForm(defaultForm);
+          addToast(t("mcp.add_success"), "success");
+        },
+        onError: (e: any) => addToast(e?.message || t("mcp.add_failed"), "error"),
+      });
     }
   }
 
   function confirmTemplateInstall() {
     if (!installingTemplate) return;
-    addMutation.mutate(buildPayloadFromTemplate(installingTemplate, envInputs));
+    addMutation.mutate(buildPayloadFromTemplate(installingTemplate, envInputs), {
+      onSuccess: () => {
+        setShowAddModal(false);
+        setInstallingTemplate(null);
+        setEnvInputs({});
+        setForm(defaultForm);
+        addToast(t("mcp.add_success"), "success");
+      },
+      onError: (e: any) => addToast(e?.message || t("mcp.add_failed"), "error"),
+    });
   }
 
   const registryTemplates = registryQuery.data?.integrations ?? [];
@@ -1178,7 +1172,15 @@ export function McpServersPage() {
         message={t("mcp.delete_confirm")}
         tone="destructive"
         confirmLabel={t("common.delete")}
-        onConfirm={() => { if (deletingServer) deleteMutation.mutate(deletingServer); }}
+        onConfirm={() => {
+          if (deletingServer) deleteMutation.mutate(deletingServer, {
+            onSuccess: () => {
+              setDeletingServer(null);
+              addToast(t("mcp.delete_success"), "success");
+            },
+            onError: (e: any) => addToast(e?.message || t("mcp.delete_failed"), "error"),
+          });
+        }}
         onClose={() => setDeletingServer(null)}
       />
     </div>

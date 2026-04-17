@@ -1130,6 +1130,10 @@ pub struct AgentLoopResult {
     /// own index — which would go stale if the loop trims session history.
     /// Always in range [0, session.messages.len()] after the loop returns.
     pub new_messages_start: usize,
+    /// True when the agent used enough tool calls that skill evolution review
+    /// is recommended. The kernel checks this to trigger background skill
+    /// creation/improvement suggestions. Threshold: 5+ tool calls.
+    pub skill_evolution_suggested: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -2046,6 +2050,7 @@ fn build_silent_agent_loop_result(
         experiment_context,
         latency_ms: 0,
         new_messages_start,
+        skill_evolution_suggested: false,
     }
 }
 
@@ -2220,6 +2225,7 @@ async fn finalize_successful_end_turn(
     };
     fire_hook_best_effort(ctx.hooks, &hook_ctx);
 
+    let tool_call_count = end_turn.decision_traces.len();
     Ok(AgentLoopResult {
         response: end_turn.final_response,
         total_usage: end_turn.total_usage,
@@ -2235,6 +2241,9 @@ async fn finalize_successful_end_turn(
         experiment_context: end_turn.experiment_context,
         latency_ms: 0,
         new_messages_start: end_turn.new_messages_start,
+        // Suggest skill evolution when the agent used 5+ tool calls,
+        // indicating a non-trivial task that might be worth saving as a skill.
+        skill_evolution_suggested: tool_call_count >= 5,
     })
 }
 
@@ -2926,6 +2935,7 @@ pub async fn run_agent_loop(
                         cost_usd: None,
                         silent: false,
                         directives: reply_directives_from_parsed(parsed_directives),
+                        skill_evolution_suggested: decision_traces.len() >= 5,
                         decision_traces,
                         memories_saved,
                         memories_used,
@@ -3951,6 +3961,7 @@ pub async fn run_agent_loop_streaming(
                         cost_usd: None,
                         silent: false,
                         directives: reply_directives_from_parsed(parsed_directives),
+                        skill_evolution_suggested: decision_traces.len() >= 5,
                         decision_traces,
                         memories_saved,
                         memories_used,
