@@ -595,6 +595,69 @@ impl TelegramAdapter {
         .await
     }
 
+    /// Upload a voice note via `sendVoice` (Ogg/Opus mono).
+    async fn api_send_voice_upload(
+        &self,
+        chat_id: i64,
+        data: Vec<u8>,
+        filename: &str,
+        mime_type: &str,
+        caption: Option<&str>,
+        thread_id: Option<i64>,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let extra: Vec<(&str, String)> = caption
+            .map(|c| vec![("caption", c.to_string())])
+            .unwrap_or_default();
+        self.api_send_media_upload(
+            "sendVoice",
+            "voice",
+            chat_id,
+            data,
+            filename,
+            mime_type,
+            if extra.is_empty() { None } else { Some(&extra) },
+            thread_id,
+        )
+        .await
+    }
+
+    /// Upload a generic audio file via `sendAudio` (MP3 / M4A / etc.
+    /// with optional title / performer metadata).
+    #[allow(clippy::too_many_arguments)]
+    async fn api_send_audio_upload(
+        &self,
+        chat_id: i64,
+        data: Vec<u8>,
+        filename: &str,
+        mime_type: &str,
+        caption: Option<&str>,
+        title: Option<&str>,
+        performer: Option<&str>,
+        thread_id: Option<i64>,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let mut extra: Vec<(&str, String)> = Vec::new();
+        if let Some(c) = caption {
+            extra.push(("caption", c.to_string()));
+        }
+        if let Some(t) = title {
+            extra.push(("title", t.to_string()));
+        }
+        if let Some(p) = performer {
+            extra.push(("performer", p.to_string()));
+        }
+        self.api_send_media_upload(
+            "sendAudio",
+            "audio",
+            chat_id,
+            data,
+            filename,
+            mime_type,
+            if extra.is_empty() { None } else { Some(&extra) },
+            thread_id,
+        )
+        .await
+    }
+
     /// Generic multipart upload for any Telegram `send{Media}` endpoint.
     ///
     /// `field_name` is the form field the API expects for the payload
@@ -1460,8 +1523,28 @@ impl TelegramAdapter {
                 filename,
                 mime_type,
             } => {
-                self.api_send_document_upload(chat_id, data, &filename, &mime_type, thread_id)
+                // Audio payloads take the voice / audio path so the
+                // chat renders a voice bubble or a music card instead
+                // of a generic attachment. Voice-note heuristic: Opus
+                // or Ogg mime → `sendVoice`; anything else `audio/*`
+                // → `sendAudio`.
+                let is_audio = mime_type.starts_with("audio/");
+                let is_voice_note =
+                    is_audio && (mime_type.contains("opus") || mime_type.contains("ogg"));
+                if is_voice_note {
+                    self.api_send_voice_upload(
+                        chat_id, data, &filename, &mime_type, None, thread_id,
+                    )
                     .await?;
+                } else if is_audio {
+                    self.api_send_audio_upload(
+                        chat_id, data, &filename, &mime_type, None, None, None, thread_id,
+                    )
+                    .await?;
+                } else {
+                    self.api_send_document_upload(chat_id, data, &filename, &mime_type, thread_id)
+                        .await?;
+                }
             }
             ChannelContent::Voice { url, caption, .. } => {
                 self.api_send_voice(chat_id, &url, caption.as_deref(), thread_id)

@@ -172,6 +172,52 @@ impl WhatsAppAdapter {
         Ok(())
     }
 
+    /// Spool an audio payload to a shared temp path and ask the
+    /// WhatsApp Web gateway to pick it up via `/message/send-audio`.
+    ///
+    /// The gateway runs alongside the daemon in the same container and
+    /// reads `/tmp/librefang_*` directly, so we can avoid a round-trip
+    /// through a loopback HTTP server. `ptt=true` makes Baileys deliver
+    /// the payload as a voice-note bubble; `false` surfaces it as a
+    /// generic audio attachment.
+    async fn gateway_send_audio_bytes(
+        &self,
+        gateway_url: &str,
+        to: &str,
+        data: &[u8],
+        ptt: bool,
+        ext_hint: &str,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let spool_dir = std::env::temp_dir().join("librefang_audio_out");
+        tokio::fs::create_dir_all(&spool_dir).await?;
+        let ext = if ext_hint.is_empty() { "bin" } else { ext_hint };
+        let path = spool_dir.join(format!("{}.{}", uuid::Uuid::new_v4(), ext));
+        tokio::fs::write(&path, data).await?;
+
+        let url = format!("{}/message/send-audio", gateway_url.trim_end_matches('/'));
+        let body = serde_json::json!({
+            "to": to,
+            "audio_url": format!("file://{}", path.display()),
+            "ptt": ptt,
+        });
+        let resp = self.client.post(&url).json(&body).send().await;
+
+        // Best-effort cleanup: the gateway reads the file synchronously
+        // before responding, so once we've seen a response (success or
+        // error) the bytes are no longer needed on disk.
+        let _ = tokio::fs::remove_file(&path).await;
+
+        let resp = resp?;
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let body = resp.text().await.unwrap_or_default();
+            error!("WhatsApp gateway audio error {status}: {body}");
+            return Err(format!("WhatsApp gateway audio error {status}: {body}").into());
+        }
+
+        Ok(())
+    }
+
     /// Check if a phone number is allowed.
     #[allow(dead_code)]
     fn is_allowed(&self, phone: &str) -> bool {
@@ -233,6 +279,30 @@ impl ChannelAdapter for WhatsAppAdapter {
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         // Web/QR gateway mode: route all messages through the gateway
         if let Some(ref gw) = self.gateway_url {
+            // Audio payloads (voice notes + music) route through
+            // `/message/send-audio` so Baileys delivers a proper
+            // WhatsApp voice bubble instead of the generic
+            // "unsupported content type" fallback. The outbound
+            // normalizer in `tool_channel_send` guarantees we receive
+            // Ogg/Opus mono for voice notes.
+            if let ChannelContent::FileData {
+                ref data,
+                ref filename,
+                ref mime_type,
+            } = content
+            {
+                if mime_type.starts_with("audio/") {
+                    let is_voice_note = mime_type.contains("opus") || mime_type.contains("ogg");
+                    let ext = std::path::Path::new(filename.as_str())
+                        .extension()
+                        .and_then(|e| e.to_str())
+                        .unwrap_or(if is_voice_note { "ogg" } else { "mp3" });
+                    self.gateway_send_audio_bytes(gw, &user.platform_id, data, is_voice_note, ext)
+                        .await?;
+                    return Ok(());
+                }
+            }
+
             let text = match &content {
                 ChannelContent::Text(t) => t.clone(),
                 ChannelContent::Image { caption, .. } => caption
