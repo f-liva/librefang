@@ -294,6 +294,10 @@ function readWhatsAppConfig(configPath) {
     owner_numbers: [],
     conversation_ttl_hours: 24,
     group_activation_overrides: new Map(),
+    // English-only by default keeps upstream deployments locale-neutral;
+    // set `[relay_intent].languages = ["en", "it", …]` in config.toml
+    // to enable extra language packs.
+    relay_intent_languages: ['en'],
   };
   try {
     const content = fs.readFileSync(configPath, 'utf8');
@@ -314,14 +318,19 @@ function readWhatsAppConfig(configPath) {
       if (!['always', 'mention', 'off'].includes(mode)) continue;
       overrides.set(row.jid, mode);
     }
+    const relay = parsed?.relay_intent || {};
     const cfg = {
       default_agent: wa.default_agent || defaults.default_agent,
       owner_numbers: Array.isArray(wa.owner_numbers) ? wa.owner_numbers : defaults.owner_numbers,
       conversation_ttl_hours: parseInt(wa.conversation_ttl_hours, 10) || defaults.conversation_ttl_hours,
       group_activation_overrides: overrides,
+      relay_intent_languages:
+        Array.isArray(relay.languages) && relay.languages.length > 0
+          ? relay.languages
+          : defaults.relay_intent_languages,
     };
     const overrideLog = overrides.size > 0 ? `, group_activation_overrides=${overrides.size}` : '';
-    console.log(`[gateway] Read config from ${configPath}: default_agent="${cfg.default_agent}", owner_numbers=${JSON.stringify(cfg.owner_numbers)}, conversation_ttl_hours=${cfg.conversation_ttl_hours}${overrideLog}`);
+    console.log(`[gateway] Read config from ${configPath}: default_agent="${cfg.default_agent}", owner_numbers=${JSON.stringify(cfg.owner_numbers)}, conversation_ttl_hours=${cfg.conversation_ttl_hours}${overrideLog}, relay_intent_languages=${JSON.stringify(cfg.relay_intent_languages)}`);
     return cfg;
   } catch (err) {
     console.warn(`[gateway] Could not read ${configPath}: ${err.message} — using defaults/env vars`);
@@ -2514,14 +2523,19 @@ async function processMediaMessage(fullMsg, innerMsg, agentId) {
 // Only inject the relay instruction when the owner's message expresses an
 // explicit delegated-speech intent. Everything else is treated as owner
 // talking directly to the agent.
+// Regex compiled once at module load from the configured language
+// packs in `lib/intent_patterns.js`. Adding a locale is a file-level
+// change; adding the code to the config toggles it on.
+const RELAY_INTENT_RE = require('./lib/intent_patterns').compileIntentRegex(
+  tomlConfig.relay_intent_languages,
+);
+
 function ownerIntentsRelay(text) {
   const t = (text || '').trim().toLowerCase();
   if (!t) return false;
   if (t.startsWith('/relay') || t.startsWith('/reply')) return true;
   if (/(^|\s)@[\w.+-]+/.test(t)) return true;
-  return /\b(rispondi a|scrivi a|scrivigli|digli|dille|dica|saluta|manda a|inoltra|chiedi a|reply to|tell|write to|forward to|relay to)\b/.test(
-    t,
-  );
+  return RELAY_INTENT_RE.test(t);
 }
 
 // ---------------------------------------------------------------------------
