@@ -10,6 +10,7 @@ pub const USER_AGENT: &str = concat!("librefang/", env!("CARGO_PKG_VERSION"));
 pub mod a2a;
 pub mod agent_loop;
 pub mod apply_patch;
+pub mod audio_normalizer;
 pub mod audit;
 pub mod auth_cooldown;
 pub mod browser;

@@ -3056,16 +3056,33 @@ async function sendImage(to, imageUrl, caption) {
   });
 }
 
-async function sendAudio(to, audioUrl, ptt = true) {
-  if (!sock || connStatus !== 'connected') {
-    throw new Error('WhatsApp not connected');
+// Directory callers are allowed to reference with a local path. Anything
+// outside this prefix is rejected — the gateway runs alongside the
+// LibreFang daemon inside the same container, and the normalizer
+// writes its outputs here, so widening the allowlist would only open
+// a read primitive for unrelated callers.
+const LOCAL_AUDIO_ALLOWED_PREFIX = '/tmp/librefang_';
+
+async function loadAudioBytes(sourceRef) {
+  // Local path via `file://` URI or bare absolute path. Kept path-
+  // restricted to avoid turning /message/send-audio into a generic
+  // read oracle.
+  if (sourceRef.startsWith('file://') || sourceRef.startsWith('/')) {
+    const fs = require('node:fs/promises');
+    const path = require('node:path');
+    const rawPath = sourceRef.startsWith('file://')
+      ? sourceRef.slice('file://'.length)
+      : sourceRef;
+    const resolved = path.resolve(rawPath);
+    if (!resolved.startsWith(LOCAL_AUDIO_ALLOWED_PREFIX)) {
+      throw new Error(
+        `Refusing to read local audio outside ${LOCAL_AUDIO_ALLOWED_PREFIX}* (got ${resolved})`,
+      );
+    }
+    return fs.readFile(resolved);
   }
 
-  // Preserve group JIDs (@g.us) as-is; normalize phone → JID for individuals
-  const jid = phoneToJid(to);
-
-  // Fetch audio into buffer (Baileys needs buffer or local file)
-  const buffer = await new Promise((resolve, reject) => {
+  return new Promise((resolve, reject) => {
     const MAX_REDIRECTS = 5;
     const request = (url, redirectCount = 0) => {
       if (redirectCount > MAX_REDIRECTS) {
@@ -3085,8 +3102,23 @@ async function sendAudio(to, audioUrl, ptt = true) {
         resp.on('error', reject);
       }).on('error', reject);
     };
-    request(audioUrl);
+    request(sourceRef);
   });
+}
+
+async function sendAudio(to, audioUrl, ptt = true) {
+  if (!sock || connStatus !== 'connected') {
+    throw new Error('WhatsApp not connected');
+  }
+
+  // Preserve group JIDs (@g.us) as-is; normalize phone → JID for individuals
+  const jid = phoneToJid(to);
+
+  // Accept http(s) URLs as well as `file://...` / bare paths under the
+  // LibreFang uploads prefix — the Rust-side audio normalizer writes
+  // voice notes there and this avoids a double fetch back out through
+  // loopback HTTP.
+  const buffer = await loadAudioBytes(audioUrl);
 
   // ptt: true sends as a voice note (push-to-talk bubble); false sends as audio file
   const audioMsg = { audio: buffer, mimetype: 'audio/ogg; codecs=opus', ptt };

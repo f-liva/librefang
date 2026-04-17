@@ -3097,12 +3097,21 @@ async fn tool_channel_send(
     // Local file attachment: read from disk and send as FileData
     if let Some(raw_path) = file_path {
         let resolved = resolve_file_path(raw_path, workspace_root)?;
-        let data = tokio::fs::read(&resolved)
-            .await
-            .map_err(|e| format!("Failed to read file '{}': {e}", resolved.display()))?;
+
+        // Determine MIME type from extension (used both for routing
+        // below and as a fast check for the audio-normalizer guard).
+        let ext = resolved
+            .extension()
+            .and_then(|e| e.to_str())
+            .unwrap_or("")
+            .to_lowercase();
+        let is_audio_ext = matches!(
+            ext.as_str(),
+            "mp3" | "ogg" | "oga" | "opus" | "wav" | "m4a" | "aac" | "flac"
+        );
 
         // Derive filename from the path if not explicitly provided
-        let filename = input["filename"]
+        let filename_hint = input["filename"]
             .as_str()
             .filter(|s| !s.is_empty())
             .map(|s| s.to_string())
@@ -3114,12 +3123,54 @@ async fn tool_channel_send(
                     .to_string()
             });
 
-        // Determine MIME type from extension
-        let ext = resolved
-            .extension()
-            .and_then(|e| e.to_str())
-            .unwrap_or("")
-            .to_lowercase();
+        // Audio path: hand off to the channel-aware normalizer so the
+        // agent never has to worry about codecs, PTT flags, or the
+        // voice / music split. The normalizer transcodes when needed
+        // and returns bytes + MIME shaped for the destination channel.
+        if is_audio_ext || crate::audio_normalizer::looks_like_audio(&resolved).await {
+            let delivery = match input.get("as_voice_note").and_then(|v| v.as_bool()) {
+                Some(true) => crate::audio_normalizer::DeliveryMode::VoiceNote,
+                Some(false) => crate::audio_normalizer::DeliveryMode::MusicFile,
+                None => crate::audio_normalizer::DeliveryMode::Auto,
+            };
+            let opts = crate::audio_normalizer::NormalizeOptions {
+                delivery,
+                caption: input["message"]
+                    .as_str()
+                    .filter(|s| !s.is_empty())
+                    .map(|s| s.to_string()),
+                filename: Some(filename_hint.clone()),
+            };
+            let normalized =
+                crate::audio_normalizer::normalize_audio_for_channel(&channel, &resolved, &opts)
+                    .await
+                    .map_err(|e| format!("audio normalize failed: {e}"))?;
+            tracing::info!(
+                channel = %channel,
+                profile = ?normalized.profile,
+                transcoded = normalized.transcoded,
+                is_voice_note = normalized.is_voice_note,
+                mime = %normalized.mime_type,
+                duration = normalized.duration_seconds,
+                "channel_send: audio normalized for channel"
+            );
+            return kh
+                .send_channel_file_data(
+                    &channel,
+                    recipient,
+                    normalized.data,
+                    &normalized.filename,
+                    &normalized.mime_type,
+                    thread_id,
+                )
+                .await;
+        }
+
+        let data = tokio::fs::read(&resolved)
+            .await
+            .map_err(|e| format!("Failed to read file '{}': {e}", resolved.display()))?;
+        let filename = filename_hint;
+
         let mime_type = match ext.as_str() {
             "png" => "image/png",
             "jpg" | "jpeg" => "image/jpeg",
@@ -3134,8 +3185,6 @@ async fn tool_channel_send(
             "zip" => "application/zip",
             "gz" | "gzip" => "application/gzip",
             "tar" => "application/x-tar",
-            "mp3" => "audio/mpeg",
-            "wav" => "audio/wav",
             "mp4" => "video/mp4",
             "doc" => "application/msword",
             "docx" => "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
