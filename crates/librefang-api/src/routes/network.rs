@@ -869,7 +869,52 @@ pub async fn mcp_http(
     State(state): State<Arc<AppState>>,
     Json(request): Json<serde_json::Value>,
 ) -> impl IntoResponse {
-    // Gather all available tools (builtin + skills + MCP)
+    dispatch_mcp_request(&state, None, request).await
+}
+
+/// Per-agent MCP HTTP endpoint. Routed at `/mcp/{agent_id}`.
+///
+/// Looks up the agent in the registry and threads its manifest into the
+/// `ToolExecContext` that backs every `tools/call` — specifically
+/// `workspace_root`, `caller_agent_id`, `allowed_env_vars`, and
+/// `exec_policy`. Without this lookup the driver-originated tool calls
+/// (Claude Code CLI → `mcp__librefang__file_read`, etc.) hit the
+/// workspace-sandbox refusal or the "Agent ID required" branch even
+/// though the agent is fully registered. See issue #2699.
+#[utoipa::path(
+    post,
+    path = "/mcp/{agent_id}",
+    tag = "mcp",
+    params(
+        ("agent_id" = String, Path, description = "Registered agent UUID whose workspace + identity should back the inbound tool/call")
+    ),
+    request_body = serde_json::Value,
+    responses(
+        (status = 200, description = "Handle MCP JSON-RPC requests scoped to a specific agent", body = serde_json::Value)
+    )
+)]
+pub async fn mcp_http_for_agent(
+    State(state): State<Arc<AppState>>,
+    axum::extract::Path(agent_id): axum::extract::Path<String>,
+    Json(request): Json<serde_json::Value>,
+) -> impl IntoResponse {
+    let entry = agent_id
+        .parse::<librefang_types::agent::AgentId>()
+        .ok()
+        .and_then(|id| state.kernel.agent_registry().get(id));
+    dispatch_mcp_request(&state, entry, request).await
+}
+
+/// Shared MCP handler body used by both the anonymous `/mcp` endpoint and
+/// the per-agent `/mcp/{agent_id}` endpoint. When `entry` is `Some`, its
+/// manifest seeds the `ToolExecContext` so agent-scoped tools
+/// (`file_read`, `cron_create`, `schedule_create`, `media_describe`, …)
+/// receive the workspace and identity they need.
+async fn dispatch_mcp_request(
+    state: &AppState,
+    entry: Option<librefang_types::agent::AgentEntry>,
+    request: serde_json::Value,
+) -> Json<serde_json::Value> {
     let mut tools = builtin_tool_definitions();
     {
         let registry = state
@@ -889,7 +934,6 @@ pub async fn mcp_http(
         tools.extend(mcp_tools.iter().cloned());
     }
 
-    // Check if this is a tools/call that needs real execution
     let method = request["method"].as_str().unwrap_or("");
     if method == "tools/call" {
         let tool_name = request["params"]["name"].as_str().unwrap_or("");
@@ -898,7 +942,6 @@ pub async fn mcp_http(
             .cloned()
             .unwrap_or(serde_json::json!({}));
 
-        // Verify the tool exists
         if !tools.iter().any(|t| t.name == tool_name) {
             return Json(serde_json::json!({
                 "jsonrpc": "2.0",
@@ -907,7 +950,6 @@ pub async fn mcp_http(
             }));
         }
 
-        // Snapshot skill registry before async call (RwLockReadGuard is !Send)
         let skill_snapshot = state
             .kernel
             .skill_registry_ref()
@@ -915,10 +957,9 @@ pub async fn mcp_http(
             .unwrap_or_else(|e| e.into_inner())
             .snapshot();
 
-        // Execute the tool via the kernel's tool runner
         let kernel_handle: Arc<dyn librefang_runtime::kernel_handle::KernelHandle> =
             state.kernel.clone() as Arc<dyn librefang_runtime::kernel_handle::KernelHandle>;
-        // Snapshot config before async call — Guard is !Send and cannot cross .await
+        // Snapshot config before async — Guard is !Send.
         let cfg = state.kernel.config_snapshot();
         let tts_opt = if cfg.tts.enabled {
             Some(state.kernel.tts())
@@ -930,27 +971,39 @@ pub async fn mcp_http(
         } else {
             None
         };
+
+        // Pull agent-scoped fields from the entry (when present). Binding
+        // `String`s / `PathBuf`s to locals keeps the borrows passed to
+        // `execute_tool` alive for the entire await.
+        let caller_id_owned = entry.as_ref().map(|e| e.id.0.to_string());
+        let workspace_owned = entry.as_ref().and_then(|e| e.manifest.workspace.clone());
+        let env_vars_slice = if cfg.exec_policy.allowed_env_vars.is_empty() {
+            None
+        } else {
+            Some(cfg.exec_policy.allowed_env_vars.as_slice())
+        };
+
         let result = librefang_runtime::tool_runner::execute_tool(
             "mcp-http",
             tool_name,
             &arguments,
             Some(&kernel_handle),
-            None, // allowed_tools
-            None, // caller_agent_id
+            None, // allowed_tools — delegated to kernel capability checks
+            caller_id_owned.as_deref(),
             Some(&skill_snapshot),
-            None, // allowed_skills
+            None,
             Some(state.kernel.mcp_connections_ref()),
             Some(state.kernel.web_tools()),
             Some(state.kernel.browser()),
-            None,
-            None,
+            env_vars_slice,
+            workspace_owned.as_deref(),
             Some(state.kernel.media()),
-            None, // media_drivers
-            None, // exec_policy
+            None,
+            Some(&cfg.exec_policy),
             tts_opt,
             docker_opt,
             Some(state.kernel.processes()),
-            None, // sender_id (MCP HTTP has no sender context)
+            None, // sender_id — MCP HTTP has no channel context
             None, // channel
         )
         .await;
@@ -965,7 +1018,6 @@ pub async fn mcp_http(
         }));
     }
 
-    // For non-tools/call methods (initialize, tools/list, etc.), delegate to the handler
     let response = librefang_runtime::mcp_server::handle_mcp_request(&request, &tools).await;
     Json(response)
 }

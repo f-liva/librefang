@@ -827,6 +827,10 @@ pub async fn build_router(
         .merge(routes::network::protocol_router())
         // MCP HTTP endpoint (protocol-level, not versioned)
         .route("/mcp", axum::routing::post(routes::mcp_http))
+        .route(
+            "/mcp/{agent_id}",
+            axum::routing::post(routes::mcp_http_for_agent),
+        )
         // OpenAI-compatible API (follows OpenAI versioning, not ours)
         .route(
             "/v1/chat/completions",

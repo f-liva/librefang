@@ -5819,6 +5819,13 @@
             }
           }
         ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {}
+            }
+          }
+        },
         "responses": {
           "200": {
             "description": "Default provider updated",
@@ -7641,6 +7648,13 @@
               "string",
               "null"
             ]
+          },
+          "web_search_augmentation": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Web search augmentation mode: \"off\", \"auto\", or \"always\"."
           }
         }
       },

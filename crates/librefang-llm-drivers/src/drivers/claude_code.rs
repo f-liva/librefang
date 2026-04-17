@@ -276,11 +276,21 @@ impl ClaudeCodeDriver {
     /// `mcpServers` shape; the `type: "http"` transport points at the
     /// daemon's existing `/mcp` endpoint (see
     /// `librefang-api/src/routes/network.rs::mcp_http`).
-    fn write_mcp_config(bridge: &McpBridgeConfig) -> std::io::Result<PathBuf> {
+    fn write_mcp_config(
+        bridge: &McpBridgeConfig,
+        agent_id: Option<&str>,
+    ) -> std::io::Result<PathBuf> {
         let path =
             std::env::temp_dir().join(format!("librefang-mcp-{}.json", uuid::Uuid::new_v4()));
         let base = bridge.base_url.trim_end_matches('/');
-        let url = format!("{base}/mcp");
+        // Append the agent_id so the inbound `tools/call` handler can build
+        // a full `ToolExecContext` (workspace_root, caller_agent_id, …) for
+        // the right agent. The trailing slash is harmless but keeps the URL
+        // canonical when no id is provided (playground / tests).
+        let url = match agent_id {
+            Some(id) if !id.is_empty() => format!("{base}/mcp/{id}"),
+            _ => format!("{base}/mcp"),
+        };
 
         let mut server = serde_json::json!({
             "type": "http",
@@ -506,7 +516,7 @@ impl LlmDriver for ClaudeCodeDriver {
 
         if !request.tools.is_empty() {
             if let Some(ref bridge) = self.mcp_bridge {
-                match Self::write_mcp_config(bridge) {
+                match Self::write_mcp_config(bridge, request.agent_id.as_deref()) {
                     Ok(path) => prepared.mcp_config_path = Some(path),
                     Err(e) => {
                         prepared.cleanup();
@@ -751,7 +761,7 @@ impl LlmDriver for ClaudeCodeDriver {
 
         if !request.tools.is_empty() {
             if let Some(ref bridge) = self.mcp_bridge {
-                match Self::write_mcp_config(bridge) {
+                match Self::write_mcp_config(bridge, request.agent_id.as_deref()) {
                     Ok(path) => prepared.mcp_config_path = Some(path),
                     Err(e) => {
                         prepared.cleanup();
@@ -1156,6 +1166,7 @@ mod tests {
             response_format: None,
             timeout_secs: None,
             extra_body: None,
+            agent_id: None,
         };
 
         let prompt = ClaudeCodeDriver::build_prompt(&request);
@@ -1198,6 +1209,7 @@ mod tests {
             response_format: None,
             timeout_secs: None,
             extra_body: None,
+            agent_id: None,
         };
 
         let prompt = ClaudeCodeDriver::build_prompt(&request);
