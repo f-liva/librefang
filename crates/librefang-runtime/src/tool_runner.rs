@@ -3149,8 +3149,22 @@ async fn tool_channel_send(
                 is_voice_note = normalized.is_voice_note,
                 mime = %normalized.mime_type,
                 duration = normalized.duration_seconds,
+                waveform_present = normalized.waveform.is_some(),
                 "channel_send: audio normalized for channel"
             );
+            if normalized.is_voice_note {
+                return kh
+                    .send_channel_voice_data(
+                        &channel,
+                        recipient,
+                        normalized.data,
+                        &normalized.filename,
+                        &normalized.mime_type,
+                        normalized.waveform,
+                        thread_id,
+                    )
+                    .await;
+            }
             return kh
                 .send_channel_file_data(
                     &channel,
