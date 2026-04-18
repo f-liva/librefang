@@ -21,7 +21,8 @@ const DEFAULT_TIMEOUT_MS = 1500;
 const MAX_TEXT_CHARS = 4000;
 const TRUNC_MARKER = '\n…[truncated]';
 
-// First line only; ambiguous → caller fail-closes.
+// Single `relay` or `none` token (optionally backtick-wrapped) on the
+// first line only; anything else is ambiguous and caller fail-closes.
 const VERDICT_RE = /^`?\s*(relay|none)\s*`?$/i;
 
 function coerceEnumOption(value, valid, fallback, optionName, logger) {
@@ -243,6 +244,7 @@ function createIntentClassifier({
 
 module.exports = {
   createIntentClassifier,
+  coerceEnumOption,
   MODES,
   FAIL_MODES,
   VALID_MODES,
