@@ -2562,27 +2562,32 @@ async function processMediaMessage(fullMsg, innerMsg, agentId) {
 // Regex compiled once at module load from the configured language
 // packs in `lib/intent_patterns.js`. Adding a locale is a file-level
 // change; adding the code to the config toggles it on.
-// Agent-id cache for the LLM classifier path. Keyed by the configured
-// classifier agent name so operators can hot-swap classifiers without a
-// restart. Cleared at every reconnect alongside `cachedAgentId`.
-const classifierAgentIdCache = new Map();
+// Agent-id cache for the LLM classifier path. Short TTL so a LibreFang
+// daemon restart (new agent UUIDs) or a mid-session operator fix of a
+// missing-classifier misconfiguration is picked up within minutes without
+// needing a WhatsApp reconnect. Reconnect still invalidates immediately.
+const CLASSIFIER_CACHE_TTL_HIT_MS = 5 * 60 * 1000;   // 5 min for resolved ids
+const CLASSIFIER_CACHE_TTL_MISS_MS = 30 * 1000;      // 30 s for no-such-agent
+const classifierAgentIdCache = new Map();            // name → { id, expiresAt }
 
 function invalidateClassifierAgentIdCache() {
   classifierAgentIdCache.clear();
 }
 
-// Classifier-specific lookup. Returns the agent UUID for `name` (or the
-// string itself if already a UUID), caches the resolution, returns `null`
-// on any error — caller fail-closes. Budgeted at 5s so a down daemon
-// cannot stall the inbound pipeline.
+function cacheClassifierAgentId(name, id) {
+  const ttl = id === null ? CLASSIFIER_CACHE_TTL_MISS_MS : CLASSIFIER_CACHE_TTL_HIT_MS;
+  classifierAgentIdCache.set(name, { id, expiresAt: Date.now() + ttl });
+  return id;
+}
+
 function resolveClassifierAgentIdByName(name) {
   if (!name || typeof name !== 'string') return Promise.resolve(null);
-  if (classifierAgentIdCache.has(name)) {
-    return Promise.resolve(classifierAgentIdCache.get(name));
+  const entry = classifierAgentIdCache.get(name);
+  if (entry && entry.expiresAt > Date.now()) {
+    return Promise.resolve(entry.id);
   }
   if (/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(name)) {
-    classifierAgentIdCache.set(name, name);
-    return Promise.resolve(name);
+    return Promise.resolve(cacheClassifierAgentId(name, name));
   }
   return new Promise((resolve) => {
     const url = new URL(`${LIBREFANG_URL}/api/agents`);
@@ -2606,15 +2611,11 @@ function resolveClassifierAgentIdByName(name) {
               (a) => (a.name || '').toLowerCase() === name.toLowerCase(),
             );
             if (match && match.id) {
-              classifierAgentIdCache.set(name, match.id);
-              resolve(match.id);
+              resolve(cacheClassifierAgentId(name, match.id));
             } else {
-              // Deterministic "no such agent" — cache the negative result so
-              // every subsequent owner turn doesn't hammer /api/agents during
-              // a misconfiguration. Cleared on reconnect (see
-              // `invalidateClassifierAgentIdCache`).
-              classifierAgentIdCache.set(name, null);
-              resolve(null);
+              // Deterministic no-such-agent — short-TTL negative cache so the
+              // endpoint isn't hammered while the operator notices.
+              resolve(cacheClassifierAgentId(name, null));
             }
           } catch {
             // Transient parse failure — do NOT cache; next call retries.
@@ -2640,18 +2641,9 @@ const intentClassifier = createIntentClassifier({
   llmFailMode: tomlConfig.relay_intent_llm_fail_mode,
   resolveAgentIdByName: resolveClassifierAgentIdByName,
   libreFangUrl: LIBREFANG_URL,
-  logger: {
-    info: (m) => console.log(m),
-    warn: (m) => console.warn(m),
-    error: (m) => console.error(m),
-    debug: () => {},
-  },
+  logger: console,
 });
 
-// Thin passthrough preserved so existing call sites and tests keep the
-// stable `ownerIntentsRelay(text)` name. Always async — regex mode resolves
-// synchronously inside the classifier and this just awaits a resolved
-// promise (no I/O happens on the hot path when mode=regex).
 async function ownerIntentsRelay(text) {
   return intentClassifier.isOwnerRelayIntent(text);
 }
