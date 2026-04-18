@@ -19,9 +19,15 @@ jobs:
           token: ${{ secrets.PAT_TOKEN }}
 
       - name: Notify Telegram (start)
+        env:
+          # Pass via env var so a commit-message body containing backticks
+          # doesn't trigger bash command-substitution when the YAML template
+          # is inlined into the run script (ff16f7ec broke CI this way).
+          COMMIT_MSG: ${{ github.event.head_commit.message }}
+          EVENT_NAME: ${{ github.event_name }}
         run: |
-          COMMIT_TITLE=$(echo "${{ github.event.head_commit.message }}" | head -1 | tr '`' "'")
-          COMMIT_TITLE=${COMMIT_TITLE:-${{ github.event_name }}}
+          COMMIT_TITLE=$(printf '%s\n' "$COMMIT_MSG" | head -1 | tr '`' "'")
+          COMMIT_TITLE=${COMMIT_TITLE:-$EVENT_NAME}
           curl -s -X POST "https://api.telegram.org/bot${{ secrets.TELEGRAM_BOT_TOKEN }}/sendMessage" \
             -d chat_id="${{ secrets.TELEGRAM_CHAT_ID }}" \
             -d parse_mode="Markdown" \
