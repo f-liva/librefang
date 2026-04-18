@@ -1003,24 +1003,30 @@ after(() => {
 // stranger conversation happens to be active.
 // ---------------------------------------------------------------------------
 describe('ownerIntentsRelay', () => {
-  it('returns false for neutral greetings', () => {
-    assert.equal(ownerIntentsRelay('saludos'), false);
-    assert.equal(ownerIntentsRelay('hola'), false);
-    assert.equal(ownerIntentsRelay('ciao'), false);
-    assert.equal(ownerIntentsRelay('Buondì'), false);
-    assert.equal(ownerIntentsRelay('come stai?'), false);
-    assert.equal(ownerIntentsRelay(''), false);
-    assert.equal(ownerIntentsRelay('   '), false);
+  // NOTE: `ownerIntentsRelay` is async — the default `[relay_intent].mode =
+  // "regex"` config keeps the hot path synchronous *inside* the classifier
+  // (no I/O), but the public surface always returns a Promise so llm-mode
+  // deployments can opt in without touching call sites. Every assertion
+  // below awaits the result to lock parity with the pre-classifier
+  // behaviour.
+  it('returns false for neutral greetings', async () => {
+    assert.equal(await ownerIntentsRelay('saludos'), false);
+    assert.equal(await ownerIntentsRelay('hola'), false);
+    assert.equal(await ownerIntentsRelay('ciao'), false);
+    assert.equal(await ownerIntentsRelay('Buondì'), false);
+    assert.equal(await ownerIntentsRelay('come stai?'), false);
+    assert.equal(await ownerIntentsRelay(''), false);
+    assert.equal(await ownerIntentsRelay('   '), false);
   });
 
-  it('returns true for explicit /relay or /reply command', () => {
-    assert.equal(ownerIntentsRelay('/relay tell him I will be late'), true);
-    assert.equal(ownerIntentsRelay('/reply ok grazie'), true);
+  it('returns true for explicit /relay or /reply command', async () => {
+    assert.equal(await ownerIntentsRelay('/relay tell him I will be late'), true);
+    assert.equal(await ownerIntentsRelay('/reply ok grazie'), true);
   });
 
-  it('returns true for @mention', () => {
-    assert.equal(ownerIntentsRelay('@alice hi there'), true);
-    assert.equal(ownerIntentsRelay('please say @bob hi'), true);
+  it('returns true for @mention', async () => {
+    assert.equal(await ownerIntentsRelay('@alice hi there'), true);
+    assert.equal(await ownerIntentsRelay('please say @bob hi'), true);
   });
 
   it('Italian pack: recognises delegated-speech verbs, rejects owner→agent formal imperative', () => {
@@ -1049,10 +1055,10 @@ describe('ownerIntentsRelay', () => {
     assert.ok(re.test('digli che arrivo'));
   });
 
-  it('returns true for English delegated-speech verbs', () => {
-    assert.equal(ownerIntentsRelay('reply to Bob that I agree'), true);
-    assert.equal(ownerIntentsRelay('tell Alice I am busy'), true);
-    assert.equal(ownerIntentsRelay('write to the team'), true);
+  it('returns true for English delegated-speech verbs', async () => {
+    assert.equal(await ownerIntentsRelay('reply to Bob that I agree'), true);
+    assert.equal(await ownerIntentsRelay('tell Alice I am busy'), true);
+    assert.equal(await ownerIntentsRelay('write to the team'), true);
   });
 
   it('is case-insensitive (IT pack)', () => {
@@ -1062,27 +1068,27 @@ describe('ownerIntentsRelay', () => {
     assert.ok(re.test('DIGLI che sto arrivando'));
   });
 
-  it('does not match partial words', () => {
-    assert.equal(ownerIntentsRelay('salutami la zia'), false);
-    assert.equal(ownerIntentsRelay('rispostaok'), false);
+  it('does not match partial words', async () => {
+    assert.equal(await ownerIntentsRelay('salutami la zia'), false);
+    assert.equal(await ownerIntentsRelay('rispostaok'), false);
   });
 
-  it('does not treat "tell me/us/you" as relay intent (owner → agent)', () => {
-    assert.equal(ownerIntentsRelay('tell me a joke'), false);
-    assert.equal(ownerIntentsRelay('can you tell me about this'), false);
-    assert.equal(ownerIntentsRelay('tell us the news'), false);
-    assert.equal(ownerIntentsRelay('tell you what'), false);
+  it('does not treat "tell me/us/you" as relay intent (owner → agent)', async () => {
+    assert.equal(await ownerIntentsRelay('tell me a joke'), false);
+    assert.equal(await ownerIntentsRelay('can you tell me about this'), false);
+    assert.equal(await ownerIntentsRelay('tell us the news'), false);
+    assert.equal(await ownerIntentsRelay('tell you what'), false);
   });
 
-  it('does not treat "looking forward to" as relay intent', () => {
-    assert.equal(ownerIntentsRelay('I look forward to meeting you'), false);
-    assert.equal(ownerIntentsRelay('looking forward to the call'), false);
-    assert.equal(ownerIntentsRelay('I am forward to hearing from you'), false);
+  it('does not treat "looking forward to" as relay intent', async () => {
+    assert.equal(await ownerIntentsRelay('I look forward to meeting you'), false);
+    assert.equal(await ownerIntentsRelay('looking forward to the call'), false);
+    assert.equal(await ownerIntentsRelay('I am forward to hearing from you'), false);
   });
 
-  it('still matches "forward <it|this|the X> to <recipient>"', () => {
-    assert.equal(ownerIntentsRelay('forward it to Bob'), true);
-    assert.equal(ownerIntentsRelay('forward this to Alice'), true);
-    assert.equal(ownerIntentsRelay('forward the message to the team'), true);
+  it('still matches "forward <it|this|the X> to <recipient>"', async () => {
+    assert.equal(await ownerIntentsRelay('forward it to Bob'), true);
+    assert.equal(await ownerIntentsRelay('forward this to Alice'), true);
+    assert.equal(await ownerIntentsRelay('forward the message to the team'), true);
   });
 });
