@@ -13,6 +13,7 @@ const groupActivation = require('./lib/group-activation');
 const groupAllowFrom = require('./lib/group-allow-from');
 const pendingGroupHistory = require('./lib/pending-group-history');
 const { createDedupTracker } = require('./lib/dedup-tracker');
+const { createIntentClassifier } = require('./lib/intent_classifier');
 const {
   isLidJid,
   isGroupJid,
@@ -298,6 +299,20 @@ function readWhatsAppConfig(configPath) {
     // set `[relay_intent].languages = ["en", "it", …]` in config.toml
     // to enable extra language packs.
     relay_intent_languages: ['en'],
+    // `regex` (default) runs the language-pack classifier only — zero
+    // latency, zero LLM spend. `llm` opts into the LLM classifier
+    // (see docs/relay-intent-llm.md). No deployment sees a behavioural
+    // change without setting `[relay_intent].mode = "llm"`.
+    relay_intent_mode: 'regex',
+    // Agent name (or UUID) to route classification calls to when
+    // mode=llm. Empty string → fail-closed (no LLM call is made).
+    relay_intent_llm_classifier_agent: '',
+    // Hard wall-clock cap per classification. Exceeded → fail mode.
+    relay_intent_llm_timeout_ms: 1500,
+    // "closed" → return false on any LLM failure (safer: never leaks a
+    // neutral message to a stranger). "regex" → downgrade to the
+    // language-pack classifier instead of returning false.
+    relay_intent_llm_fail_mode: 'closed',
   };
   try {
     const content = fs.readFileSync(configPath, 'utf8');
@@ -328,9 +343,28 @@ function readWhatsAppConfig(configPath) {
         Array.isArray(relay.languages) && relay.languages.length > 0
           ? relay.languages
           : defaults.relay_intent_languages,
+      relay_intent_mode: ['regex', 'llm'].includes(
+        typeof relay.mode === 'string' ? relay.mode.toLowerCase() : '',
+      )
+        ? relay.mode.toLowerCase()
+        : defaults.relay_intent_mode,
+      relay_intent_llm_classifier_agent:
+        typeof relay.llm_classifier_agent === 'string'
+          ? relay.llm_classifier_agent
+          : defaults.relay_intent_llm_classifier_agent,
+      relay_intent_llm_timeout_ms:
+        parseInt(relay.llm_timeout_ms, 10) || defaults.relay_intent_llm_timeout_ms,
+      relay_intent_llm_fail_mode: ['closed', 'regex'].includes(
+        typeof relay.llm_fail_mode === 'string' ? relay.llm_fail_mode.toLowerCase() : '',
+      )
+        ? relay.llm_fail_mode.toLowerCase()
+        : defaults.relay_intent_llm_fail_mode,
     };
     const overrideLog = overrides.size > 0 ? `, group_activation_overrides=${overrides.size}` : '';
-    console.log(`[gateway] Read config from ${configPath}: default_agent="${cfg.default_agent}", owner_numbers=${JSON.stringify(cfg.owner_numbers)}, conversation_ttl_hours=${cfg.conversation_ttl_hours}${overrideLog}, relay_intent_languages=${JSON.stringify(cfg.relay_intent_languages)}`);
+    const llmLog = cfg.relay_intent_mode === 'llm'
+      ? `, relay_intent_llm_classifier_agent="${cfg.relay_intent_llm_classifier_agent}", relay_intent_llm_timeout_ms=${cfg.relay_intent_llm_timeout_ms}, relay_intent_llm_fail_mode="${cfg.relay_intent_llm_fail_mode}"`
+      : '';
+    console.log(`[gateway] Read config from ${configPath}: default_agent="${cfg.default_agent}", owner_numbers=${JSON.stringify(cfg.owner_numbers)}, conversation_ttl_hours=${cfg.conversation_ttl_hours}${overrideLog}, relay_intent_mode="${cfg.relay_intent_mode}", relay_intent_languages=${JSON.stringify(cfg.relay_intent_languages)}${llmLog}`);
     return cfg;
   } catch (err) {
     console.warn(`[gateway] Could not read ${configPath}: ${err.message} — using defaults/env vars`);
@@ -1360,6 +1394,7 @@ async function startConnection() {
         await cleanupSocket();
         reconnectAttempts = 0;
         cachedAgentId = null;
+        invalidateClassifierAgentIdCache();
         // Remove auth store so next connect gets a fresh QR
         const fs = require('node:fs');
         const path = require('node:path');
@@ -1425,6 +1460,7 @@ async function startConnection() {
       // Invalidate cached agent UUID on reconnect — the daemon may have
       // restarted and agents may have new UUIDs.
       cachedAgentId = null;
+      invalidateClassifierAgentIdCache();
 
       // Resolve LIDs for every OWNER_NUMBERS entry so that LID-addressed
       // messages from the owner are recognised without waiting for the first
@@ -2000,7 +2036,7 @@ async function startConnection() {
         } else if (isStranger) {
           const strangerContext = buildStrangerContext(pushName, phone, sender);
           messageToSend = strangerContext + messageText;
-        } else if (isOwner && activeConversations.size > 0 && ownerIntentsRelay(messageText)) {
+        } else if (isOwner && activeConversations.size > 0 && (await ownerIntentsRelay(messageText))) {
           // Only inject the relay system instruction when the owner's text
           // expresses an explicit delegated-speech intent. A neutral greeting
           // from the owner to the agent during an active stranger conversation
@@ -2526,16 +2562,98 @@ async function processMediaMessage(fullMsg, innerMsg, agentId) {
 // Regex compiled once at module load from the configured language
 // packs in `lib/intent_patterns.js`. Adding a locale is a file-level
 // change; adding the code to the config toggles it on.
-const RELAY_INTENT_RE = require('./lib/intent_patterns').compileIntentRegex(
-  tomlConfig.relay_intent_languages,
-);
+// Agent-id cache for the LLM classifier path. Keyed by the configured
+// classifier agent name so operators can hot-swap classifiers without a
+// restart. Cleared at every reconnect alongside `cachedAgentId`.
+const classifierAgentIdCache = new Map();
 
-function ownerIntentsRelay(text) {
-  const t = (text || '').trim().toLowerCase();
-  if (!t) return false;
-  if (t.startsWith('/relay') || t.startsWith('/reply')) return true;
-  if (/(^|\s)@[\w.+-]+/.test(t)) return true;
-  return RELAY_INTENT_RE.test(t);
+function invalidateClassifierAgentIdCache() {
+  classifierAgentIdCache.clear();
+}
+
+// Classifier-specific lookup. Returns the agent UUID for `name` (or the
+// string itself if already a UUID), caches the resolution, returns `null`
+// on any error — caller fail-closes. Budgeted at 5s so a down daemon
+// cannot stall the inbound pipeline.
+function resolveClassifierAgentIdByName(name) {
+  if (!name || typeof name !== 'string') return Promise.resolve(null);
+  if (classifierAgentIdCache.has(name)) {
+    return Promise.resolve(classifierAgentIdCache.get(name));
+  }
+  if (/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(name)) {
+    classifierAgentIdCache.set(name, name);
+    return Promise.resolve(name);
+  }
+  return new Promise((resolve) => {
+    const url = new URL(`${LIBREFANG_URL}/api/agents`);
+    const req = http.request(
+      {
+        hostname: url.hostname,
+        port: url.port || 4545,
+        path: url.pathname,
+        method: 'GET',
+        headers: { Accept: 'application/json' },
+        timeout: 5_000,
+      },
+      (res) => {
+        let body = '';
+        res.on('data', (chunk) => { body += chunk; });
+        res.on('end', () => {
+          try {
+            const parsed = JSON.parse(body);
+            const agents = Array.isArray(parsed) ? parsed : parsed.items || [];
+            const match = agents.find(
+              (a) => (a.name || '').toLowerCase() === name.toLowerCase(),
+            );
+            if (match && match.id) {
+              classifierAgentIdCache.set(name, match.id);
+              resolve(match.id);
+            } else {
+              // Deterministic "no such agent" — cache the negative result so
+              // every subsequent owner turn doesn't hammer /api/agents during
+              // a misconfiguration. Cleared on reconnect (see
+              // `invalidateClassifierAgentIdCache`).
+              classifierAgentIdCache.set(name, null);
+              resolve(null);
+            }
+          } catch {
+            // Transient parse failure — do NOT cache; next call retries.
+            resolve(null);
+          }
+        });
+      },
+    );
+    req.on('error', () => resolve(null));
+    req.on('timeout', () => {
+      req.destroy();
+      resolve(null);
+    });
+    req.end();
+  });
+}
+
+const intentClassifier = createIntentClassifier({
+  mode: tomlConfig.relay_intent_mode,
+  languages: tomlConfig.relay_intent_languages,
+  llmClassifierAgent: tomlConfig.relay_intent_llm_classifier_agent,
+  llmTimeoutMs: tomlConfig.relay_intent_llm_timeout_ms,
+  llmFailMode: tomlConfig.relay_intent_llm_fail_mode,
+  resolveAgentIdByName: resolveClassifierAgentIdByName,
+  libreFangUrl: LIBREFANG_URL,
+  logger: {
+    info: (m) => console.log(m),
+    warn: (m) => console.warn(m),
+    error: (m) => console.error(m),
+    debug: () => {},
+  },
+});
+
+// Thin passthrough preserved so existing call sites and tests keep the
+// stable `ownerIntentsRelay(text)` name. Always async — regex mode resolves
+// synchronously inside the classifier and this just awaits a resolved
+// promise (no I/O happens on the hot path when mode=regex).
+async function ownerIntentsRelay(text) {
+  return intentClassifier.isOwnerRelayIntent(text);
 }
 
 // ---------------------------------------------------------------------------
