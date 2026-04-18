@@ -12,6 +12,7 @@ const lidCache = require('./lib/lid-cache');
 const { createDedupTracker } = require('./lib/dedup-tracker');
 const {
   createIntentClassifier,
+  coerceEnumOption: coerceIntentOption,
   MODES: INTENT_MODES,
   FAIL_MODES: INTENT_FAIL_MODES,
   VALID_MODES: VALID_INTENT_MODES,
@@ -265,10 +266,17 @@ function readWhatsAppConfig(configPath) {
         Array.isArray(relay.languages) && relay.languages.length > 0
           ? relay.languages
           : defaults.relay_intent_languages,
-      relay_intent_mode: VALID_INTENT_MODES.includes(
-        typeof relay.mode === 'string' ? relay.mode.toLowerCase() : '',
-      )
-        ? relay.mode.toLowerCase()
+      // Only coerce when operator actually wrote a value — a missing
+      // `[relay_intent].mode` must use the default silently without a
+      // spurious "unknown" warning.
+      relay_intent_mode: typeof relay.mode === 'string'
+        ? coerceIntentOption(
+          relay.mode.toLowerCase(),
+          VALID_INTENT_MODES,
+          defaults.relay_intent_mode,
+          'relay_intent.mode',
+          console,
+        )
         : defaults.relay_intent_mode,
       relay_intent_llm_classifier_agent:
         typeof relay.llm_classifier_agent === 'string'
@@ -276,10 +284,14 @@ function readWhatsAppConfig(configPath) {
           : defaults.relay_intent_llm_classifier_agent,
       relay_intent_llm_timeout_ms:
         parseInt(relay.llm_timeout_ms, 10) || defaults.relay_intent_llm_timeout_ms,
-      relay_intent_llm_fail_mode: VALID_INTENT_FAIL_MODES.includes(
-        typeof relay.llm_fail_mode === 'string' ? relay.llm_fail_mode.toLowerCase() : '',
-      )
-        ? relay.llm_fail_mode.toLowerCase()
+      relay_intent_llm_fail_mode: typeof relay.llm_fail_mode === 'string'
+        ? coerceIntentOption(
+          relay.llm_fail_mode.toLowerCase(),
+          VALID_INTENT_FAIL_MODES,
+          defaults.relay_intent_llm_fail_mode,
+          'relay_intent.llm_fail_mode',
+          console,
+        )
         : defaults.relay_intent_llm_fail_mode,
     };
     const llmLog = cfg.relay_intent_mode === INTENT_MODES.LLM
