@@ -1,29 +1,9 @@
 'use strict';
 
-// Owner-relay-intent classifier.
-//
-// Two modes, selected per deployment via [relay_intent].mode in config.toml:
-//
-//   "regex" (default) — keyword-pack match. Zero latency, zero LLM spend,
-//     no external dependency. See `lib/intent_patterns.js`.
-//
-//   "llm"             — opt-in classifier that routes the owner text through
-//     a dedicated classifier agent registered in LibreFang. Handles any
-//     language / slang / codeswitch without expanding the regex packs.
-//     Fail-closed by default: on timeout, HTTP error, unparseable verdict,
-//     or missing classifier agent, returns `false` — losing a legitimate
-//     relay is safer than leaking an owner message to the wrong stranger.
-//
-// The LLM path is built to survive prompt-injection attempts in the owner
-// text:
-//   - Text is wrapped in a per-call nonce-delimited fence. The attacker does
-//     not see the nonce, so they cannot forge an "end-of-fence" token inside
-//     their own message to escape the region.
-//   - Text is truncated at MAX_TEXT_CHARS to bound prompt size and LLM cost.
-//   - Response is parsed strictly: the verdict must be a single token
-//     (`relay` or `none`, optionally backtick-wrapped, case-insensitive)
-//     on the first line. Anything else is treated as a bad verdict and
-//     handled by llmFailMode.
+// Owner-relay-intent classifier. Two modes: `regex` (default, zero I/O)
+// and `llm` (opt-in, routes owner text through a dedicated classifier
+// agent registered in LibreFang). The LLM path is hardened against
+// prompt injection — see docs/relay-intent-llm.md for the threat model.
 
 const crypto = require('node:crypto');
 const http = require('node:http');
@@ -32,13 +12,17 @@ const { URL } = require('node:url');
 
 const { compileIntentRegex } = require('./intent_patterns');
 
+const MODES = Object.freeze({ REGEX: 'regex', LLM: 'llm' });
+const FAIL_MODES = Object.freeze({ CLOSED: 'closed', REGEX: 'regex' });
+const VALID_MODES = Object.freeze(Object.values(MODES));
+const VALID_FAIL_MODES = Object.freeze(Object.values(FAIL_MODES));
+
 const DEFAULT_TIMEOUT_MS = 1500;
 const MAX_TEXT_CHARS = 4000;
 const TRUNC_MARKER = '\n…[truncated]';
 
-// Strict verdict: a single word, optionally wrapped in backticks, with
-// optional surrounding whitespace. First line of response only — anything
-// else is ambiguous and caller fail-closes.
+// Verdict must be a single `relay` / `none` token (optionally backtick-
+// wrapped) on the first line; anything else is ambiguous and fail-closes.
 const VERDICT_RE = /^`?\s*(relay|none)\s*`?$/i;
 
 function truncateText(text) {
@@ -91,7 +75,6 @@ function fastPathVerdict(text) {
   return { matched: false };
 }
 
-// Default transport for production use. Tests inject their own httpClient.
 function defaultHttpClient() {
   return async ({ url, method = 'POST', headers = {}, body = '', timeoutMs }) => {
     const u = new URL(url);
@@ -128,9 +111,9 @@ function defaultHttpClient() {
   };
 }
 
-// Race the httpClient promise against our own timer so mock-based tests don't
-// need to implement timeouts themselves — and so a misbehaving transport
-// can't hold the gateway past llmTimeoutMs.
+// Independent timer guarantees the classifier returns within llmTimeoutMs
+// even if the injected httpClient (e.g. a misbehaving mock or a transport
+// with its own bug) fails to honour the budget.
 function withTimeout(promise, timeoutMs) {
   if (!timeoutMs || timeoutMs <= 0) return promise;
   let timer;
@@ -144,17 +127,33 @@ function withTimeout(promise, timeoutMs) {
 }
 
 function createIntentClassifier({
-  mode = 'regex',
+  mode = MODES.REGEX,
   languages = ['en'],
   llmClassifierAgent = '',
   llmTimeoutMs = DEFAULT_TIMEOUT_MS,
-  llmFailMode = 'closed',
+  llmFailMode = FAIL_MODES.CLOSED,
   resolveAgentIdByName = async () => null,
   httpClient = defaultHttpClient(),
   libreFangUrl = 'http://127.0.0.1:4545',
   logger = console,
 } = {}) {
-  const effectiveMode = mode === 'llm' ? 'llm' : 'regex';
+  // Unknown mode / fail_mode → warn once at construction and fall back to
+  // the safe default. Operators get a signal the value didn't take effect
+  // instead of silent degradation.
+  let effectiveMode = mode;
+  if (!VALID_MODES.includes(effectiveMode)) {
+    logger.warn?.(
+      `[intent_classifier] unknown mode ${JSON.stringify(mode)} — falling back to "${MODES.REGEX}" (valid: ${VALID_MODES.join(', ')})`,
+    );
+    effectiveMode = MODES.REGEX;
+  }
+  let effectiveFailMode = llmFailMode;
+  if (!VALID_FAIL_MODES.includes(effectiveFailMode)) {
+    logger.warn?.(
+      `[intent_classifier] unknown llmFailMode ${JSON.stringify(llmFailMode)} — falling back to "${FAIL_MODES.CLOSED}" (valid: ${VALID_FAIL_MODES.join(', ')})`,
+    );
+    effectiveFailMode = FAIL_MODES.CLOSED;
+  }
   const compiled = compileIntentRegex(languages);
   const baseUrl = String(libreFangUrl || '').replace(/\/+$/, '');
 
@@ -227,18 +226,18 @@ function createIntentClassifier({
     return verdict;
   }
 
-  async function isOwnerRelayIntent(text /* , { sender, locale } = {} */) {
+  async function isOwnerRelayIntent(text) {
     const fast = fastPathVerdict(text);
     if (fast.matched) return fast.verdict;
 
-    if (effectiveMode === 'regex') {
+    if (effectiveMode === MODES.REGEX) {
       return regexVerdict(text);
     }
 
     const llmResult = await llmClassify(text);
     if (llmResult !== null) return llmResult;
 
-    if (llmFailMode === 'regex') return regexVerdict(text);
+    if (effectiveFailMode === FAIL_MODES.REGEX) return regexVerdict(text);
     return false;
   }
 
@@ -247,8 +246,16 @@ function createIntentClassifier({
 
 module.exports = {
   createIntentClassifier,
-  buildClassifyPrompt,
-  parseVerdict,
+  MODES,
+  FAIL_MODES,
+  VALID_MODES,
+  VALID_FAIL_MODES,
   DEFAULT_TIMEOUT_MS,
   MAX_TEXT_CHARS,
+  // Test-only entry points — kept off the public surface so normal
+  // consumers don't think they're part of the API.
+  __testing: {
+    buildClassifyPrompt,
+    parseVerdict,
+  },
 };

@@ -5,9 +5,8 @@ const { describe, it } = require('node:test');
 
 const {
   createIntentClassifier,
-  buildClassifyPrompt,
-  parseVerdict,
   MAX_TEXT_CHARS,
+  __testing: { buildClassifyPrompt, parseVerdict },
 } = require('./intent_classifier');
 
 // ---------------------------------------------------------------------------
