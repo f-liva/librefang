@@ -21,9 +21,16 @@ const DEFAULT_TIMEOUT_MS = 1500;
 const MAX_TEXT_CHARS = 4000;
 const TRUNC_MARKER = '\n…[truncated]';
 
-// Verdict must be a single `relay` / `none` token (optionally backtick-
-// wrapped) on the first line; anything else is ambiguous and fail-closes.
+// First line only; ambiguous → caller fail-closes.
 const VERDICT_RE = /^`?\s*(relay|none)\s*`?$/i;
+
+function coerceEnumOption(value, valid, fallback, optionName, logger) {
+  if (valid.includes(value)) return value;
+  logger.warn?.(
+    `[intent_classifier] unknown ${optionName} ${JSON.stringify(value)} — falling back to ${JSON.stringify(fallback)} (valid: ${valid.join(', ')})`,
+  );
+  return fallback;
+}
 
 function truncateText(text) {
   const s = String(text ?? '');
@@ -138,22 +145,12 @@ function createIntentClassifier({
   logger = console,
 } = {}) {
   // Unknown mode / fail_mode → warn once at construction and fall back to
-  // the safe default. Operators get a signal the value didn't take effect
-  // instead of silent degradation.
-  let effectiveMode = mode;
-  if (!VALID_MODES.includes(effectiveMode)) {
-    logger.warn?.(
-      `[intent_classifier] unknown mode ${JSON.stringify(mode)} — falling back to "${MODES.REGEX}" (valid: ${VALID_MODES.join(', ')})`,
-    );
-    effectiveMode = MODES.REGEX;
-  }
-  let effectiveFailMode = llmFailMode;
-  if (!VALID_FAIL_MODES.includes(effectiveFailMode)) {
-    logger.warn?.(
-      `[intent_classifier] unknown llmFailMode ${JSON.stringify(llmFailMode)} — falling back to "${FAIL_MODES.CLOSED}" (valid: ${VALID_FAIL_MODES.join(', ')})`,
-    );
-    effectiveFailMode = FAIL_MODES.CLOSED;
-  }
+  // the safe default, so operators see the value didn't take effect
+  // instead of silently degrading.
+  const effectiveMode = coerceEnumOption(mode, VALID_MODES, MODES.REGEX, 'mode', logger);
+  const effectiveFailMode = coerceEnumOption(
+    llmFailMode, VALID_FAIL_MODES, FAIL_MODES.CLOSED, 'llmFailMode', logger,
+  );
   const compiled = compileIntentRegex(languages);
   const baseUrl = String(libreFangUrl || '').replace(/\/+$/, '');
 

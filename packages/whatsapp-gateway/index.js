@@ -10,7 +10,13 @@ const toml = require('toml');
 const { EchoTracker } = require('./lib/echo-tracker');
 const lidCache = require('./lib/lid-cache');
 const { createDedupTracker } = require('./lib/dedup-tracker');
-const { createIntentClassifier } = require('./lib/intent_classifier');
+const {
+  createIntentClassifier,
+  MODES: INTENT_MODES,
+  FAIL_MODES: INTENT_FAIL_MODES,
+  VALID_MODES: VALID_INTENT_MODES,
+  VALID_FAIL_MODES: VALID_INTENT_FAIL_MODES,
+} = require('./lib/intent_classifier');
 const {
   isLidJid,
   isGroupJid,
@@ -235,7 +241,7 @@ function readWhatsAppConfig(configPath) {
     // latency, zero LLM spend. `llm` opts into the LLM classifier
     // (see docs/relay-intent-llm.md). No deployment sees a behavioural
     // change without setting `[relay_intent].mode = "llm"`.
-    relay_intent_mode: 'regex',
+    relay_intent_mode: INTENT_MODES.REGEX,
     // Agent name (or UUID) to route classification calls to when
     // mode=llm. Empty string → fail-closed (no LLM call is made).
     relay_intent_llm_classifier_agent: '',
@@ -244,7 +250,7 @@ function readWhatsAppConfig(configPath) {
     // "closed" → return false on any LLM failure (safer: never leaks a
     // neutral message to a stranger). "regex" → downgrade to the
     // language-pack classifier instead of returning false.
-    relay_intent_llm_fail_mode: 'closed',
+    relay_intent_llm_fail_mode: INTENT_FAIL_MODES.CLOSED,
   };
   try {
     const content = fs.readFileSync(configPath, 'utf8');
@@ -259,7 +265,7 @@ function readWhatsAppConfig(configPath) {
         Array.isArray(relay.languages) && relay.languages.length > 0
           ? relay.languages
           : defaults.relay_intent_languages,
-      relay_intent_mode: ['regex', 'llm'].includes(
+      relay_intent_mode: VALID_INTENT_MODES.includes(
         typeof relay.mode === 'string' ? relay.mode.toLowerCase() : '',
       )
         ? relay.mode.toLowerCase()
@@ -270,13 +276,13 @@ function readWhatsAppConfig(configPath) {
           : defaults.relay_intent_llm_classifier_agent,
       relay_intent_llm_timeout_ms:
         parseInt(relay.llm_timeout_ms, 10) || defaults.relay_intent_llm_timeout_ms,
-      relay_intent_llm_fail_mode: ['closed', 'regex'].includes(
+      relay_intent_llm_fail_mode: VALID_INTENT_FAIL_MODES.includes(
         typeof relay.llm_fail_mode === 'string' ? relay.llm_fail_mode.toLowerCase() : '',
       )
         ? relay.llm_fail_mode.toLowerCase()
         : defaults.relay_intent_llm_fail_mode,
     };
-    const llmLog = cfg.relay_intent_mode === 'llm'
+    const llmLog = cfg.relay_intent_mode === INTENT_MODES.LLM
       ? `, relay_intent_llm_classifier_agent="${cfg.relay_intent_llm_classifier_agent}", relay_intent_llm_timeout_ms=${cfg.relay_intent_llm_timeout_ms}, relay_intent_llm_fail_mode="${cfg.relay_intent_llm_fail_mode}"`
       : '';
     console.log(`[gateway] Read config from ${configPath}: default_agent="${cfg.default_agent}", owner_numbers=${JSON.stringify(cfg.owner_numbers)}, conversation_ttl_hours=${cfg.conversation_ttl_hours}, relay_intent_mode="${cfg.relay_intent_mode}", relay_intent_languages=${JSON.stringify(cfg.relay_intent_languages)}${llmLog}`);
