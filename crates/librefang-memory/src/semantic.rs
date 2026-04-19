@@ -406,6 +406,46 @@ impl SemanticStore {
             );
         }
 
+        // Phase 05 §B.2 — chat-aware recall filter.
+        //
+        // Applied AFTER any SQL `metadata` exact-match filtering because the
+        // `json_extract = ?` predicate can't express "tag is None OR tag ==
+        // active": we want untagged fragments (legacy / explicitly global)
+        // to survive alongside fragments tagged with the active chat. Doing
+        // this in-process after retrieval keeps the SQL layer simple.
+        //
+        // Semantics:
+        //  - filter.active_chat_jid = None              → no filter (opt out).
+        //  - fragment.metadata has no "chat_jid"        → always in (legacy).
+        //  - fragment.metadata["chat_jid"] == active    → in.
+        //  - fragment.metadata["chat_jid"] != active    → out (bleed block).
+        //
+        // Disabled globally via `LIBREFANG_MEMORY_CHAT_AWARE=off`.
+        if let Some(f) = filter.as_ref() {
+            if let Some(active) = f.active_chat_jid.as_deref() {
+                let chat_aware_enabled = std::env::var("LIBREFANG_MEMORY_CHAT_AWARE")
+                    .map(|v| v != "off")
+                    .unwrap_or(true);
+                if chat_aware_enabled {
+                    let before = fragments.len();
+                    fragments.retain(|frag| {
+                        match frag.metadata.get("chat_jid").and_then(|v| v.as_str()) {
+                            None => true,               // untagged → always visible
+                            Some(tag) => tag == active, // strict equality
+                        }
+                    });
+                    if fragments.len() != before {
+                        debug!(
+                            "Chat-aware filter dropped {} of {} fragments for chat_jid={}",
+                            before - fragments.len(),
+                            before,
+                            active
+                        );
+                    }
+                }
+            }
+        }
+
         // Update access counts for returned memories. Logged on failure
         // because the decay/consolidation engine keys TTL decisions off
         // accessed_at — silently losing updates means "active" memories
@@ -454,6 +494,35 @@ impl SemanticStore {
                 .map_err(|e| LibreFangError::Memory(e.to_string()))?;
             if let Some(frag) = self.get_by_id(mem_id, false)? {
                 fragments.push(frag);
+            }
+        }
+
+        // Phase 05 §B.2 — chat-aware recall filter (vector-store path).
+        // Mirror of the in-process path above. See `recall_with_embedding`
+        // for the semantics: untagged fragments pass through; tagged
+        // fragments match only the active chat_jid.
+        if let Some(f) = filter.as_ref() {
+            if let Some(active) = f.active_chat_jid.as_deref() {
+                let chat_aware_enabled = std::env::var("LIBREFANG_MEMORY_CHAT_AWARE")
+                    .map(|v| v != "off")
+                    .unwrap_or(true);
+                if chat_aware_enabled {
+                    let before = fragments.len();
+                    fragments.retain(|frag| {
+                        match frag.metadata.get("chat_jid").and_then(|v| v.as_str()) {
+                            None => true,
+                            Some(tag) => tag == active,
+                        }
+                    });
+                    if fragments.len() != before {
+                        debug!(
+                            "Chat-aware filter (vs) dropped {} of {} for chat_jid={}",
+                            before - fragments.len(),
+                            before,
+                            active
+                        );
+                    }
+                }
             }
         }
 
