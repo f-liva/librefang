@@ -9,6 +9,8 @@
 // Core infrastructure — always compiled
 pub mod bridge;
 pub mod formatter;
+#[cfg(feature = "channel-telegram")]
+pub(crate) mod html_strip;
 pub(crate) mod http_client;
 pub mod message_journal;
 pub mod rate_limiter;
