@@ -460,7 +460,7 @@ impl TelegramAdapter {
                 if status == reqwest::StatusCode::BAD_REQUEST
                     && body_text.contains("can't parse entities")
                 {
-                    let stripped = strip_html_for_fallback(&chunk);
+                    let stripped = strip_html_for_fallback(chunk);
                     let parse_error_excerpt: String = body_text.chars().take(100).collect();
                     warn!(
                         event = "telegram_html_fallback_strip",
@@ -4751,5 +4751,207 @@ mod tests {
                 panic!("expected unchanged Text (no photo URL with fake token), got {other:?}")
             }
         }
+    }
+}
+
+// --- Retry-fallback integration tests (Fix 2, incident 2026-04-19) ---
+//
+// Exercises the api_send_message HTML-parse-failed retry branch through a
+// mocked Telegram API (wiremock). Asserts:
+//   1. Happy-path: valid HTML succeeds on first request, no retry fires.
+//   2. Adversarial: crossed tags trigger 400 → retry body is stripped plain.
+//   3. Incident replay: formatter output for Signore verbatim message
+//      should succeed on first request with zero retry-fallback activity.
+#[cfg(test)]
+mod retry_fallback_tests {
+    use super::*;
+    use crate::formatter::format_for_channel;
+    use librefang_types::config::OutputFormat;
+    use wiremock::matchers::{method, path_regex};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    /// Build a TelegramAdapter pointed at `base_url` for offline testing.
+    /// Uses a fixed fake token ("TEST_TOKEN") so the URL path is predictable.
+    fn test_adapter(base_url: &str) -> TelegramAdapter {
+        TelegramAdapter::new(
+            "TEST_TOKEN".to_string(),
+            Vec::new(),
+            Duration::from_secs(1),
+            Some(base_url.to_string()),
+        )
+    }
+
+    #[tokio::test]
+    async fn test_happy_path_no_retry_fires() {
+        let mock_server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path_regex(r"^/botTEST_TOKEN/sendMessage$"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_raw(br#"{"ok":true,"result":{}}"#, "application/json"),
+            )
+            .mount(&mock_server)
+            .await;
+
+        let adapter = test_adapter(&mock_server.uri());
+        let result = adapter.api_send_message(12345, "<b>hello</b>", None).await;
+        assert!(result.is_ok(), "expected Ok, got {result:?}");
+
+        let requests = mock_server.received_requests().await.unwrap();
+        assert_eq!(
+            requests.len(),
+            1,
+            "expected exactly 1 request on happy path, got {}",
+            requests.len()
+        );
+        let body: serde_json::Value = serde_json::from_slice(&requests[0].body).unwrap();
+        assert_eq!(body["parse_mode"], "HTML");
+    }
+
+    #[tokio::test]
+    async fn test_crossed_tags_trigger_fallback_strip() {
+        let mock_server = MockServer::start().await;
+        // First attempt: 400 "can't parse entities" (Telegram rejects crossed tags).
+        Mock::given(method("POST"))
+            .and(path_regex(r"^/botTEST_TOKEN/sendMessage$"))
+            .respond_with(ResponseTemplate::new(400).set_body_raw(
+                br#"{"ok":false,"description":"Bad Request: can't parse entities: Unexpected end tag at byte offset 30"}"#,
+                "application/json",
+            ))
+            .up_to_n_times(1)
+            .mount(&mock_server)
+            .await;
+        // Fallback retry: 200 OK.
+        Mock::given(method("POST"))
+            .and(path_regex(r"^/botTEST_TOKEN/sendMessage$"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_raw(br#"{"ok":true,"result":{}}"#, "application/json"),
+            )
+            .mount(&mock_server)
+            .await;
+
+        let adapter = test_adapter(&mock_server.uri());
+        // Raw crossed-tag input bypasses Fix 1 (formatter) to exercise Fix 2.
+        let result = adapter
+            .api_send_message(67890, "<b>797 <i>Aira</b></i>", None)
+            .await;
+        assert!(
+            result.is_ok(),
+            "adapter should swallow retry errors: {result:?}"
+        );
+
+        let requests = mock_server.received_requests().await.unwrap();
+        assert_eq!(
+            requests.len(),
+            2,
+            "expected 2 requests (1 failed HTML + 1 plain retry), got {}",
+            requests.len()
+        );
+
+        // Second request: stripped plain text, NO parse_mode.
+        let second_body: serde_json::Value = serde_json::from_slice(&requests[1].body).unwrap();
+        let sent_text = second_body["text"].as_str().unwrap();
+        assert!(
+            !sent_text.contains("<b>"),
+            "literal <b> leaked to plain retry: {sent_text}"
+        );
+        assert!(
+            !sent_text.contains("</b>"),
+            "literal </b> leaked to plain retry: {sent_text}"
+        );
+        assert!(
+            !sent_text.contains("<i>"),
+            "literal <i> leaked to plain retry: {sent_text}"
+        );
+        assert!(
+            !sent_text.contains("</i>"),
+            "literal </i> leaked to plain retry: {sent_text}"
+        );
+        assert!(sent_text.contains("797"), "content lost: {sent_text}");
+        assert!(sent_text.contains("Aira"), "content lost: {sent_text}");
+        assert!(
+            second_body.get("parse_mode").is_none(),
+            "plain retry must not carry parse_mode: {second_body:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_incident_20260419_no_retry_needed_after_fix1() {
+        // Acceptance test: replay the Signore verbatim incident message
+        // through format_for_channel (Fix 1) → api_send_message. After
+        // Fix 1 the formatter emits proper-nested HTML, Telegram accepts
+        // with 200, and the retry-fallback (Fix 2) never fires.
+        let mock_server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path_regex(r"^/botTEST_TOKEN/sendMessage$"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_raw(br#"{"ok":true,"result":{}}"#, "application/json"),
+            )
+            .mount(&mock_server)
+            .await;
+
+        let adapter = test_adapter(&mock_server.uri());
+        let signore_verbatim = "\u{2022} **797 *Aira*** (Sospiro) \u{2014} luminoso, elegante, armonioso. Fresco da giorno.\n\u{2022} **799 *Farsa*** (Sospiro) \u{2014} vibrante, magnetico. Pi\u{00f9} giovane, agrumato.";
+        let html = format_for_channel(signore_verbatim, OutputFormat::TelegramHtml);
+        let result = adapter.api_send_message(54321, &html, None).await;
+        assert!(result.is_ok(), "expected Ok, got {result:?}");
+
+        let requests = mock_server.received_requests().await.unwrap();
+        assert_eq!(
+            requests.len(),
+            1,
+            "Fix 1 should prevent 400 so retry-fallback never fires; got {} requests",
+            requests.len()
+        );
+        let body: serde_json::Value = serde_json::from_slice(&requests[0].body).unwrap();
+        assert_eq!(body["parse_mode"], "HTML");
+        let sent = body["text"].as_str().unwrap();
+        // Structural invariant: proper inside-out nesting.
+        assert!(
+            sent.contains("<b>797 <i>Aira</i></b>"),
+            "expected proper nesting in sent text: {sent}"
+        );
+        assert!(
+            !sent.contains("</b></i>"),
+            "crossed close tags </b></i> leaked to send body: {sent}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_retry_body_entity_decoded() {
+        // Observability-adjacent test: the stripped body must also decode
+        // escaped entities so that e.g. "AT&amp;T" becomes "AT&T" in the
+        // final plain-text delivery. Without decoding, users would see
+        // "AT&amp;T" in the retry message.
+        let mock_server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path_regex(r"^/botTEST_TOKEN/sendMessage$"))
+            .respond_with(ResponseTemplate::new(400).set_body_raw(
+                br#"{"ok":false,"description":"Bad Request: can't parse entities"}"#,
+                "application/json",
+            ))
+            .up_to_n_times(1)
+            .mount(&mock_server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path_regex(r"^/botTEST_TOKEN/sendMessage$"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_raw(br#"{"ok":true,"result":{}}"#, "application/json"),
+            )
+            .mount(&mock_server)
+            .await;
+
+        let adapter = test_adapter(&mock_server.uri());
+        let _ = adapter
+            .api_send_message(1, "<b>AT&amp;T says &lt;hi&gt;</b>", None)
+            .await;
+        let requests = mock_server.received_requests().await.unwrap();
+        assert_eq!(requests.len(), 2);
+        let second_body: serde_json::Value = serde_json::from_slice(&requests[1].body).unwrap();
+        let sent_text = second_body["text"].as_str().unwrap();
+        assert_eq!(sent_text, "AT&T says <hi>");
     }
 }
