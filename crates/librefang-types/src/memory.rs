@@ -858,6 +858,19 @@ pub struct MemoryFilter {
     pub metadata: HashMap<String, serde_json::Value>,
     /// Filter by peer ID (for per-user memory isolation in multi-user channels).
     pub peer_id: Option<String>,
+    /// Active chat JID for chat-aware recall (Phase 05 §B.2).
+    ///
+    /// When `Some`, the semantic store filters out fragments whose
+    /// `metadata["chat_jid"]` is set AND differs from this value. Fragments
+    /// with no `chat_jid` metadata are always included (legacy/global
+    /// memories stay visible). When `None`, no chat-aware filtering is
+    /// applied — existing callers (CLI, cron, intra-agent) that don't
+    /// know about chats keep working unchanged.
+    ///
+    /// The filter can be disabled in the field via
+    /// `LIBREFANG_MEMORY_CHAT_AWARE=off` (default ON).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub active_chat_jid: Option<String>,
 }
 
 impl MemoryFilter {
@@ -875,6 +888,16 @@ impl MemoryFilter {
             scope: Some(scope.into()),
             ..Default::default()
         }
+    }
+
+    /// Set the active chat JID for chat-aware recall (Phase 05 §B.2).
+    ///
+    /// Intended to be called from WhatsApp / channel code paths after
+    /// constructing the filter, e.g.
+    ///   `MemoryFilter::agent(agent_id).with_active_chat_jid(jid)`.
+    pub fn with_active_chat_jid(mut self, chat_jid: impl Into<String>) -> Self {
+        self.active_chat_jid = Some(chat_jid.into());
+        self
     }
 }
 
