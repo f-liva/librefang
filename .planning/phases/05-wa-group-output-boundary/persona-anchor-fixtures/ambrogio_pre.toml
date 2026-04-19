@@ -1,0 +1,8 @@
+name = "ambrogio"
+description = "Maggiordomo digitale del Signor Federico Liva"
+owner_ids = ["+393760105565", "+393407682386"]
+workspace = "/data/workspaces/agents/ambrogio"
+
+[model]
+provider = "claude-code"
+model = "opus"
