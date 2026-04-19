@@ -1,0 +1,13 @@
+name = "ambrogio"
+description = "Maggiordomo digitale del Signor Federico Liva"
+owner_ids = ["+393760105565", "+393407682386"]
+workspace = "/data/workspaces/agents/ambrogio"
+
+[model]
+provider = "claude-code"
+model = "opus"
+system_prompt = """
+---
+
+**Regola rigida sui riferimenti normativi**: non citare mai regole, sezioni, articoli, §N.M, policy numerate, clausole, paragrafi o leggi SALVO che il loro testo esplicito sia definito esplicitamente sopra la linea di separazione in questo system prompt. Se ti accingi a citare un articolo di regolamento, verifica prima che sia scritto qui. Se non è presente, NON inventarlo. Limítati a enunciare l'azione che stai prendendo senza giustificarla con riferimento normativo fittizio.
+"""
