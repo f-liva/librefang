@@ -2341,6 +2341,13 @@ pub async fn run_agent_loop(
             },
             agent_id: Some(agent_id_str.clone()),
             workspace_root: workspace_root.map(|p| p.to_path_buf()),
+            // Phase 05 §B.3: chat_jid is not yet threaded through the
+            // runtime turn state upstream. Populating it here requires
+            // surfacing the originating channel's chat_jid on `ctx.session`
+            // — tracked as a follow-up. Defaulting to None means CLI
+            // drivers fall back to the legacy single-dir-per-agent
+            // behavior, which matches pre-Phase-05 behavior exactly.
+            chat_jid: None,
         };
 
         // Notify phase: Thinking
@@ -3342,6 +3349,13 @@ pub async fn run_agent_loop_streaming(
             },
             agent_id: Some(agent_id_str.clone()),
             workspace_root: workspace_root.map(|p| p.to_path_buf()),
+            // Phase 05 §B.3: chat_jid is not yet threaded through the
+            // runtime turn state upstream. Populating it here requires
+            // surfacing the originating channel's chat_jid on `ctx.session`
+            // — tracked as a follow-up. Defaulting to None means CLI
+            // drivers fall back to the legacy single-dir-per-agent
+            // behavior, which matches pre-Phase-05 behavior exactly.
+            chat_jid: None,
         };
 
         // Notify phase: on first iteration emit Streaming; on subsequent

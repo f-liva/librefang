@@ -992,4 +992,194 @@ mod tests {
             _ => panic!("Expected ToolUse content block"),
         }
     }
+
+    /// With prompt_caching enabled, the LAST tool in the request must carry
+    /// `cache_control: ephemeral`; preceding tools must not. This means the
+    /// (system + tools) prefix is cached as one unit — the common expensive
+    /// part that derivative calls can reuse.
+    #[test]
+    fn test_tools_cache_control_on_last_only() {
+        let tool_a = ToolDefinition {
+            name: "alpha".to_string(),
+            description: "first".to_string(),
+            input_schema: serde_json::json!({"type":"object"}),
+        };
+        let tool_b = ToolDefinition {
+            name: "beta".to_string(),
+            description: "second".to_string(),
+            input_schema: serde_json::json!({"type":"object"}),
+        };
+        let request = CompletionRequest {
+            model: "claude-sonnet-4-5".to_string(),
+            messages: vec![Message::user("hi")],
+            tools: vec![tool_a, tool_b],
+            max_tokens: 100,
+            temperature: 0.0,
+            system: Some("sys".to_string()),
+            thinking: None,
+            prompt_caching: true,
+            response_format: None,
+            timeout_secs: None,
+            extra_body: None,
+            agent_id: None,
+            workspace_root: None,
+            chat_jid: None,
+        };
+        let api_request = build_anthropic_request(&request);
+        assert_eq!(api_request.tools.len(), 2);
+        assert!(
+            api_request.tools[0].cache_control.is_none(),
+            "first tool must NOT have cache_control",
+        );
+        let last_cc = api_request.tools[1]
+            .cache_control
+            .as_ref()
+            .expect("last tool must have cache_control");
+        assert_eq!(last_cc["type"], "ephemeral");
+    }
+
+    /// With prompt_caching disabled, no tool gets cache_control. Ensures
+    /// we don't accidentally leak cache markers to providers that can't
+    /// handle them or incur unintended cost-accounting.
+    #[test]
+    fn test_tools_cache_control_absent_when_caching_off() {
+        let tool = ToolDefinition {
+            name: "only".to_string(),
+            description: "solo".to_string(),
+            input_schema: serde_json::json!({"type":"object"}),
+        };
+        let request = CompletionRequest {
+            model: "claude-sonnet-4-5".to_string(),
+            messages: vec![Message::user("hi")],
+            tools: vec![tool],
+            max_tokens: 100,
+            temperature: 0.0,
+            system: Some("sys".to_string()),
+            thinking: None,
+            prompt_caching: false,
+            response_format: None,
+            timeout_secs: None,
+            extra_body: None,
+            agent_id: None,
+            workspace_root: None,
+            chat_jid: None,
+        };
+        let api_request = build_anthropic_request(&request);
+        assert!(api_request.tools[0].cache_control.is_none());
+    }
+
+    /// Last message gets cache_control: ephemeral on its last content block
+    /// when prompt caching is on. This is what turns forkedAgent into a real
+    /// cost saver for multi-turn conversations — the full message prefix
+    /// caches, not just system + tools.
+    #[test]
+    fn test_messages_cache_control_on_last_block() {
+        let request = CompletionRequest {
+            model: "claude-sonnet-4-5".to_string(),
+            messages: vec![
+                Message::user("first user msg"),
+                Message::assistant("first assistant reply"),
+                Message::user("second user msg (last)"),
+            ],
+            tools: vec![],
+            max_tokens: 100,
+            temperature: 0.0,
+            system: Some("sys".to_string()),
+            thinking: None,
+            prompt_caching: true,
+            response_format: None,
+            timeout_secs: None,
+            extra_body: None,
+            agent_id: None,
+            workspace_root: None,
+            chat_jid: None,
+        };
+        let api_request = build_anthropic_request(&request);
+        let last = api_request.messages.last().expect("has last message");
+        // Plain-string Text content was upgraded to Blocks form so the
+        // marker has somewhere to live. Anthropic rejects cache_control
+        // on shorthand strings, so this upgrade is load-bearing.
+        let blocks = match &last.content {
+            ApiContent::Blocks(b) => b,
+            ApiContent::Text(_) => {
+                panic!("cache_control on last msg requires Blocks form, got Text")
+            }
+        };
+        let last_block = blocks.last().expect("has last block");
+        let cc = match last_block {
+            ApiContentBlock::Text { cache_control, .. } => cache_control.as_ref(),
+            _ => panic!("expected Text block"),
+        };
+        assert_eq!(cc.expect("cache_control set")["type"], "ephemeral");
+
+        // Only the LAST message's last block is marked — earlier messages
+        // would split the cache into fragments and waste the 4-breakpoint
+        // budget Anthropic allows per request.
+        let first = &api_request.messages[0];
+        if let ApiContent::Blocks(blocks) = &first.content {
+            for block in blocks {
+                if let ApiContentBlock::Text { cache_control, .. } = block {
+                    assert!(cache_control.is_none(), "first message must NOT be marked");
+                }
+            }
+        }
+    }
+
+    /// With caching disabled, no message block gets cache_control — ensures
+    /// we don't leak markers to providers that can't handle them (or incur
+    /// cache-cost billing on providers that do).
+    #[test]
+    fn test_messages_cache_control_absent_when_caching_off() {
+        let request = CompletionRequest {
+            model: "claude-sonnet-4-5".to_string(),
+            messages: vec![Message::user("hi")],
+            tools: vec![],
+            max_tokens: 100,
+            temperature: 0.0,
+            system: Some("sys".to_string()),
+            thinking: None,
+            prompt_caching: false,
+            response_format: None,
+            timeout_secs: None,
+            extra_body: None,
+            agent_id: None,
+            workspace_root: None,
+            chat_jid: None,
+        };
+        let api_request = build_anthropic_request(&request);
+        let last = api_request.messages.last().expect("has last message");
+        // With caching off, plain Text stays plain Text — we don't
+        // eagerly upgrade to Blocks form because that would change
+        // the wire format for no benefit.
+        match &last.content {
+            ApiContent::Text(_) => { /* expected */ }
+            ApiContent::Blocks(_) => panic!("expected Text form when caching off"),
+        }
+    }
+
+    /// With caching on but zero tools, the request still builds cleanly
+    /// — the `is_last` check must not underflow or special-case an empty
+    /// list. Skipping this test once hid a bug where `tool_count - 1`
+    /// produced an out-of-range index on empty input.
+    #[test]
+    fn test_tools_cache_control_empty_tools_list() {
+        let request = CompletionRequest {
+            model: "claude-sonnet-4-5".to_string(),
+            messages: vec![Message::user("hi")],
+            tools: vec![],
+            max_tokens: 100,
+            temperature: 0.0,
+            system: Some("sys".to_string()),
+            thinking: None,
+            prompt_caching: true,
+            response_format: None,
+            timeout_secs: None,
+            extra_body: None,
+            agent_id: None,
+            workspace_root: None,
+            chat_jid: None,
+        };
+        let api_request = build_anthropic_request(&request);
+        assert!(api_request.tools.is_empty());
+    }
 }

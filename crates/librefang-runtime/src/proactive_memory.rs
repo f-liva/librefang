@@ -257,6 +257,10 @@ impl MemoryExtractor for LlmMemoryExtractor {
             extra_body: None,
             agent_id: None,
             workspace_root: None,
+            // Phase 05 §B.3: proactive-memory extraction is a background
+            // pipeline keyed on agent + transcript, not on an active
+            // channel chat — no chat_jid context applies.
+            chat_jid: None,
         };
 
         let response = self
@@ -313,6 +317,10 @@ impl MemoryExtractor for LlmMemoryExtractor {
             extra_body: None,
             agent_id: None,
             workspace_root: None,
+            // Phase 05 §B.3: proactive-memory extraction is a background
+            // pipeline keyed on agent + transcript, not on an active
+            // channel chat — no chat_jid context applies.
+            chat_jid: None,
         };
 
         match self.driver.complete(request).await {

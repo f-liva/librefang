@@ -55,6 +55,59 @@ const SENSITIVE_SUFFIXES: &[&str] = &["_SECRET", "_TOKEN", "_PASSWORD"];
 /// Default subprocess timeout in seconds (5 minutes).
 const DEFAULT_MESSAGE_TIMEOUT_SECS: u64 = 300;
 
+/// Phase 05 §B.3 — chat-scoped CLAUDE_CONFIG_DIR derivation.
+///
+/// Claude Code's own sticky session state lives under
+/// `<CLAUDE_CONFIG_DIR>/projects/<workspace-hash>/session.jsonl`. When the
+/// same `CLAUDE_CONFIG_DIR` is reused across every turn for a given agent,
+/// two ingresses from different chats (a DM and a group sharing the same
+/// agent) share that transcript — which is exactly the cross-chat leak
+/// vector that surfaced in the 2026-04-18 group-output incident.
+///
+/// Deriving a per-`(agent, chat_jid)` subdirectory makes each chat see its
+/// own `projects/<hash>/session.jsonl`, closing the leak vector. The base
+/// directory is already agent/profile-scoped upstream by
+/// `with_config_dir(...)`, so hashing just the chat_jid here is sufficient
+/// to achieve per-`(agent, chat_jid)` isolation.
+///
+/// Disable via `LIBREFANG_CLAUDE_SESSION_SCOPE=off` (defaults ON). The
+/// fallback is the legacy single-dir-per-agent behavior, which is exactly
+/// what pre-Phase-05 did.
+fn chat_scope_enabled() -> bool {
+    std::env::var("LIBREFANG_CLAUDE_SESSION_SCOPE")
+        .map(|v| v != "off")
+        .unwrap_or(true)
+}
+
+/// Given a base `config_dir` and an optional active `chat_jid`, compute the
+/// per-turn effective `CLAUDE_CONFIG_DIR` path.
+///
+/// - `(None, _, _)`                             → `None` (no env override).
+/// - `(Some(base), None, _)`                    → `Some(base)` (legacy).
+/// - `(Some(base), Some(jid), flag-off)`        → `Some(base)` (legacy).
+/// - `(Some(base), Some(jid), flag-on)`         →
+///   `Some(base/chat-scope/<deterministic-hex>)`.
+///
+/// The hash is deterministic (DefaultHasher with one key) so the same
+/// chat_jid always maps to the same subdir — turns in the same chat keep
+/// sharing session.jsonl, turns in different chats don't.
+fn effective_config_dir(
+    base: Option<&std::path::Path>,
+    chat_jid: Option<&str>,
+) -> Option<std::path::PathBuf> {
+    use std::hash::{Hash, Hasher};
+    let base = base?;
+    match chat_jid {
+        Some(jid) if chat_scope_enabled() => {
+            let mut hasher = std::collections::hash_map::DefaultHasher::new();
+            jid.hash(&mut hasher);
+            let hex = format!("{:016x}", hasher.finish());
+            Some(base.join("chat-scope").join(hex))
+        }
+        _ => Some(base.to_path_buf()),
+    }
+}
+
 /// LLM driver that delegates to the Claude Code CLI.
 pub struct ClaudeCodeDriver {
     cli_path: String,
@@ -587,7 +640,15 @@ impl LlmDriver for ClaudeCodeDriver {
         }
 
         Self::apply_env_filter(&mut cmd);
-        if let Some(ref dir) = self.config_dir {
+        // Phase 05 §B.3 — chat-scoped config dir. See `effective_config_dir`
+        // for the rationale: per-(agent, chat_jid) subdir prevents Claude
+        // Code CLI sticky session.jsonl from crossing chat boundaries.
+        if let Some(dir) =
+            effective_config_dir(self.config_dir.as_deref(), request.chat_jid.as_deref())
+        {
+            if let Err(e) = std::fs::create_dir_all(&dir) {
+                debug!(dir = %dir.display(), error = %e, "failed to pre-create CLAUDE_CONFIG_DIR (will rely on CLI to create)");
+            }
             cmd.env("CLAUDE_CONFIG_DIR", dir);
         }
 
@@ -841,7 +902,13 @@ impl LlmDriver for ClaudeCodeDriver {
         }
 
         Self::apply_env_filter(&mut cmd);
-        if let Some(ref dir) = self.config_dir {
+        // Phase 05 §B.3 — symmetric with the non-streaming spawn site.
+        if let Some(dir) =
+            effective_config_dir(self.config_dir.as_deref(), request.chat_jid.as_deref())
+        {
+            if let Err(e) = std::fs::create_dir_all(&dir) {
+                debug!(dir = %dir.display(), error = %e, "failed to pre-create CLAUDE_CONFIG_DIR (will rely on CLI to create)");
+            }
             cmd.env("CLAUDE_CONFIG_DIR", dir);
         }
 
@@ -1220,6 +1287,8 @@ mod tests {
             extra_body: None,
             agent_id: None,
             workspace_root: None,
+            workspace_root: None,
+            chat_jid: None,
         };
 
         let prompt = ClaudeCodeDriver::build_prompt(&request);
@@ -1264,6 +1333,8 @@ mod tests {
             extra_body: None,
             agent_id: None,
             workspace_root: None,
+            workspace_root: None,
+            chat_jid: None,
         };
 
         let prompt = ClaudeCodeDriver::build_prompt(&request);
@@ -1325,6 +1396,8 @@ mod tests {
             extra_body: None,
             agent_id: None,
             workspace_root: None,
+            workspace_root: None,
+            chat_jid: None,
         };
 
         let prompt = ClaudeCodeDriver::build_prompt(&request);
@@ -1402,6 +1475,8 @@ mod tests {
             extra_body: None,
             agent_id: None,
             workspace_root: None,
+            workspace_root: None,
+            chat_jid: None,
         };
 
         let prompt = ClaudeCodeDriver::build_prompt(&request);
@@ -1609,5 +1684,183 @@ mod tests {
             .stderr(std::process::Stdio::null())
             .output();
         assert!(output.is_err(), "spawning a nonexistent binary should fail");
+    }
+
+    #[test]
+    fn test_mcp_config_carries_agent_id_header() {
+        // Regression: without the X-LibreFang-Agent-Id header, the /mcp
+        // endpoint has no way to rehydrate the caller's workspace / tool
+        // allowlist / skill allowlist / exec_policy, so every file_*,
+        // media_*, cron_create, schedule_create tool invoked from the
+        // spawned Claude CLI fails with "workspace sandbox not configured"
+        // or "Agent ID required" even though the agent is fully
+        // registered. See issue #2699.
+        let bridge = McpBridgeConfig {
+            base_url: "http://127.0.0.1:4545".to_string(),
+            api_key: Some("secret-key".to_string()),
+        };
+        let path = ClaudeCodeDriver::write_mcp_config(&bridge, Some("agent-1234")).unwrap();
+        let written = std::fs::read_to_string(&path).unwrap();
+        let _ = std::fs::remove_file(&path);
+        let cfg: serde_json::Value = serde_json::from_str(&written).unwrap();
+        let headers = &cfg["mcpServers"]["librefang"]["headers"];
+        assert_eq!(headers["X-API-Key"], "secret-key");
+        assert_eq!(headers["X-LibreFang-Agent-Id"], "agent-1234");
+    }
+
+    #[test]
+    fn test_mcp_config_omits_agent_id_header_when_absent() {
+        // No agent_id → no X-LibreFang-Agent-Id header. The `/mcp`
+        // endpoint then falls back to its legacy unauthenticated
+        // behaviour (all context fields None), preserving backward
+        // compatibility for non-agent MCP clients that connect to /mcp
+        // directly.
+        let bridge = McpBridgeConfig {
+            base_url: "http://127.0.0.1:4545".to_string(),
+            api_key: Some("secret-key".to_string()),
+        };
+        let path = ClaudeCodeDriver::write_mcp_config(&bridge, None).unwrap();
+        let written = std::fs::read_to_string(&path).unwrap();
+        let _ = std::fs::remove_file(&path);
+        let cfg: serde_json::Value = serde_json::from_str(&written).unwrap();
+        let headers = &cfg["mcpServers"]["librefang"]["headers"];
+        assert_eq!(headers["X-API-Key"], "secret-key");
+        assert!(headers.get("X-LibreFang-Agent-Id").is_none());
+    }
+
+    #[test]
+    fn test_mcp_config_no_headers_when_nothing_to_send() {
+        // Neither api_key nor agent_id set — the `headers` object must
+        // be omitted entirely (not an empty {}). Claude CLI tolerates
+        // either but the clean shape matches what the driver wrote
+        // before this change.
+        let bridge = McpBridgeConfig {
+            base_url: "http://127.0.0.1:4545".to_string(),
+            api_key: None,
+        };
+        let path = ClaudeCodeDriver::write_mcp_config(&bridge, None).unwrap();
+        let written = std::fs::read_to_string(&path).unwrap();
+        let _ = std::fs::remove_file(&path);
+        let cfg: serde_json::Value = serde_json::from_str(&written).unwrap();
+        assert!(cfg["mcpServers"]["librefang"].get("headers").is_none());
+    }
+
+    // --- Phase 05 §B.3 — chat-scoped CLAUDE_CONFIG_DIR ------------------
+    //
+    // These tests serialise on the env-var side via a file-local mutex so
+    // multi-threaded `cargo test` doesn't race on LIBREFANG_CLAUDE_SESSION_SCOPE.
+
+    use std::sync::{Mutex, OnceLock};
+
+    fn scope_env_lock() -> std::sync::MutexGuard<'static, ()> {
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(()))
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    #[test]
+    fn effective_config_dir_returns_base_when_chat_jid_is_none() {
+        let _g = scope_env_lock();
+        // SAFETY: scope_env_lock serialises this file's env mutations.
+        unsafe { std::env::remove_var("LIBREFANG_CLAUDE_SESSION_SCOPE") };
+        let base = std::path::Path::new("/tmp/prof-a");
+        let r = effective_config_dir(Some(base), None);
+        assert_eq!(r.as_deref(), Some(base));
+    }
+
+    #[test]
+    fn effective_config_dir_none_base_is_always_none() {
+        let _g = scope_env_lock();
+        let r1 = effective_config_dir(None, None);
+        let r2 = effective_config_dir(None, Some("abc@s.whatsapp.net"));
+        assert!(r1.is_none());
+        assert!(
+            r2.is_none(),
+            "no base → no env override regardless of chat_jid"
+        );
+    }
+
+    #[test]
+    fn effective_config_dir_chat_jid_on_differs_per_chat_and_deterministic() {
+        let _g = scope_env_lock();
+        // SAFETY: scope_env_lock serialises this file's env mutations.
+        unsafe { std::env::remove_var("LIBREFANG_CLAUDE_SESSION_SCOPE") };
+        let base = std::path::Path::new("/tmp/prof-a");
+
+        let a1 = effective_config_dir(Some(base), Some("dm-alpha@s.whatsapp.net")).unwrap();
+        let a2 = effective_config_dir(Some(base), Some("dm-alpha@s.whatsapp.net")).unwrap();
+        let b = effective_config_dir(Some(base), Some("group-beta@g.us")).unwrap();
+
+        assert_eq!(a1, a2, "same chat_jid → same subdir (deterministic)");
+        assert_ne!(a1, b, "different chat_jids → different subdirs");
+        assert!(
+            a1.starts_with(base.join("chat-scope")),
+            "subdir under chat-scope/"
+        );
+        assert!(
+            b.starts_with(base.join("chat-scope")),
+            "subdir under chat-scope/"
+        );
+    }
+
+    #[test]
+    fn effective_config_dir_flag_off_disables_scoping() {
+        let _g = scope_env_lock();
+        // SAFETY: scope_env_lock serialises this file's env mutations.
+        unsafe { std::env::set_var("LIBREFANG_CLAUDE_SESSION_SCOPE", "off") };
+        let base = std::path::Path::new("/tmp/prof-a");
+        let a = effective_config_dir(Some(base), Some("dm-alpha@s.whatsapp.net")).unwrap();
+        let b = effective_config_dir(Some(base), Some("group-beta@g.us")).unwrap();
+        assert_eq!(a, base, "flag off → base returned verbatim (dm)");
+        assert_eq!(b, base, "flag off → base returned verbatim (group)");
+        // SAFETY: scope_env_lock serialises.
+        unsafe { std::env::remove_var("LIBREFANG_CLAUDE_SESSION_SCOPE") };
+    }
+
+    #[test]
+    fn chat_scope_enabled_reads_env_correctly() {
+        let _g = scope_env_lock();
+        // SAFETY: scope_env_lock serialises.
+        unsafe { std::env::remove_var("LIBREFANG_CLAUDE_SESSION_SCOPE") };
+        assert!(chat_scope_enabled(), "unset → on (default)");
+
+        unsafe { std::env::set_var("LIBREFANG_CLAUDE_SESSION_SCOPE", "on") };
+        assert!(chat_scope_enabled(), "on → on");
+
+        unsafe { std::env::set_var("LIBREFANG_CLAUDE_SESSION_SCOPE", "off") };
+        assert!(!chat_scope_enabled(), "off → disabled");
+
+        unsafe { std::env::set_var("LIBREFANG_CLAUDE_SESSION_SCOPE", "anything-else") };
+        assert!(chat_scope_enabled(), "any non-off value → on");
+
+        // SAFETY: cleanup.
+        unsafe { std::env::remove_var("LIBREFANG_CLAUDE_SESSION_SCOPE") };
+    }
+
+    #[test]
+    fn completion_request_chat_jid_round_trips_via_clone() {
+        // CompletionRequest derives Clone — ensure the new field survives.
+        let req = librefang_llm_driver::CompletionRequest {
+            model: "claude-code".to_string(),
+            messages: vec![],
+            tools: vec![],
+            max_tokens: 10,
+            temperature: 0.0,
+            system: None,
+            thinking: None,
+            prompt_caching: false,
+            response_format: None,
+            timeout_secs: None,
+            extra_body: None,
+            agent_id: None,
+            workspace_root: None,
+            chat_jid: Some("whatsapp-dm:x@s.whatsapp.net".to_string()),
+        };
+        let cloned = req.clone();
+        assert_eq!(
+            cloned.chat_jid.as_deref(),
+            Some("whatsapp-dm:x@s.whatsapp.net")
+        );
     }
 }

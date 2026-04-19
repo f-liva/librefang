@@ -4399,6 +4399,9 @@ system_prompt = "You are a helpful assistant."
             extra_body: None,
             agent_id: None,
             workspace_root: None,
+            // Phase 05 §B.3: kernel-internal probe/utility requests — no
+            // active channel chat context.
+            chat_jid: None,
         };
 
         let result = match tokio::time::timeout(
@@ -5060,6 +5063,7 @@ system_prompt = "You are a helpful assistant."
                 extra_body: None,
                 agent_id: None,
                 workspace_root: None,
+                chat_jid: None,
             };
             let (complexity, routed_model) = router.select_model(&probe);
             // Check if the routed model's provider has a valid API key.
@@ -7344,6 +7348,47 @@ system_prompt = "You are a helpful assistant."
         // agents are picked up on the next routing call.
         router::invalidate_manifest_cache();
         router::invalidate_hand_route_cache();
+    }
+
+    /// Lightweight one-shot LLM call for classification tasks (e.g., reply precheck).
+    ///
+    /// Uses the default driver with low max_tokens and 0 temperature.
+    /// Returns `Err` on LLM error or timeout (caller should fail-open).
+    pub async fn one_shot_llm_call(&self, model: &str, prompt: &str) -> Result<String, String> {
+        use librefang_runtime::llm_driver::CompletionRequest;
+        use librefang_types::message::Message;
+
+        let request = CompletionRequest {
+            model: model.to_string(),
+            messages: vec![Message::user(prompt.to_string())],
+            tools: vec![],
+            max_tokens: 10,
+            temperature: 0.0,
+            system: None,
+            thinking: None,
+            prompt_caching: false,
+            response_format: None,
+            timeout_secs: None,
+            extra_body: None,
+            agent_id: None,
+            workspace_root: None,
+            // Phase 05 §B.3: kernel-internal probe/utility requests — no
+            // active channel chat context.
+            chat_jid: None,
+        };
+
+        let result = match tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            self.default_driver.complete(request),
+        )
+        .await
+        {
+            Ok(Ok(resp)) => resp,
+            Ok(Err(e)) => return Err(format!("LLM call failed: {e}")),
+            Err(_) => return Err("LLM call timed out (5s)".to_string()),
+        };
+
+        Ok(result.text())
     }
 
     /// Publish an event to the bus and evaluate triggers.

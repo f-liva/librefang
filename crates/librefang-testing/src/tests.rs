@@ -115,6 +115,7 @@ async fn test_mock_llm_driver_recording() {
         extra_body: None,
         agent_id: None,
         workspace_root: None,
+        chat_jid: None,
     };
 
     // First call
@@ -288,6 +289,7 @@ async fn test_mock_llm_driver_custom_tokens_and_stop_reason() {
         extra_body: None,
         agent_id: None,
         workspace_root: None,
+        chat_jid: None,
     };
 
     let resp = driver.complete(request).await.unwrap();
@@ -330,6 +332,7 @@ async fn test_failing_llm_driver() {
         extra_body: None,
         agent_id: None,
         workspace_root: None,
+        chat_jid: None,
     };
 
     let result = driver.complete(request).await;

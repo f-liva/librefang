@@ -574,6 +574,9 @@ async fn summarize_messages(
         response_format: None,
         timeout_secs: None,
         extra_body: None,
+        // Phase 05 §B.3: compaction runs over already-persisted messages,
+        // not over a live channel turn — no chat_jid context applies.
+        chat_jid: None,
     };
 
     // Retry logic for transient failures
@@ -699,6 +702,9 @@ async fn summarize_in_chunks(
         response_format: None,
         timeout_secs: None,
         extra_body: None,
+        // Phase 05 §B.3: compaction runs over already-persisted messages,
+        // not over a live channel turn — no chat_jid context applies.
+        chat_jid: None,
     };
 
     match driver.complete(merge_request).await {

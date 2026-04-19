@@ -416,6 +416,7 @@ mod tests {
             extra_body: None,
             agent_id: None,
             workspace_root: None,
+            chat_jid: None,
         }
     }
 
