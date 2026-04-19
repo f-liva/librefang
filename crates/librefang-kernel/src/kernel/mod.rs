@@ -4943,6 +4943,9 @@ system_prompt = "You are a helpful assistant."
             timeout_secs: None,
             extra_body: None,
             agent_id: None,
+            // Phase 05 §B.3: kernel-internal probe/utility requests — no
+            // active channel chat context.
+            chat_jid: None,
         };
 
         let result = match tokio::time::timeout(
@@ -5603,6 +5606,7 @@ system_prompt = "You are a helpful assistant."
                 timeout_secs: None,
                 extra_body: None,
                 agent_id: None,
+                chat_jid: None,
             };
             let (complexity, routed_model) = router.select_model(&probe);
             // Check if the routed model's provider has a valid API key.
@@ -7997,6 +8001,9 @@ system_prompt = "You are a helpful assistant."
             timeout_secs: None,
             extra_body: None,
             agent_id: None,
+            // Phase 05 §B.3: kernel-internal probe/utility requests — no
+            // active channel chat context.
+            chat_jid: None,
         };
 
         let result = match tokio::time::timeout(
@@ -10628,6 +10635,9 @@ system_prompt = "You are a helpful assistant."
             timeout_secs: None,
             extra_body: None,
             agent_id: None,
+            // Phase 05 §B.3: kernel-internal probe/utility requests — no
+            // active channel chat context.
+            chat_jid: None,
         };
 
         let start = std::time::Instant::now();

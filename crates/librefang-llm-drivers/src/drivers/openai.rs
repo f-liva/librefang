@@ -1756,6 +1756,7 @@ mod tests {
             timeout_secs: None,
             extra_body: None,
             agent_id: None,
+            chat_jid: None,
         };
         let oai = driver.build_request(&request).expect("build request");
         let extra = oai.extra_body.as_ref().expect("extra_body present");
@@ -1782,6 +1783,7 @@ mod tests {
             timeout_secs: None,
             extra_body: None,
             agent_id: None,
+            chat_jid: None,
         };
         let oai = driver.build_request(&request).expect("build request");
         let extra = oai.extra_body.as_ref().expect("extra_body present");
@@ -1808,6 +1810,7 @@ mod tests {
             timeout_secs: None,
             extra_body: None,
             agent_id: None,
+            chat_jid: None,
         };
         let oai = driver.build_request(&request).expect("build request");
         // Non-ollama: extra_body should mirror the (None) request.extra_body.

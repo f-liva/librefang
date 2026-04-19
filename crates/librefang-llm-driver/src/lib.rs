@@ -112,6 +112,18 @@ pub struct CompletionRequest {
     /// registry. `None` for out-of-band callers (compaction, routing
     /// probes, tests) that have no agent identity to propagate.
     pub agent_id: Option<String>,
+    /// Active chat JID for chat-scoped CLI session isolation
+    /// (Phase 05 §B.3).
+    ///
+    /// Populated by the runtime agent loop when the current turn originated
+    /// from a channel message (WhatsApp, Telegram, ...). CLI drivers like
+    /// `claude-code` use it to derive a per-`(agent, chat_jid)`
+    /// `CLAUDE_CONFIG_DIR` subdirectory so the CLI's own sticky session
+    /// state (stored under `~/.claude/projects/<hash>/session.jsonl`)
+    /// cannot cross chat boundaries for the same agent. `None` for
+    /// out-of-band callers (CLI, cron, compaction) that have no chat
+    /// context.
+    pub chat_jid: Option<String>,
 }
 
 /// A response from an LLM completion.
@@ -434,6 +446,7 @@ mod tests {
             timeout_secs: None,
             extra_body: None,
             agent_id: None,
+            chat_jid: None,
         };
 
         let response = driver.stream(request, tx).await.unwrap();

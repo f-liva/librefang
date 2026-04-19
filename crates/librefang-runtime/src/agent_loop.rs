@@ -2012,6 +2012,10 @@ async fn generate_search_queries(
         timeout_secs: Some(15),
         extra_body: None,
         agent_id: None,
+        // Phase 05 §B.3: this is a one-off router probe with no channel
+        // context — CLI driver session scoping is a no-op when chat_jid
+        // is None.
+        chat_jid: None,
     };
 
     let response =
@@ -2658,6 +2662,13 @@ pub async fn run_agent_loop(
                 Some(manifest.model.extra_params.clone())
             },
             agent_id: Some(agent_id_str.clone()),
+            // Phase 05 §B.3: chat_jid is not yet threaded through the
+            // runtime turn state upstream. Populating it here requires
+            // surfacing the originating channel's chat_jid on `ctx.session`
+            // — tracked as a follow-up. Defaulting to None means CLI
+            // drivers fall back to the legacy single-dir-per-agent
+            // behavior, which matches pre-Phase-05 behavior exactly.
+            chat_jid: None,
         };
 
         // Notify phase: Thinking
@@ -3653,6 +3664,13 @@ pub async fn run_agent_loop_streaming(
                 Some(manifest.model.extra_params.clone())
             },
             agent_id: Some(agent_id_str.clone()),
+            // Phase 05 §B.3: chat_jid is not yet threaded through the
+            // runtime turn state upstream. Populating it here requires
+            // surfacing the originating channel's chat_jid on `ctx.session`
+            // — tracked as a follow-up. Defaulting to None means CLI
+            // drivers fall back to the legacy single-dir-per-agent
+            // behavior, which matches pre-Phase-05 behavior exactly.
+            chat_jid: None,
         };
 
         // Notify phase: on first iteration emit Streaming; on subsequent

@@ -1130,6 +1130,7 @@ mod tests {
             timeout_secs: None,
             extra_body: None,
             agent_id: None,
+            chat_jid: None,
         };
         let api_request = build_anthropic_request(&request);
         assert_eq!(api_request.tools.len(), 2);
@@ -1167,6 +1168,7 @@ mod tests {
             timeout_secs: None,
             extra_body: None,
             agent_id: None,
+            chat_jid: None,
         };
         let api_request = build_anthropic_request(&request);
         assert!(api_request.tools[0].cache_control.is_none());
@@ -1195,6 +1197,7 @@ mod tests {
             timeout_secs: None,
             extra_body: None,
             agent_id: None,
+            chat_jid: None,
         };
         let api_request = build_anthropic_request(&request);
         let last = api_request.messages.last().expect("has last message");
@@ -1245,6 +1248,7 @@ mod tests {
             timeout_secs: None,
             extra_body: None,
             agent_id: None,
+            chat_jid: None,
         };
         let api_request = build_anthropic_request(&request);
         let last = api_request.messages.last().expect("has last message");
@@ -1276,6 +1280,7 @@ mod tests {
             timeout_secs: None,
             extra_body: None,
             agent_id: None,
+            chat_jid: None,
         };
         let api_request = build_anthropic_request(&request);
         assert!(api_request.tools.is_empty());
