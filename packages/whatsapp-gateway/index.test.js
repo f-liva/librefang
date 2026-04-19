@@ -36,6 +36,9 @@ const {
   lidMapSet,
   db,
   LID_PERSIST_ENABLED,
+  classifyOutput,
+  logOutputGuardDrop,
+  OUTPUT_GUARD_ENABLED,
 } = require('./index.js');
 
 // ---------------------------------------------------------------------------
@@ -727,6 +730,164 @@ describe('echo tracker wiring (Phase 3 §A)', () => {
     const trackCount = (src.match(/echoTracker\.track\(/g) || []).length;
     assert.equal(trackCount, 7,
       `expected 7 echoTracker.track() calls (one per outbound text site), got ${trackCount}`);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Output guard wiring (Phase 5 §A, OB-05)
+// ---------------------------------------------------------------------------
+describe('output guard wiring (Phase 5 §A)', () => {
+  it('exports classifyOutput, logOutputGuardDrop, OUTPUT_GUARD_ENABLED', () => {
+    assert.equal(typeof classifyOutput, 'function');
+    assert.equal(typeof logOutputGuardDrop, 'function');
+    assert.equal(typeof OUTPUT_GUARD_ENABLED, 'boolean');
+  });
+
+  it('INT-1: toxic input ([EMPTY_OR_NO_REPLY_FROM_PREVIOUS_TURN]) classifies toxic', () => {
+    // Simulates the streaming hold-back gate: the onProgress handler
+    // receives a cleaned chunk, classifies it, and returns early on toxic.
+    // sock.sendMessage would NOT be called — here we verify the verdict
+    // that the wire-in branches on.
+    const v = classifyOutput('[EMPTY_OR_NO_REPLY_FROM_PREVIOUS_TURN]');
+    assert.equal(v.verdict, 'toxic');
+    assert.equal(v.reason, 'bracket_token_solo');
+  });
+
+  it('INT-2: suspicious input (## Sender + prose) yields stripped tail', () => {
+    const v = classifyOutput('## Sender\nMessage from: X\n\nCiao!');
+    assert.equal(v.verdict, 'suspicious');
+    assert.equal(v.stripped, 'Message from: X\n\nCiao!');
+    // Wire-in replaces `cleaned`/`toSend` with v.stripped before sendMessage.
+  });
+
+  it('INT-3: natural prose passes through as ok verdict (no guard drop)', () => {
+    const v = classifyOutput('Sì Signore, eccomi.');
+    assert.equal(v.verdict, 'ok');
+    assert.equal(v.reason, 'prose');
+    // Wire-in ships the text verbatim in the ok branch.
+  });
+
+  it('INT-4: cascade regurgitation (bracket + header + bullets) → toxic full suppress', () => {
+    const v = classifyOutput('[EMPTY_OR_NO_REPLY_FROM_PREVIOUS_TURN]\n\n## Response Style\n- Be concise and direct.\n- Use plain language.');
+    assert.equal(v.verdict, 'toxic');
+    assert.ok(v.reason.startsWith('cascade_'), `expected cascade_ reason, got ${v.reason}`);
+    assert.equal(v.stripped, undefined,
+      'cascade must NOT provide stripped — full-message suppress');
+  });
+
+  it('INT-5: logOutputGuardDrop emits canonical JSON log shape', () => {
+    // Capture console.log output
+    const orig = console.log;
+    const captured = [];
+    console.log = (...args) => captured.push(args.join(' '));
+    try {
+      logOutputGuardDrop({
+        verdict: 'toxic',
+        reason: 'bracket_token_solo',
+        chatJid: '1234567890-1600000000@g.us',
+        text: '[EMPTY_OR_NO_REPLY_FROM_PREVIOUS_TURN] and more text beyond forty chars here',
+      });
+      logOutputGuardDrop({
+        verdict: 'suspicious',
+        reason: 'markdown_header_solo_with_prose',
+        chatJid: '1234567890@s.whatsapp.net',
+        text: '## Hello\nworld',
+      });
+      logOutputGuardDrop({
+        verdict: 'toxic',
+        reason: 'json_object_open',
+        chatJid: null,
+        text: null,
+      });
+    } finally {
+      console.log = orig;
+    }
+
+    assert.equal(captured.length, 3);
+
+    const toxicGroupLog = JSON.parse(captured[0]);
+    assert.equal(toxicGroupLog.event, 'output_guard_drop');
+    assert.equal(toxicGroupLog.verdict, 'toxic');
+    assert.equal(toxicGroupLog.reason, 'bracket_token_solo');
+    assert.equal(toxicGroupLog.chat_jid, '1234567890-1600000000@g.us');
+    assert.equal(toxicGroupLog.group, true);
+    assert.ok(toxicGroupLog.body_excerpt.length <= 40,
+      `body_excerpt must be <=40 chars, got ${toxicGroupLog.body_excerpt.length}`);
+
+    const dmLog = JSON.parse(captured[1]);
+    assert.equal(dmLog.group, false, 'DM jid must have group=false');
+    assert.equal(dmLog.verdict, 'suspicious');
+
+    const noJidLog = JSON.parse(captured[2]);
+    assert.equal(noJidLog.chat_jid, null);
+    assert.equal(noJidLog.group, false);
+    assert.equal(noJidLog.body_excerpt, '');
+  });
+
+  it('source: streaming hold-back gate invokes classifyOutput before flush', () => {
+    const src = require('node:fs').readFileSync(require('node:path').join(__dirname, 'index.js'), 'utf8');
+    // The onProgress handler must call classifyOutput(cleaned) inside an
+    // OUTPUT_GUARD_ENABLED guard before sock.sendMessage/editMessage.
+    assert.match(src,
+      /if\s*\(\s*OUTPUT_GUARD_ENABLED\s*\)\s*\{[\s\S]*?const\s+v\s*=\s*classifyOutput\(cleaned\)/,
+      'streaming hold-back gate must call classifyOutput(cleaned) under OUTPUT_GUARD_ENABLED flag');
+  });
+
+  it('source: sendOrEdit re-classifies final output before dispatch', () => {
+    const src = require('node:fs').readFileSync(require('node:path').join(__dirname, 'index.js'), 'utf8');
+    // Final post-scrub inside sendOrEdit: classifies `toSend` and replaces
+    // on suspicious, suppresses on toxic+!streamMsgKey.
+    assert.match(src, /classifyOutput\(toSend\)/,
+      'final post-scrub must classifyOutput(toSend)');
+    // sendOrEdit closure must contain the guard block.
+    const idx = src.indexOf('const sendOrEdit =');
+    assert.ok(idx > 0, 'sendOrEdit closure not found');
+    const tail = src.slice(idx, idx + 1200);
+    assert.match(tail, /classifyOutput\(toSend\)/,
+      'classifyOutput(toSend) must live inside sendOrEdit closure');
+  });
+
+  it('source: classifyOutput invoked in ≥ 2 distinct sites', () => {
+    const src = require('node:fs').readFileSync(require('node:path').join(__dirname, 'index.js'), 'utf8');
+    const hits = (src.match(/classifyOutput\(/g) || []).length;
+    // Streaming hold-back gate (classifyOutput(cleaned)) + sendOrEdit final
+    // post-scrub (classifyOutput(toSend)) = 2 call sites. Destructured
+    // import `const { classifyOutput } = require(...)` does NOT match `(`
+    // right after the identifier so it doesn't bump the count.
+    assert.ok(hits >= 2,
+      `expected >= 2 classifyOutput( invocations (streaming gate + final post-scrub), got ${hits}`);
+  });
+
+  it('source: output_guard_drop log shape includes required fields', () => {
+    const src = require('node:fs').readFileSync(require('node:path').join(__dirname, 'index.js'), 'utf8');
+    assert.match(src, /event:\s*'output_guard_drop'/);
+    assert.match(src, /body_excerpt:/);
+    assert.match(src, /chat_jid:/);
+    assert.match(src, /group:/);
+    // 40-char excerpt cap per spec
+    assert.match(src, /\.slice\(0,\s*40\)/);
+  });
+
+  it('flag-off bypass: LIBREFANG_OUTPUT_GUARD=off returns ok for all input', () => {
+    // classifyOutput captures the flag at module-load time, so we spawn a
+    // fresh child to exercise the disabled path.
+    const { spawnSync } = require('node:child_process');
+    const probe = `
+      const { classifyOutput } = require(${JSON.stringify(require.resolve('./lib/output_guard'))});
+      const inputs = ['## Sender', '[User]', '<system>', '[EMPTY_OR_NO_REPLY_FROM_PREVIOUS_TURN]'];
+      process.stdout.write(JSON.stringify(inputs.map((t) => classifyOutput(t))));
+    `;
+    const res = spawnSync(process.execPath, ['-e', probe], {
+      env: { ...process.env, LIBREFANG_OUTPUT_GUARD: 'off' },
+      encoding: 'utf8',
+    });
+    assert.equal(res.status, 0, `spawn failed: ${res.stderr}`);
+    const parsed = JSON.parse(res.stdout);
+    assert.equal(parsed.length, 4);
+    for (const r of parsed) {
+      assert.equal(r.verdict, 'ok');
+      assert.equal(r.reason, 'disabled');
+    }
   });
 });
 
