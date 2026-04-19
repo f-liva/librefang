@@ -1191,6 +1191,9 @@ impl App {
             } => {
                 self.chat.tool_result(&name, &result_preview, is_error);
             }
+            // Phase 05 §B.4 — no-op: the TUI doesn't own a streaming-dedup
+            // accumulator. See chat_runner.rs for the symmetric handler.
+            StreamEvent::ResetAccumulator { .. } => {}
         }
     }
 

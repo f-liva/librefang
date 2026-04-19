@@ -36,6 +36,106 @@ use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
 use tracing::{debug, info, instrument, warn};
 
+/// Phase 05 §B.4 — per-agent last-seen chat_jid tracker.
+///
+/// Fires a `StreamEvent::ResetAccumulator { reason: "chat_switch" }` at the
+/// top of each streaming turn when the previous turn for the same agent
+/// came from a different chat_jid. Downstream consumers (SSE dedup window,
+/// gateway streamer) reset their per-turn accumulators so content from
+/// turn N-1 of a different chat can't suppress identical content in turn
+/// N of a new chat.
+///
+/// Disabled globally via `LIBREFANG_STREAM_RESET_ON_CHAT_SWITCH=off`. The
+/// tracker is also updated when the flag is off (so enabling it mid-
+/// process recovers correct behavior on the next turn).
+fn chat_switch_reset_enabled() -> bool {
+    std::env::var("LIBREFANG_STREAM_RESET_ON_CHAT_SWITCH")
+        .map(|v| v != "off")
+        .unwrap_or(true)
+}
+
+static LAST_CHAT_JID_PER_AGENT: std::sync::OnceLock<
+    dashmap::DashMap<librefang_types::agent::AgentId, String>,
+> = std::sync::OnceLock::new();
+
+fn last_chat_jid_tracker() -> &'static dashmap::DashMap<librefang_types::agent::AgentId, String> {
+    LAST_CHAT_JID_PER_AGENT.get_or_init(dashmap::DashMap::new)
+}
+
+/// Test helper: drop any tracked last_chat_jid for `agent_id`. Used by the
+/// chat-switch unit tests below so they start from a clean slate.
+#[cfg(test)]
+fn reset_last_chat_jid_for_testing(agent_id: librefang_types::agent::AgentId) {
+    last_chat_jid_tracker().remove(&agent_id);
+}
+
+/// Returns the verdict emitted by `detect_and_emit_chat_switch_reset`.
+///
+/// - `FirstTurn`        → no previous chat_jid recorded; tracker updated.
+/// - `SameChat`         → previous == current; tracker unchanged.
+/// - `DifferentChat`    → previous != current; tracker updated, reset emitted.
+/// - `AmbiguousNone`    → current chat_jid is None; conservative no-op.
+/// - `Disabled`         → `LIBREFANG_STREAM_RESET_ON_CHAT_SWITCH=off`; no-op.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ChatSwitchVerdict {
+    FirstTurn,
+    SameChat,
+    DifferentChat,
+    AmbiguousNone,
+    Disabled,
+}
+
+/// Detect a chat switch for `agent_id` and emit `StreamEvent::ResetAccumulator`
+/// on the provided channel when appropriate. Returns a verdict for
+/// observability / tests.
+///
+/// Callers pass the current turn's `chat_jid` (`None` when the caller has no
+/// chat context — CLI, cron). On `DifferentChat` the reset is sent
+/// asynchronously via `try_send`; a full channel is logged but not fatal.
+pub async fn detect_and_emit_chat_switch_reset(
+    agent_id: librefang_types::agent::AgentId,
+    chat_jid: Option<&str>,
+    stream_tx: &mpsc::Sender<StreamEvent>,
+) -> ChatSwitchVerdict {
+    if !chat_switch_reset_enabled() {
+        return ChatSwitchVerdict::Disabled;
+    }
+    let Some(active) = chat_jid else {
+        // Ambiguous: CLI/cron/test paths with no chat context → no reset
+        // and don't touch the tracker (preserves last channel chat_jid so
+        // a subsequent channel turn can still detect a switch properly).
+        return ChatSwitchVerdict::AmbiguousNone;
+    };
+    let tracker = last_chat_jid_tracker();
+    let previous = tracker.get(&agent_id).map(|r| r.clone());
+    let verdict = match previous {
+        None => ChatSwitchVerdict::FirstTurn,
+        Some(prev) if prev == active => ChatSwitchVerdict::SameChat,
+        Some(_) => ChatSwitchVerdict::DifferentChat,
+    };
+    if matches!(verdict, ChatSwitchVerdict::DifferentChat) {
+        if let Err(e) = stream_tx.try_send(StreamEvent::ResetAccumulator {
+            reason: "chat_switch".to_string(),
+        }) {
+            tracing::warn!(
+                agent_id = %agent_id,
+                new_chat = %active,
+                error = %e,
+                "failed to emit ResetAccumulator for chat switch (channel full or closed)"
+            );
+        } else {
+            tracing::info!(
+                agent_id = %agent_id,
+                new_chat = %active,
+                "emitted ResetAccumulator for chat switch"
+            );
+        }
+    }
+    // Always update tracker — even for SameChat this is a cheap upsert.
+    tracker.insert(agent_id, active.to_string());
+    verdict
+}
+
 /// Maximum iterations in the agent loop before giving up.
 const MAX_ITERATIONS: u32 = 50;
 
@@ -8766,5 +8866,135 @@ mod tests {
             manifest.web_search_augmentation,
             librefang_types::agent::WebSearchAugmentationMode::Auto,
         );
+    }
+
+    // --- Phase 05 §B.4 — chat-switch reset detector --------------------
+    //
+    // The tests serialise on the env-var toggle via a file-local mutex.
+    // `last_chat_jid_tracker()` is a module-global DashMap; the
+    // `reset_last_chat_jid_for_testing` helper clears the per-agent entry
+    // so each test starts from a clean slate.
+
+    use super::{
+        detect_and_emit_chat_switch_reset, reset_last_chat_jid_for_testing, ChatSwitchVerdict,
+    };
+    use librefang_types::agent::AgentId;
+    use std::sync::{Mutex, OnceLock};
+
+    fn switch_env_lock() -> std::sync::MutexGuard<'static, ()> {
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(()))
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+    }
+
+    #[tokio::test]
+    async fn chat_switch_first_turn_emits_no_reset() {
+        let _g = switch_env_lock();
+        // SAFETY: switch_env_lock serialises env mutations in this module.
+        unsafe { std::env::remove_var("LIBREFANG_STREAM_RESET_ON_CHAT_SWITCH") };
+        let agent = AgentId::new();
+        reset_last_chat_jid_for_testing(agent);
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<StreamEvent>(4);
+        let v =
+            detect_and_emit_chat_switch_reset(agent, Some("whatsapp-dm:alpha@s.whatsapp.net"), &tx)
+                .await;
+        assert_eq!(v, ChatSwitchVerdict::FirstTurn);
+        // No event emitted.
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn chat_switch_same_chat_consecutive_no_reset() {
+        let _g = switch_env_lock();
+        unsafe { std::env::remove_var("LIBREFANG_STREAM_RESET_ON_CHAT_SWITCH") };
+        let agent = AgentId::new();
+        reset_last_chat_jid_for_testing(agent);
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<StreamEvent>(4);
+        let _ =
+            detect_and_emit_chat_switch_reset(agent, Some("whatsapp-dm:alpha@s.whatsapp.net"), &tx)
+                .await;
+        // Consume any first-turn noise (there shouldn't be any).
+        while rx.try_recv().is_ok() {}
+        let v =
+            detect_and_emit_chat_switch_reset(agent, Some("whatsapp-dm:alpha@s.whatsapp.net"), &tx)
+                .await;
+        assert_eq!(v, ChatSwitchVerdict::SameChat);
+        assert!(rx.try_recv().is_err(), "no reset on same-chat turn");
+    }
+
+    #[tokio::test]
+    async fn chat_switch_different_chat_emits_reset() {
+        let _g = switch_env_lock();
+        unsafe { std::env::remove_var("LIBREFANG_STREAM_RESET_ON_CHAT_SWITCH") };
+        let agent = AgentId::new();
+        reset_last_chat_jid_for_testing(agent);
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<StreamEvent>(4);
+        // Turn 1: DM.
+        let _ =
+            detect_and_emit_chat_switch_reset(agent, Some("whatsapp-dm:alpha@s.whatsapp.net"), &tx)
+                .await;
+        while rx.try_recv().is_ok() {}
+        // Turn 2: group — must emit reset.
+        let v =
+            detect_and_emit_chat_switch_reset(agent, Some("whatsapp-group:beta@g.us"), &tx).await;
+        assert_eq!(v, ChatSwitchVerdict::DifferentChat);
+        match rx.try_recv().expect("reset event expected") {
+            StreamEvent::ResetAccumulator { reason } => assert_eq!(reason, "chat_switch"),
+            other => panic!("wrong event: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn chat_switch_flag_off_disables_emission() {
+        let _g = switch_env_lock();
+        unsafe { std::env::set_var("LIBREFANG_STREAM_RESET_ON_CHAT_SWITCH", "off") };
+        let agent = AgentId::new();
+        reset_last_chat_jid_for_testing(agent);
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<StreamEvent>(4);
+        let _ =
+            detect_and_emit_chat_switch_reset(agent, Some("whatsapp-dm:alpha@s.whatsapp.net"), &tx)
+                .await;
+        let v =
+            detect_and_emit_chat_switch_reset(agent, Some("whatsapp-group:beta@g.us"), &tx).await;
+        assert_eq!(v, ChatSwitchVerdict::Disabled);
+        assert!(rx.try_recv().is_err(), "flag off → no reset event");
+        // Restore default.
+        unsafe { std::env::remove_var("LIBREFANG_STREAM_RESET_ON_CHAT_SWITCH") };
+    }
+
+    #[tokio::test]
+    async fn chat_switch_current_none_is_ambiguous_no_reset() {
+        let _g = switch_env_lock();
+        unsafe { std::env::remove_var("LIBREFANG_STREAM_RESET_ON_CHAT_SWITCH") };
+        let agent = AgentId::new();
+        reset_last_chat_jid_for_testing(agent);
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<StreamEvent>(4);
+        // Seed a chat_jid first.
+        let _ =
+            detect_and_emit_chat_switch_reset(agent, Some("whatsapp-dm:alpha@s.whatsapp.net"), &tx)
+                .await;
+        while rx.try_recv().is_ok() {}
+        // Now a turn with no chat context (CLI/cron) — conservative no-op.
+        let v = detect_and_emit_chat_switch_reset(agent, None, &tx).await;
+        assert_eq!(v, ChatSwitchVerdict::AmbiguousNone);
+        assert!(rx.try_recv().is_err(), "None chat_jid → no reset");
+        // The tracker still shows the last channel chat so a subsequent
+        // channel turn can detect a switch properly.
+        let v2 =
+            detect_and_emit_chat_switch_reset(agent, Some("whatsapp-group:beta@g.us"), &tx).await;
+        assert_eq!(v2, ChatSwitchVerdict::DifferentChat);
+    }
+
+    #[test]
+    fn stream_event_reset_accumulator_is_constructible_and_cloneable() {
+        let e = StreamEvent::ResetAccumulator {
+            reason: "chat_switch".to_string(),
+        };
+        let cloned = e.clone();
+        match cloned {
+            StreamEvent::ResetAccumulator { reason } => assert_eq!(reason, "chat_switch"),
+            _ => panic!("wrong variant"),
+        }
     }
 }

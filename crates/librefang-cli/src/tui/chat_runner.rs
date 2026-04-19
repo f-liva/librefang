@@ -158,6 +158,11 @@ impl StandaloneChat {
             } => {
                 self.chat.tool_result(&name, &result_preview, is_error);
             }
+            // Phase 05 §B.4 — no-op in the CLI TUI. The CLI doesn't
+            // maintain a streaming-dedup accumulator, so it has nothing
+            // to reset. The event is still emitted by the agent loop
+            // for any HTTP/SSE consumer (e.g. gateway) downstream.
+            StreamEvent::ResetAccumulator { .. } => {}
         }
     }
 

@@ -1921,6 +1921,19 @@ pub async fn send_message_stream(
                         "detail": detail,
                     }))
                     .unwrap_or_else(|_| Event::default().data("error")),
+                // Phase 05 §B.4 — clear the dedup window so content from
+                // the previous turn (different chat) can't suppress
+                // identical-but-different-chat content in the current one.
+                // Surfaced to the client as a structured event so SSE
+                // consumers (dashboards, tests) can observe the reset.
+                StreamEvent::ResetAccumulator { reason } => {
+                    dedup.clear();
+                    tracing::info!(reason = %reason, "StreamDedup cleared on ResetAccumulator");
+                    Event::default()
+                        .event("reset_accumulator")
+                        .json_data(serde_json::json!({ "reason": reason }))
+                        .unwrap_or_else(|_| Event::default().data("error"))
+                }
                 _ => Event::default().comment("skip"),
             });
             return Some((sse_event, (rx, dedup)));

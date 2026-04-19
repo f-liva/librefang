@@ -193,6 +193,20 @@ pub enum StreamEvent {
         result_preview: String,
         is_error: bool,
     },
+    /// Reset any downstream per-turn accumulators (e.g. streaming dedup
+    /// windows) before the next chunk lands.
+    ///
+    /// Introduced in Phase 05 §B.4 as a chat-switch contamination guard.
+    /// Emitted by the agent loop (not by LLM drivers) at the very start of
+    /// a turn when the previous turn for the same agent came from a
+    /// different `chat_jid`. Consumers — notably any per-agent
+    /// `StreamDedup` — clear their window so content from turn N-1 can't
+    /// suppress identical-but-different-chat content in turn N.
+    ///
+    /// `reason` distinguishes triggers (future-proofing for additional
+    /// reset causes, e.g. nudge-retry). Current callers set it to
+    /// `"chat_switch"`.
+    ResetAccumulator { reason: String },
 }
 
 /// Trait for LLM drivers.
