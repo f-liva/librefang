@@ -4,6 +4,7 @@
 //! No external Telegram crate — just `reqwest` for full control over error handling.
 
 use crate::formatter;
+use crate::html_strip::strip_html_for_fallback;
 use crate::types::{
     split_message, truncate_utf8, ChannelAdapter, ChannelContent, ChannelMessage, ChannelType,
     ChannelUser, InteractiveButton, InteractiveMessage, LifecycleReaction,
@@ -443,13 +444,35 @@ impl TelegramAdapter {
             if !status.is_success() {
                 let body_text = resp.text().await.unwrap_or_default();
                 warn!("Telegram sendMessage failed ({status}): {body_text}");
-                // If HTML parsing failed, retry as plain text (no parse_mode)
+                // If HTML parsing failed, retry as plain text (no parse_mode).
+                //
+                // Historically this path re-sent the SAME chunk (with its
+                // visible tags) as plain text — so literal `<b>`/`</b>`/`<i>`/
+                // `</i>` characters appeared in the delivered message (incident
+                // 2026-04-19). Now we strip tags + decode entities first so the
+                // fallback delivers clean prose, never markup.
+                //
+                // NOTE: scoped intentionally to api_send_message only. The two
+                // other sanitize_telegram_html call sites (sendMessage with
+                // buttons at L1036, editMessageText at L1102) do NOT have a
+                // plain-retry path — they just warn and swallow — so there is
+                // no literal-tag leak to plug there.
                 if status == reqwest::StatusCode::BAD_REQUEST
                     && body_text.contains("can't parse entities")
                 {
+                    let stripped = strip_html_for_fallback(&chunk);
+                    let parse_error_excerpt: String = body_text.chars().take(100).collect();
+                    warn!(
+                        event = "telegram_html_fallback_strip",
+                        parse_error_excerpt = %parse_error_excerpt,
+                        original_len = chunk.len(),
+                        stripped_len = stripped.len(),
+                        chat_id = chat_id,
+                        "Telegram HTML parse failed, shipping stripped plain text",
+                    );
                     let mut plain_body = serde_json::json!({
                         "chat_id": chat_id,
-                        "text": chunk,
+                        "text": stripped,
                     });
                     if let Some(tid) = thread_id {
                         plain_body["message_thread_id"] = serde_json::json!(tid);
