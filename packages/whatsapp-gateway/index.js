@@ -22,6 +22,11 @@ const {
   VALID_FAIL_MODES: VALID_INTENT_FAIL_MODES,
 } = require('./lib/intent_classifier');
 const {
+  channelTypeForChat,
+  runCs01SelfTest,
+  STRICT_PREFIX_ENABLED,
+} = require('./lib/session-key');
+const {
   isLidJid,
   isGroupJid,
   normalizeDeviceScopedJid,
@@ -2787,10 +2792,13 @@ async function forwardToLibreFang(text, systemPrefix, phone, pushName, isOwner, 
 
   const fullMessage = systemPrefix ? systemPrefix + text : text;
 
-  // Per-conversation session isolation: include chat JID in channel_type
-  // so the kernel creates separate sessions for each WhatsApp conversation.
+  // Per-conversation session isolation: derive a structured channel_type
+  // (Phase 05 §B.1 strict prefix — `whatsapp-dm:<jid>` / `whatsapp-group:<jid>`)
+  // so the kernel creates separate sessions and downstream guards can apply
+  // group-vs-DM policies.
   // CS-01: chatJid has already been validated non-empty at function entry.
-  const channelType = `whatsapp:${chatJid}`;
+  // Revert: `LIBREFANG_STRICT_CHANNEL_PREFIX=off` restores legacy prefix.
+  const channelType = channelTypeForChat(chatJid);
   const payload = {
     message: fullMessage,
     channel_type: channelType,
@@ -2923,8 +2931,10 @@ async function forwardToLibreFangStreaming(text, systemPrefix, phone, pushName, 
 
   const fullMessage = systemPrefix ? systemPrefix + text : text;
 
-  // CS-01: chatJid has already been validated non-empty at function entry.
-  const channelType = `whatsapp:${chatJid}`;
+  // CS-01 + Phase 05 §B.1 strict prefix — same helper used by the non-streaming
+  // path above. Keeping the helper call symmetric so both entry points agree
+  // on the channel_type for a given chatJid.
+  const channelType = channelTypeForChat(chatJid);
   const payload = {
     message: fullMessage,
     channel_type: channelType,
@@ -3608,6 +3618,33 @@ const server = http.createServer(async (req, res) => {
 });
 
 if (require.main === module) {
+  // Phase 05 §B.1 — CS-01 boot self-test.
+  // Runs BEFORE the HTTP server listens so a regression crashes the gateway
+  // fast instead of surfacing as a cross-chat leak at traffic time. Emits a
+  // structured success line on stdout so the NAS log tail can confirm the
+  // mitigation is live.
+  try {
+    const cs01 = runCs01SelfTest();
+    if (!cs01.ok) {
+      console.error(
+        `[gateway] FATAL cs01_self_test failed: ${cs01.reason} ` +
+          `(LIBREFANG_STRICT_CHANNEL_PREFIX=${process.env.LIBREFANG_STRICT_CHANNEL_PREFIX ?? 'on'})`
+      );
+      process.exit(1);
+    }
+    console.log(
+      JSON.stringify({
+        event: 'cs01_self_test',
+        ok: true,
+        dm_type: cs01.dm_type,
+        group_type: cs01.group_type,
+        strict_prefix_enabled: STRICT_PREFIX_ENABLED,
+      })
+    );
+  } catch (err) {
+    console.error(`[gateway] FATAL cs01_self_test threw: ${err.message}`);
+    process.exit(1);
+  }
 server.listen(PORT, '127.0.0.1', async () => {
   console.log(`[gateway] WhatsApp Web gateway listening on http://127.0.0.1:${PORT}`);
   console.log(`[gateway] LibreFang URL: ${LIBREFANG_URL}`);
@@ -3733,4 +3770,8 @@ module.exports = {
   classifyOutput,
   logOutputGuardDrop,
   OUTPUT_GUARD_ENABLED,
+  // Phase 05 §B.1 — strict channel_type prefix (testing + introspection)
+  channelTypeForChat,
+  runCs01SelfTest,
+  STRICT_PREFIX_ENABLED,
 };

@@ -50,6 +50,9 @@ const {
   classifyOutput,
   logOutputGuardDrop,
   OUTPUT_GUARD_ENABLED,
+  channelTypeForChat,
+  runCs01SelfTest,
+  STRICT_PREFIX_ENABLED,
 } = require('./index.js');
 
 // ---------------------------------------------------------------------------
@@ -433,23 +436,67 @@ describe('CS-01 forwardToLibreFang chatJid enforcement', () => {
     );
   });
 
-  it('Test 3: forwardToLibreFang proceeds with valid chatJid and sends channel_type=whatsapp:<jid>', async () => {
+  it('Test 3: forwardToLibreFang proceeds with DM chatJid and sends channel_type=whatsapp-dm:<jid>', async () => {
+    // Phase 05 §B.1 strict prefix — the DM path must carry the
+    // `whatsapp-dm:` discriminator so downstream guards can apply
+    // DM-specific policies (memory scope, claude_code session scope, etc.).
     lastRequests.length = 0;
     const jid = '39123@s.whatsapp.net';
     const reply = await forwardToLibreFang('hello', '', '+39123', 'Alice', false, [], { isGroup: false, wasMentioned: false, chatJid: jid });
     assert.equal(reply, 'mock reply');
     const msgReq = lastRequests.find((r) => r.url && r.url.endsWith('/message'));
     assert.ok(msgReq, 'expected /message POST to have fired');
-    assert.equal(msgReq.body.channel_type, `whatsapp:${jid}`);
+    assert.equal(msgReq.body.channel_type, `whatsapp-dm:${jid}`);
   });
 
-  it('Test 4: no code path produces bare channel_type "whatsapp"', () => {
-    // Source-level invariant: the only channelType assignments are
-    // `whatsapp:${chatJid}`, and entry is guarded by the CS-01 throw.
+  it('Test 3b: forwardToLibreFang with group chatJid sends channel_type=whatsapp-group:<jid>', async () => {
+    lastRequests.length = 0;
+    const jid = '120363abc@g.us';
+    const reply = await forwardToLibreFang(
+      'ciao gruppo',
+      '',
+      '+39123',
+      'Alice',
+      false,
+      [],
+      { isGroup: true, wasMentioned: true, chatJid: jid }
+    );
+    assert.equal(reply, 'mock reply');
+    const msgReq = lastRequests.find((r) => r.url && r.url.endsWith('/message'));
+    assert.ok(msgReq, 'expected /message POST to have fired');
+    assert.equal(msgReq.body.channel_type, `whatsapp-group:${jid}`);
+    // CS-01 structural invariant, explicit assertion:
+    assert.notEqual(
+      msgReq.body.channel_type,
+      `whatsapp-dm:${jid}`,
+      'group JID must never fall through to dm prefix'
+    );
+  });
+
+  it('Test 4: no code path produces bare channel_type "whatsapp" or legacy inline literal', () => {
+    // Source-level invariant: the only channelType assignments are now
+    // `channelTypeForChat(chatJid)` helper calls. The legacy inline
+    // `` `whatsapp:${chatJid}` `` literal must no longer appear, and no
+    // code path produces a bare `channelType = 'whatsapp'` sentinel.
     const fs = require('node:fs');
     const src = fs.readFileSync(__dirname + '/index.js', 'utf8');
     assert.equal(src.includes("chatJid ? `whatsapp:"), false, 'ternary fallback must be removed');
     assert.equal(/channelType\s*=\s*'whatsapp'\s*;/.test(src), false, 'bare whatsapp assignment must not exist');
+    assert.equal(
+      /const\s+channelType\s*=\s*`whatsapp:\$\{chatJid\}`/.test(src),
+      false,
+      'inline `whatsapp:${chatJid}` must be replaced by channelTypeForChat(chatJid)'
+    );
+    assert.ok(
+      src.includes('channelTypeForChat(chatJid)'),
+      'channelTypeForChat(chatJid) helper call must be wired'
+    );
+    const callCount = (src.match(/channelTypeForChat\(chatJid\)/g) || []).length;
+    assert.equal(
+      callCount,
+      2,
+      `expected exactly 2 call sites (forwardToLibreFang + forwardToLibreFangStreaming), found ${callCount}`
+    );
   });
 
   it('Test 5 (catchup guard): shouldSkipCatchupForMissingJid returns true for null/empty jid rows', () => {
@@ -458,6 +505,33 @@ describe('CS-01 forwardToLibreFang chatJid enforcement', () => {
     assert.equal(shouldSkipCatchupForMissingJid({ id: 3, jid: undefined }), true);
     assert.equal(shouldSkipCatchupForMissingJid({ id: 4, jid: '39123@s.whatsapp.net' }), false);
     assert.equal(shouldSkipCatchupForMissingJid(null), true);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// CS-01 boot self-test (strict prefix mitigation, Phase 05 §B.1)
+// ---------------------------------------------------------------------------
+describe('CS-01 boot self-test', () => {
+  it('runCs01SelfTest() reports ok=true under default (strict prefix) config', () => {
+    const result = runCs01SelfTest();
+    assert.equal(result.ok, true);
+    assert.match(result.dm_type, /^whatsapp-dm:/);
+    assert.match(result.group_type, /^whatsapp-group:/);
+    assert.notEqual(result.dm_type, result.group_type);
+  });
+
+  it('channelTypeForChat is re-exported from index.js and symmetric DM/group', () => {
+    const dm = channelTypeForChat('39000@s.whatsapp.net');
+    const group = channelTypeForChat('120363zz@g.us');
+    assert.equal(dm, 'whatsapp-dm:39000@s.whatsapp.net');
+    assert.equal(group, 'whatsapp-group:120363zz@g.us');
+    assert.notEqual(dm, group);
+  });
+
+  it('STRICT_PREFIX_ENABLED is re-exported and reflects process.env', () => {
+    // Module was loaded with env at test harness start — so whatever flag
+    // was set then drove this constant. We only assert the type shape.
+    assert.equal(typeof STRICT_PREFIX_ENABLED, 'boolean');
   });
 });
 
