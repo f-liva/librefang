@@ -54,6 +54,28 @@ const ECHO_TRACKER_ENABLED = process.env.LIBREFANG_ECHO_TRACKER !== 'off';
 const echoTracker = new EchoTracker(100);
 
 // ---------------------------------------------------------------------------
+// Output guard classifier (OB-05, Phase 5 §A)
+// ---------------------------------------------------------------------------
+// Blocks/strips model-generated meta-text (markdown headers, bracket tokens,
+// JSON/XML openers, fabricated `§N.M` rule citations) BEFORE it reaches
+// WhatsApp. Detection is categorial first-char + structural shape and
+// cascade-aware (2+ stacked structural leaders → toxic full-message). Flag
+// `LIBREFANG_OUTPUT_GUARD=off` short-circuits to { verdict:'ok',
+// reason:'disabled' } for instant revert without redeploy.
+const { classifyOutput, OUTPUT_GUARD_ENABLED } = require('./lib/output_guard');
+
+function logOutputGuardDrop({ verdict, reason, chatJid, text }) {
+  console.log(JSON.stringify({
+    event: 'output_guard_drop',
+    verdict,
+    reason,
+    chat_jid: chatJid || null,
+    body_excerpt: String(text || '').slice(0, 40),
+    group: typeof chatJid === 'string' && chatJid.endsWith('@g.us'),
+  }));
+}
+
+// ---------------------------------------------------------------------------
 // SQLite Message Store (better-sqlite3)
 // ---------------------------------------------------------------------------
 const Database = require('better-sqlite3');
@@ -2108,6 +2130,28 @@ async function startConnection() {
           cleaned = stripNoReply(cleaned);
           cleaned = cleaned.trim();
           if (!cleaned) return;
+
+          // Output guard — streaming hold-back gate (OB-05, Phase 5 §A).
+          // Classifier inspects the cumulative cleaned chunk before flush:
+          //   - toxic      → suppress this flush entirely (do not send/edit).
+          //                  If the stream keeps arriving and the final
+          //                  post-scrub still sees toxic content, the
+          //                  assembly-site guard below will also suppress.
+          //   - suspicious → ship the stripped variant instead of the
+          //                  leader-prefixed original.
+          //   - ok         → pass through.
+          if (OUTPUT_GUARD_ENABLED) {
+            const v = classifyOutput(cleaned);
+            if (v.verdict === 'toxic') {
+              logOutputGuardDrop({ verdict: 'toxic', reason: v.reason, chatJid: sender, text: cleaned });
+              return; // hold back — await more chunks or end of stream
+            }
+            if (v.verdict === 'suspicious' && v.stripped) {
+              logOutputGuardDrop({ verdict: 'suspicious', reason: v.reason, chatJid: sender, text: cleaned });
+              cleaned = v.stripped;
+            }
+          }
+
           const formatted = markdownToWhatsApp(cleaned);
           if (!streamMsgKey) {
             const sent = await sock.sendMessage(sender, { text: formatted });
@@ -2132,15 +2176,40 @@ async function startConnection() {
 
         // Helper: send a new message or edit the streamed one for final delivery
         const sendOrEdit = async (jid, finalText) => {
+          // Output guard — final post-scrub (OB-05, Phase 5 §A).
+          // Re-classify the fully-assembled output just before it reaches
+          // WhatsApp. Streaming hold-back gate only sees each cumulative
+          // chunk; this site is the last line of defense.
+          //   - toxic  + !streamMsgKey → suppress entirely, never send.
+          //   - toxic  +  streamMsgKey → log and proceed. Delete-on-leak
+          //     (Phase 05-PLAN-03 §C) handles retraction out of scope here.
+          //   - suspicious → replace finalText with the stripped variant.
+          let toSend = finalText;
+          if (OUTPUT_GUARD_ENABLED) {
+            const v = classifyOutput(toSend);
+            if (v.verdict === 'toxic') {
+              logOutputGuardDrop({ verdict: 'toxic', reason: v.reason, chatJid: jid, text: toSend });
+              if (!(streamMsgKey && jid === sender)) {
+                // Not yet emitted → drop on the floor. Caller receives
+                // undefined (same shape as a skipped send).
+                return undefined;
+              }
+              // Already streamed — let it proceed; §C will delete later.
+            } else if (v.verdict === 'suspicious' && v.stripped) {
+              logOutputGuardDrop({ verdict: 'suspicious', reason: v.reason, chatJid: jid, text: toSend });
+              toSend = v.stripped;
+            }
+          }
+
           if (streamMsgKey && jid === sender) {
             // Edit the message we've been streaming
-            await sock.sendMessage(jid, { text: finalText, edit: streamMsgKey });
-            if (ECHO_TRACKER_ENABLED) echoTracker.track(finalText);
+            await sock.sendMessage(jid, { text: toSend, edit: streamMsgKey });
+            if (ECHO_TRACKER_ENABLED) echoTracker.track(toSend);
             return streamMsgKey;
           }
           // No streaming happened (fallback path) — send new message
-          const sentKey = (await sock.sendMessage(jid, { text: finalText }))?.key;
-          if (ECHO_TRACKER_ENABLED) echoTracker.track(finalText);
+          const sentKey = (await sock.sendMessage(jid, { text: toSend }))?.key;
+          if (ECHO_TRACKER_ENABLED) echoTracker.track(toSend);
           return sentKey;
         };
 
@@ -3660,4 +3729,8 @@ module.exports = {
   // Phase 5 §B — readiness predicate (testing)
   computeReadiness,
   HEARTBEAT_MS,
+  // Phase 5 §A (OB-05) — output guard classifier (testing + introspection)
+  classifyOutput,
+  logOutputGuardDrop,
+  OUTPUT_GUARD_ENABLED,
 };
