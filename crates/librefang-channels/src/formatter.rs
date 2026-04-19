@@ -6,6 +6,30 @@
 //! - Plain text: strips all formatting
 
 use librefang_types::config::OutputFormat;
+use regex::Regex;
+use std::sync::LazyLock;
+
+/// Triple-asterisk symmetric bold+italic combo: `***X***` → `<b><i>X</i></b>`.
+///
+/// `[^*]+` forbids interior asterisks so the match is unambiguous.
+static RE_TRIPLE_STAR: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"\*\*\*([^*]+)\*\*\*").expect("triple-star regex"));
+
+/// Italic-inside-bold asymmetric combo: `**A *B***` → `<b>A <i>B</i></b>`.
+///
+/// Captures head text (no interior `*`) then italic tail (no interior `*`).
+/// Closing `***` means inside-out: close italic then bold.
+static RE_BOLD_OUTER_ITALIC_INNER: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"\*\*([^*]+)\*([^*]+)\*\*\*").expect("bold-outer italic-inner regex")
+});
+
+/// Bold-inside-italic asymmetric combo: `*A **B***` → `<i>A <b>B</b></i>`.
+///
+/// Captures head text (no interior `*`) then bold tail (no interior `*`).
+/// Closing `***` means inside-out: close bold then italic.
+static RE_ITALIC_OUTER_BOLD_INNER: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"\*([^*]+)\*\*([^*]+)\*\*\*").expect("italic-outer bold-inner regex")
+});
 
 /// Return the default [`OutputFormat`] for a channel type string.
 ///
@@ -180,6 +204,18 @@ fn markdown_to_telegram_html(text: &str) -> String {
 fn render_inline_markdown(text: &str) -> String {
     let mut result = escape_html(text);
 
+    // Pre-normalize triple-asterisk + asymmetric emphasis combos into
+    // properly-nested Telegram HTML BEFORE the independent bold/italic passes
+    // run. Without this pre-pass, `**A *B***` would emit crossed tags
+    // `<b>A <i>B</b></i>` (invalid HTML), which Telegram rejects with
+    // HTTP 400 "can't parse entities" (incident 2026-04-19).
+    //
+    // Order matters — we do ASYMMETRIC combos first (since they consume
+    // 5 asterisks), then symmetric triple-star (6 asterisks). The asymmetric
+    // regexes require at least one non-`*` character on BOTH sides of the
+    // middle delimiter, so they never match a symmetric `***X***`.
+    result = normalize_emphasis_combos(&result);
+
     // Links: [text](url) → <a href="url">text</a>
     while let Some(bracket_start) = result.find('[') {
         if let Some(bracket_end_rel) = result[bracket_start..].find("](") {
@@ -231,21 +267,47 @@ fn render_inline_markdown(text: &str) -> String {
     }
 
     // Italic: *text* → <i>text</i> (single star only)
-    let mut out = String::with_capacity(result.len());
-    let mut in_italic = false;
-    let mut prev_char = '\0';
+    //
+    // Two-pass to avoid dangling tags on unclosed italic (e.g. `*text` →
+    // stays `*text` literal instead of `<i>text`):
+    //   Pass 1: count isolated `*` (not part of `**` or `***`).
+    //   Pass 2: only emit `<i>`/`</i>` pairs; if count is odd, the last
+    //           isolated `*` is left literal (handled by `remaining` counter).
     let bytes = result.as_bytes();
+    let mut isolated_star_count: usize = 0;
+    let mut prev_char = '\0';
     for (i, ch) in result.char_indices() {
         if ch == '*'
             && prev_char != '*'
             && (i + ch.len_utf8() >= bytes.len() || bytes[i + ch.len_utf8()] != b'*')
         {
-            if in_italic {
-                out.push_str("</i>");
+            isolated_star_count += 1;
+        }
+        prev_char = ch;
+    }
+    let pairable = isolated_star_count - (isolated_star_count % 2);
+
+    let mut out = String::with_capacity(result.len());
+    let mut in_italic = false;
+    let mut consumed: usize = 0;
+    let mut prev_char = '\0';
+    for (i, ch) in result.char_indices() {
+        if ch == '*'
+            && prev_char != '*'
+            && (i + ch.len_utf8() >= bytes.len() || bytes[i + ch.len_utf8()] != b'*')
+        {
+            if consumed < pairable {
+                if in_italic {
+                    out.push_str("</i>");
+                } else {
+                    out.push_str("<i>");
+                }
+                in_italic = !in_italic;
+                consumed += 1;
             } else {
-                out.push_str("<i>");
+                // Odd extra star → emit literal to avoid dangling <i>.
+                out.push('*');
             }
-            in_italic = !in_italic;
         } else {
             out.push(ch);
         }
@@ -253,6 +315,35 @@ fn render_inline_markdown(text: &str) -> String {
     }
 
     out
+}
+
+/// Pre-normalize triple-asterisk and asymmetric emphasis combos into
+/// properly-nested Telegram HTML tags.
+///
+/// Handles three Markdown shapes that the downstream independent bold/italic
+/// passes would render as crossed (invalid) HTML:
+///
+/// - `***X***`    → `<b><i>X</i></b>`      (symmetric triple)
+/// - `**A *B***`  → `<b>A <i>B</i></b>`    (italic inside bold)
+/// - `*A **B***`  → `<i>A <b>B</b></i>`    (bold inside italic)
+///
+/// All three closing forms use `***`; inside-out closure (italic-first or
+/// bold-first) is determined by which opener started the outer emphasis.
+///
+/// Patterns use `[^*]+` interior classes so they never cross asterisk
+/// boundaries of neighbouring emphasis runs. Asymmetric patterns run BEFORE
+/// the symmetric triple-star pattern because the asymmetric patterns each
+/// consume 5 asterisks and would lose a star if the symmetric pattern ate
+/// the leading `***` first.
+fn normalize_emphasis_combos(text: &str) -> String {
+    // Pass 1: `**A *B***` → `<b>A <i>B</i></b>` (italic-inside-bold).
+    let s1 = RE_BOLD_OUTER_ITALIC_INNER.replace_all(text, "<b>$1<i>$2</i></b>");
+    // Pass 2: `*A **B***` → `<i>A <b>B</b></i>` (bold-inside-italic).
+    let s2 = RE_ITALIC_OUTER_BOLD_INNER.replace_all(&s1, "<i>$1<b>$2</b></i>");
+    // Pass 3: `***X***` → `<b><i>X</i></b>` (symmetric).
+    RE_TRIPLE_STAR
+        .replace_all(&s2, "<b><i>$1</i></b>")
+        .into_owned()
 }
 
 /// Escape HTML special characters for Telegram.
@@ -714,5 +805,180 @@ mod tests {
     fn test_single_backtick_line_is_not_treated_as_fenced_code() {
         let result = markdown_to_wecom_plain("`status`\nnext line");
         assert_eq!(result, "status\nnext line");
+    }
+
+    // --- Proper-nesting emphasis matrix (Fix 1, incident 2026-04-19) ---
+    //
+    // Regression guard: Telegram rejects crossed HTML tags with HTTP 400
+    // "can't parse entities", and the retry path historically shipped raw
+    // tags as literal characters. The matrix below covers every asterisk
+    // permutation seen in production model output plus the Signore
+    // verbatim incident text.
+
+    /// Walk an HTML string tracking a tag stack; panic if any closing tag
+    /// violates LIFO order (i.e. crossed tags like `<b>x<i>y</b></i>`).
+    ///
+    /// This is a minimal HTML validator: it only cares about proper nesting
+    /// of `<b>`, `<i>`, `<code>`, `<pre>`, `<blockquote>`, and `<a>`. Self-closing
+    /// and unknown tags are ignored.
+    fn assert_no_tag_crossing(html: &str) {
+        let mut stack: Vec<String> = Vec::new();
+        let bytes = html.as_bytes();
+        let mut i = 0;
+        while i < bytes.len() {
+            if bytes[i] == b'<' {
+                // Find matching '>'
+                let end = match html[i..].find('>') {
+                    Some(e) => i + e,
+                    None => break,
+                };
+                let inner = &html[i + 1..end];
+                let (is_close, tag) = if let Some(rest) = inner.strip_prefix('/') {
+                    (true, rest.trim().to_lowercase())
+                } else {
+                    let tag = inner
+                        .split_whitespace()
+                        .next()
+                        .unwrap_or("")
+                        .trim_end_matches('/')
+                        .to_lowercase();
+                    (false, tag)
+                };
+                // Only track the emphasis/structural tags we emit.
+                let tracked = matches!(
+                    tag.as_str(),
+                    "b" | "i" | "code" | "pre" | "blockquote" | "a"
+                );
+                if tracked {
+                    if is_close {
+                        match stack.pop() {
+                            Some(top) if top == tag => { /* proper close */ }
+                            Some(top) => panic!(
+                                "tag crossing: closing </{tag}> but stack top is <{top}> in: {html}"
+                            ),
+                            None => {
+                                panic!("tag crossing: closing </{tag}> with empty stack in: {html}")
+                            }
+                        }
+                    } else {
+                        stack.push(tag);
+                    }
+                }
+                i = end + 1;
+            } else {
+                i += 1;
+            }
+        }
+        assert!(
+            stack.is_empty(),
+            "unclosed tags remaining on stack {stack:?} in: {html}"
+        );
+    }
+
+    #[test]
+    fn test_assert_no_tag_crossing_accepts_valid() {
+        assert_no_tag_crossing("<b>a <i>b</i></b>");
+        assert_no_tag_crossing("<i>a <b>b</b></i>");
+        assert_no_tag_crossing("<b><i>abc</i></b>");
+        assert_no_tag_crossing("<b>x</b> <i>y</i>");
+        assert_no_tag_crossing("plain text, no tags");
+    }
+
+    #[test]
+    #[should_panic(expected = "tag crossing")]
+    fn test_assert_no_tag_crossing_rejects_crossed() {
+        // The exact shape that broke production on 2026-04-19.
+        assert_no_tag_crossing("<b>797 <i>Aira</b></i>");
+    }
+
+    #[test]
+    fn test_telegram_html_emphasis_matrix_bold_outer_italic_inner() {
+        let result = markdown_to_telegram_html("**a *b***");
+        assert_eq!(result, "<b>a <i>b</i></b>");
+        assert_no_tag_crossing(&result);
+    }
+
+    #[test]
+    fn test_telegram_html_emphasis_matrix_italic_outer_bold_inner() {
+        let result = markdown_to_telegram_html("*a **b***");
+        assert_eq!(result, "<i>a <b>b</b></i>");
+        assert_no_tag_crossing(&result);
+    }
+
+    #[test]
+    fn test_telegram_html_emphasis_matrix_triple_symmetric() {
+        let result = markdown_to_telegram_html("***abc***");
+        assert_eq!(result, "<b><i>abc</i></b>");
+        assert_no_tag_crossing(&result);
+    }
+
+    #[test]
+    fn test_telegram_html_emphasis_matrix_sequential_bold_italic() {
+        let result = markdown_to_telegram_html("**x** *y*");
+        assert_eq!(result, "<b>x</b> <i>y</i>");
+        assert_no_tag_crossing(&result);
+    }
+
+    #[test]
+    fn test_telegram_html_emphasis_matrix_sequential_italic_bold() {
+        let result = markdown_to_telegram_html("*x* **y**");
+        assert_eq!(result, "<i>x</i> <b>y</b>");
+        assert_no_tag_crossing(&result);
+    }
+
+    #[test]
+    fn test_telegram_html_emphasis_matrix_same_char_sequential_bold() {
+        let result = markdown_to_telegram_html("**a**b**c**");
+        assert_eq!(result, "<b>a</b>b<b>c</b>");
+        assert_no_tag_crossing(&result);
+    }
+
+    #[test]
+    fn test_telegram_html_emphasis_edge_unclosed_outer_bold() {
+        // Unclosed outer bold `**a *b*` — deterministic behavior:
+        // pre-norm does not match (no `***`), bold parser leaves `**` literal
+        // (no pair), italic walker emits `<i>b</i>` for the complete inner pair.
+        let result = markdown_to_telegram_html("**a *b*");
+        assert_eq!(result, "**a <i>b</i>");
+        assert_no_tag_crossing(&result);
+    }
+
+    #[test]
+    fn test_telegram_html_emphasis_edge_unclosed_italic() {
+        // Single dangling `*` must NOT produce `<i>` (unclosed dangling tag
+        // breaks Telegram parser). Must render literal `*text`.
+        let result = markdown_to_telegram_html("*text");
+        assert_eq!(result, "*text");
+        assert_no_tag_crossing(&result);
+    }
+
+    #[test]
+    fn test_telegram_html_incident_20260419() {
+        // Verbatim replay of the 2026-04-19 Signore incident message.
+        // Before Fix 1, `render_inline_markdown` emitted crossed tags:
+        //   <b>797 <i>Aira</b></i>
+        // Telegram API returned 400 "can't parse entities" and the retry
+        // path shipped the raw tags as visible characters.
+        let input = "\u{2022} **797 *Aira*** (Sospiro) \u{2014} luminoso, elegante, armonioso. Fresco da giorno.\n\u{2022} **799 *Farsa*** (Sospiro) \u{2014} vibrante, magnetico. Pi\u{00f9} giovane, agrumato.";
+        let result = markdown_to_telegram_html(input);
+        // Strong invariant: no crossed tags pattern.
+        assert!(
+            !result.contains("</b></i>"),
+            "crossed close tags </b></i> detected in: {result}"
+        );
+        assert!(
+            !result.contains("<b>") || result.contains("</b>"),
+            "unclosed <b> detected in: {result}"
+        );
+        assert_no_tag_crossing(&result);
+        // Structural expectation: bullets preserved, bold+italic proper-nested.
+        assert!(
+            result.contains("<b>797 <i>Aira</i></b>"),
+            "expected proper inside-out nesting for 797 Aira: {result}"
+        );
+        assert!(
+            result.contains("<b>799 <i>Farsa</i></b>"),
+            "expected proper inside-out nesting for 799 Farsa: {result}"
+        );
     }
 }
