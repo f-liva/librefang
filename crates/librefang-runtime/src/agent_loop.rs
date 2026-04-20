@@ -34,6 +34,106 @@ use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
 use tracing::{debug, info, instrument, warn};
 
+/// Phase 05 §B.4 — per-agent last-seen chat_jid tracker.
+///
+/// Fires a `StreamEvent::ResetAccumulator { reason: "chat_switch" }` at the
+/// top of each streaming turn when the previous turn for the same agent
+/// came from a different chat_jid. Downstream consumers (SSE dedup window,
+/// gateway streamer) reset their per-turn accumulators so content from
+/// turn N-1 of a different chat can't suppress identical content in turn
+/// N of a new chat.
+///
+/// Disabled globally via `LIBREFANG_STREAM_RESET_ON_CHAT_SWITCH=off`. The
+/// tracker is also updated when the flag is off (so enabling it mid-
+/// process recovers correct behavior on the next turn).
+fn chat_switch_reset_enabled() -> bool {
+    std::env::var("LIBREFANG_STREAM_RESET_ON_CHAT_SWITCH")
+        .map(|v| v != "off")
+        .unwrap_or(true)
+}
+
+static LAST_CHAT_JID_PER_AGENT: std::sync::OnceLock<
+    dashmap::DashMap<librefang_types::agent::AgentId, String>,
+> = std::sync::OnceLock::new();
+
+fn last_chat_jid_tracker() -> &'static dashmap::DashMap<librefang_types::agent::AgentId, String> {
+    LAST_CHAT_JID_PER_AGENT.get_or_init(dashmap::DashMap::new)
+}
+
+/// Test helper: drop any tracked last_chat_jid for `agent_id`. Used by the
+/// chat-switch unit tests below so they start from a clean slate.
+#[cfg(test)]
+fn reset_last_chat_jid_for_testing(agent_id: librefang_types::agent::AgentId) {
+    last_chat_jid_tracker().remove(&agent_id);
+}
+
+/// Returns the verdict emitted by `detect_and_emit_chat_switch_reset`.
+///
+/// - `FirstTurn`        → no previous chat_jid recorded; tracker updated.
+/// - `SameChat`         → previous == current; tracker unchanged.
+/// - `DifferentChat`    → previous != current; tracker updated, reset emitted.
+/// - `AmbiguousNone`    → current chat_jid is None; conservative no-op.
+/// - `Disabled`         → `LIBREFANG_STREAM_RESET_ON_CHAT_SWITCH=off`; no-op.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ChatSwitchVerdict {
+    FirstTurn,
+    SameChat,
+    DifferentChat,
+    AmbiguousNone,
+    Disabled,
+}
+
+/// Detect a chat switch for `agent_id` and emit `StreamEvent::ResetAccumulator`
+/// on the provided channel when appropriate. Returns a verdict for
+/// observability / tests.
+///
+/// Callers pass the current turn's `chat_jid` (`None` when the caller has no
+/// chat context — CLI, cron). On `DifferentChat` the reset is sent
+/// asynchronously via `try_send`; a full channel is logged but not fatal.
+pub async fn detect_and_emit_chat_switch_reset(
+    agent_id: librefang_types::agent::AgentId,
+    chat_jid: Option<&str>,
+    stream_tx: &mpsc::Sender<StreamEvent>,
+) -> ChatSwitchVerdict {
+    if !chat_switch_reset_enabled() {
+        return ChatSwitchVerdict::Disabled;
+    }
+    let Some(active) = chat_jid else {
+        // Ambiguous: CLI/cron/test paths with no chat context → no reset
+        // and don't touch the tracker (preserves last channel chat_jid so
+        // a subsequent channel turn can still detect a switch properly).
+        return ChatSwitchVerdict::AmbiguousNone;
+    };
+    let tracker = last_chat_jid_tracker();
+    let previous = tracker.get(&agent_id).map(|r| r.clone());
+    let verdict = match previous {
+        None => ChatSwitchVerdict::FirstTurn,
+        Some(prev) if prev == active => ChatSwitchVerdict::SameChat,
+        Some(_) => ChatSwitchVerdict::DifferentChat,
+    };
+    if matches!(verdict, ChatSwitchVerdict::DifferentChat) {
+        if let Err(e) = stream_tx.try_send(StreamEvent::ResetAccumulator {
+            reason: "chat_switch".to_string(),
+        }) {
+            tracing::warn!(
+                agent_id = %agent_id,
+                new_chat = %active,
+                error = %e,
+                "failed to emit ResetAccumulator for chat switch (channel full or closed)"
+            );
+        } else {
+            tracing::info!(
+                agent_id = %agent_id,
+                new_chat = %active,
+                "emitted ResetAccumulator for chat switch"
+            );
+        }
+    }
+    // Always update tracker — even for SameChat this is a cheap upsert.
+    tracker.insert(agent_id, active.to_string());
+    verdict
+}
+
 /// Maximum iterations in the agent loop before giving up.
 const MAX_ITERATIONS: u32 = 50;
 
@@ -3537,7 +3637,11 @@ pub async fn run_agent_loop_streaming(
                         );
                         // Tell the gateway to discard accumulated text before
                         // we stream iteration N+1 — prevents concatenation.
-                        let _ = stream_tx.send(StreamEvent::ResetAccumulator).await;
+                        let _ = stream_tx
+                            .send(StreamEvent::ResetAccumulator {
+                                reason: "nudge_retry".to_string(),
+                            })
+                            .await;
                         if is_silent_failure {
                             messages = crate::session_repair::validate_and_repair(&messages);
                         }
@@ -3554,7 +3658,11 @@ pub async fn run_agent_loop_streaming(
                         );
                         // Tell the gateway to discard accumulated text before
                         // we stream iteration N+1 — prevents concatenation.
-                        let _ = stream_tx.send(StreamEvent::ResetAccumulator).await;
+                        let _ = stream_tx
+                            .send(StreamEvent::ResetAccumulator {
+                                reason: "nudge_retry".to_string(),
+                            })
+                            .await;
                         messages.push(Message::assistant(&text));
                         messages.push(Message::user(
                             "[System: You described performing an action but did not actually call any tools. \
@@ -3571,7 +3679,11 @@ pub async fn run_agent_loop_streaming(
                         );
                         // Tell the gateway to discard accumulated text before
                         // we stream iteration N+1 — prevents concatenation.
-                        let _ = stream_tx.send(StreamEvent::ResetAccumulator).await;
+                        let _ = stream_tx
+                            .send(StreamEvent::ResetAccumulator {
+                                reason: "nudge_retry".to_string(),
+                            })
+                            .await;
                         messages.push(Message::assistant(&text));
                         messages.push(Message::user(
                             "[System: You described actions but didn't execute them. \
