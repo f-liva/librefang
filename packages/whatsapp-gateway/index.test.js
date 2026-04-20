@@ -509,6 +509,47 @@ describe('CS-01 forwardToLibreFang chatJid enforcement', () => {
 });
 
 // ---------------------------------------------------------------------------
+// forwardToLibreFang: non-2xx status must not be echoed as agent reply
+// ---------------------------------------------------------------------------
+// Regression guard for the 2026-04-20 WA "Failed to parse the request
+// body as JSON …" incident, where axum returned 400 with a plain-text
+// body and the gateway's JSON.parse catch branch resolved with the
+// body verbatim — the kernel's parse error ended up delivered to the
+// sender on WhatsApp as if it were the agent's reply.
+// ---------------------------------------------------------------------------
+describe('forwardToLibreFang error-body masking', () => {
+  it('rejects on 400 instead of resolving with the plain-text error body', () => {
+    // Source-level invariant for the 2026-04-20 fix. A live-HTTP test
+    // racing with the existing CS-01 mock server on the same captured
+    // LIBREFANG_URL port is flaky under node:test, so assert the guard
+    // exists in source instead. The behaviour is exercised end-to-end
+    // by the fork/custom live-test protocol.
+    const fs = require('node:fs');
+    const src = fs.readFileSync(__dirname + '/index.js', 'utf8');
+
+    // Guard must reject non-2xx with a stable, body-free error message,
+    // not echo the raw body to the caller.
+    assert.ok(
+      /res\.statusCode\s*<\s*200\s*\|\|\s*res\.statusCode\s*>=\s*300/.test(src),
+      'non-2xx guard must be present before the JSON.parse-fallback path'
+    );
+    assert.ok(
+      /reject\(new Error\(`LibreFang API \$\{res\.statusCode\}`\)\)/.test(src),
+      'non-2xx branch must reject with a body-free "LibreFang API <code>" message'
+    );
+
+    // Legacy bug: `resolve(stripNoReply(body || ''))` in the JSON.parse
+    // catch clause echoed raw 4xx/5xx bodies verbatim. The 2xx-catch
+    // fallback must now resolve to the empty string instead.
+    assert.equal(
+      /resolve\(stripNoReply\(body\s*\|\|\s*''\)\)/.test(src),
+      false,
+      'raw-body echo in the non-JSON fallback must be gone'
+    );
+  });
+});
+
+// ---------------------------------------------------------------------------
 // CS-01 boot self-test (strict prefix mitigation, Phase 05 §B.1)
 // ---------------------------------------------------------------------------
 describe('CS-01 boot self-test', () => {

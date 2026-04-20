@@ -2856,6 +2856,34 @@ async function forwardToLibreFang(text, systemPrefix, phone, pushName, isOwner, 
             return reject(new Error('Agent not found after retry'));
           }
 
+          // Non-2xx responses must not be echoed back to the user as the
+          // agent's reply. Before this guard, the JSON.parse-fallback
+          // branch below would `resolve(stripNoReply(body))` on *any*
+          // body it couldn't parse, so a plain-text 4xx/5xx error from
+          // axum ("Failed to parse the request body as JSON: unexpected
+          // end of hex escape at line 1 column …") was delivered verbatim
+          // to the sender on WhatsApp. Log full body + payload shape so
+          // the root cause can be diagnosed, and reject so the caller
+          // surfaces an error instead of forwarding garbage.
+          if (res.statusCode < 200 || res.statusCode >= 300) {
+            const preview = (body || '').slice(0, 800);
+            console.error(
+              `[gateway] LibreFang /message returned ${res.statusCode} (body ${body.length} bytes): ${preview}`
+            );
+            try {
+              const shape = {
+                message_len: typeof payload.message === 'string' ? payload.message.length : null,
+                channel_type: payload.channel_type,
+                sender_id: payload.sender_id,
+                sender_name_len: typeof payload.sender_name === 'string' ? payload.sender_name.length : null,
+                attachments: Array.isArray(payload.attachments) ? payload.attachments.length : 0,
+                is_group: payload.is_group === true,
+              };
+              console.error(`[gateway] …rejected request payload shape: ${JSON.stringify(shape)}`);
+            } catch { /* never let diagnostics crash the handler */ }
+            return reject(new Error(`LibreFang API ${res.statusCode}`));
+          }
+
           try {
             const data = JSON.parse(body);
             // Silent completion — agent intentionally chose not to reply (NO_REPLY)
@@ -2869,8 +2897,12 @@ async function forwardToLibreFang(text, systemPrefix, phone, pushName, isOwner, 
             // glued to an emoji / punctuation without a separator).
             resolve(stripNoReply(responseText));
           } catch {
-            // Non-JSON fallback — still scrub NO_REPLY for the same reason.
-            resolve(stripNoReply(body || ''));
+            // 2xx with an unparseable body — rare, but treat as empty
+            // reply rather than echoing raw bytes. Logged for visibility.
+            console.warn(
+              `[gateway] LibreFang /message returned 2xx with non-JSON body (${body.length} bytes), treating as empty`
+            );
+            resolve('');
           }
         });
       },
