@@ -3022,10 +3022,14 @@ async function forwardToLibreFangStreaming(text, systemPrefix, phone, pushName, 
                   onProgress(display).catch(() => {});
                 }
               } catch { /* ignore */ }
-            } else if (eventType === 'reset') {
+            } else if (eventType === 'reset_accumulator') {
               // Agent loop is retrying (nudge/hallucination retry) — discard
               // accumulated text so iteration-N text is not prepended to
-              // iteration-N+1 text in the final WhatsApp message.
+              // iteration-N+1 text in the final WhatsApp message. Kernel
+              // emits the SSE event as `reset_accumulator`
+              // (crates/librefang-api/src/routes/agents.rs,
+              // StreamEvent::ResetAccumulator branch). The earlier
+              // `'reset'` listener here never fired.
               accumulated = '';
               clearTimeout(pendingEdit);
               pendingEdit = null;

@@ -509,6 +509,35 @@ describe('CS-01 forwardToLibreFang chatJid enforcement', () => {
 });
 
 // ---------------------------------------------------------------------------
+// SSE event-name parity with kernel — guards the nudge-retry accumulator
+// reset wired in Phase 05 §B.3. Kernel emits `reset_accumulator`
+// (crates/librefang-api/src/routes/agents.rs); the gateway must listen
+// for the same name or iter-N text leaks into iter-N+1, producing a
+// doubled WhatsApp reply (bug observed 2026-04-20).
+// ---------------------------------------------------------------------------
+describe('SSE reset_accumulator event wiring', () => {
+  const fs = require('node:fs');
+  const src = fs.readFileSync(__dirname + '/index.js', 'utf8');
+
+  it('streaming handler listens for "reset_accumulator" (kernel event name)', () => {
+    assert.ok(
+      /eventType\s*===\s*['"]reset_accumulator['"]/.test(src),
+      'gateway must listen for the kernel-emitted reset_accumulator event'
+    );
+  });
+
+  it('obsolete "reset" event name is not used as a standalone listener', () => {
+    // Allow the substring `reset_accumulator` but forbid a bare
+    // `eventType === 'reset'` comparison — kernel never emits plain "reset".
+    assert.equal(
+      /eventType\s*===\s*['"]reset['"]\b/.test(src),
+      false,
+      'bare eventType === "reset" must not be present'
+    );
+  });
+});
+
+// ---------------------------------------------------------------------------
 // CS-01 boot self-test (strict prefix mitigation, Phase 05 §B.1)
 // ---------------------------------------------------------------------------
 describe('CS-01 boot self-test', () => {
