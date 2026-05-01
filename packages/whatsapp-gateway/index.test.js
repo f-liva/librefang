@@ -18,7 +18,6 @@ const {
   extractNotifyOwner,
   extractRelayCommands,
   ownerIntentsRelay,
-  buildConversationsContext,
   isRateLimited,
   buildCorsHeaders,
   isAllowedOrigin,
@@ -226,15 +225,6 @@ describe('extractRelayCommands', () => {
     const r2 = extractRelayCommands(text);
     assert.equal(r1.relays.length, 1);
     assert.equal(r2.relays.length, 1);
-  });
-});
-
-// ---------------------------------------------------------------------------
-// buildConversationsContext
-// ---------------------------------------------------------------------------
-describe('buildConversationsContext', () => {
-  it('returns empty string when no active conversations', () => {
-    assert.equal(buildConversationsContext(), '');
   });
 });
 

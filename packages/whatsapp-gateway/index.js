@@ -245,7 +245,6 @@ function readWhatsAppConfig(configPath) {
   const defaults = {
     default_agent: 'assistant',
     owner_numbers: [],
-    conversation_ttl_hours: 24,
     // English-only by default keeps upstream deployments locale-neutral;
     // set `[relay_intent].languages = ["en", "it", …]` in config.toml
     // to enable extra language packs.
@@ -259,13 +258,12 @@ function readWhatsAppConfig(configPath) {
     const cfg = {
       default_agent: wa.default_agent || defaults.default_agent,
       owner_numbers: Array.isArray(wa.owner_numbers) ? wa.owner_numbers : defaults.owner_numbers,
-      conversation_ttl_hours: parseInt(wa.conversation_ttl_hours, 10) || defaults.conversation_ttl_hours,
       relay_intent_languages:
         Array.isArray(relay.languages) && relay.languages.length > 0
           ? relay.languages
           : defaults.relay_intent_languages,
     };
-    console.log(`[gateway] Read config from ${configPath}: default_agent="${cfg.default_agent}", owner_numbers=${JSON.stringify(cfg.owner_numbers)}, conversation_ttl_hours=${cfg.conversation_ttl_hours}, relay_intent_languages=${JSON.stringify(cfg.relay_intent_languages)}`);
+    console.log(`[gateway] Read config from ${configPath}: default_agent="${cfg.default_agent}", owner_numbers=${JSON.stringify(cfg.owner_numbers)}, relay_intent_languages=${JSON.stringify(cfg.relay_intent_languages)}`);
     return cfg;
   } catch (err) {
     console.warn(`[gateway] Could not read ${configPath}: ${err.message} — using defaults/env vars`);
@@ -296,10 +294,6 @@ const OWNER_JID = OWNER_JIDS.size > 0 ? [...OWNER_JIDS][0] : '';
 // new behaviour without a rebuild. Defaults to "on".
 const OWNER_CHANNEL_MODE = (process.env.LIBREFANG_OWNER_CHANNEL || 'on').toLowerCase();
 const OWNER_CHANNEL_ENABLED = OWNER_CHANNEL_MODE !== 'off';
-
-// Conversation TTL from config.toml (default 24 hours)
-const CONVERSATION_TTL_HOURS = parseInt(process.env.CONVERSATION_TTL_HOURS || String(tomlConfig.conversation_ttl_hours), 10);
-const CONVERSATION_TTL_MS = CONVERSATION_TTL_HOURS * 3600 * 1000;
 
 // Validate owner numbers at startup
 if (OWNER_NUMBERS.length > 0) {
@@ -678,62 +672,6 @@ function markdownToWhatsApp(text) {
 }
 
 // ---------------------------------------------------------------------------
-// Step B: Conversation Tracker — in-memory Map with TTL
-// ---------------------------------------------------------------------------
-// Map<stranger_jid, ConversationState>
-const activeConversations = new Map();
-
-// Max messages to keep per conversation
-const MAX_CONVERSATION_MESSAGES = 20;
-
-/**
- * Record an inbound or outbound message in the conversation tracker.
- * Creates the conversation entry if it doesn't exist.
- */
-function trackMessage(strangerJid, pushName, phone, text, direction) {
-  let convo = activeConversations.get(strangerJid);
-  if (!convo) {
-    convo = {
-      pushName,
-      phone,
-      messages: [],
-      lastActivity: Date.now(),
-      messageCount: 0,
-      escalated: false,
-    };
-    activeConversations.set(strangerJid, convo);
-  }
-  convo.pushName = pushName || convo.pushName;
-  convo.lastActivity = Date.now();
-  convo.messageCount += 1;
-  convo.messages.push({
-    text: (text || '').substring(0, 500),
-    timestamp: Date.now(),
-    direction, // 'inbound' | 'outbound'
-  });
-  // Cap message history
-  if (convo.messages.length > MAX_CONVERSATION_MESSAGES) {
-    convo.messages = convo.messages.slice(-MAX_CONVERSATION_MESSAGES);
-  }
-}
-
-/**
- * Evict expired conversations based on TTL.
- */
-function evictExpiredConversations() {
-  const now = Date.now();
-  for (const [jid, convo] of activeConversations) {
-    if (now - convo.lastActivity > CONVERSATION_TTL_MS) {
-      console.log(`[gateway] Evicting expired conversation: ${convo.pushName} (${convo.phone})`);
-      activeConversations.delete(jid);
-    }
-  }
-}
-
-// Periodic sweep every 15 minutes
-setInterval(evictExpiredConversations, 15 * 60 * 1000);
-
-// ---------------------------------------------------------------------------
 // Step F: Rate limiting — per-JID for strangers
 // ---------------------------------------------------------------------------
 const rateLimitMap = new Map(); // Map<jid, { timestamps: number[] }>
@@ -798,61 +736,6 @@ setInterval(() => {
     if (now - ts > ESCALATION_DEBOUNCE_MS) lastEscalationTime.delete(jid);
   }
 }, 10 * 60 * 1000);
-
-// ---------------------------------------------------------------------------
-// Step D: Build active conversations context block for owner messages
-// ---------------------------------------------------------------------------
-function buildConversationsContext() {
-  if (activeConversations.size === 0) return '';
-
-  const lines = ['[ACTIVE_STRANGER_CONVERSATIONS]'];
-  let idx = 1;
-  for (const [jid, convo] of activeConversations) {
-    const lastMsg = convo.messages[convo.messages.length - 1];
-    const agoMs = Date.now() - (lastMsg?.timestamp || convo.lastActivity);
-    const agoStr = formatTimeAgo(agoMs);
-    const lastText = lastMsg ? `"${lastMsg.text.substring(0, 100)}"` : '(no messages)';
-    const escalatedTag = convo.escalated ? ' [ESCALATED]' : '';
-    lines.push(`${idx}. ${convo.pushName} (${convo.phone}) [JID: ${jid}] — last: ${lastText} (${agoStr})${escalatedTag}`);
-    idx++;
-  }
-  lines.push('[/ACTIVE_STRANGER_CONVERSATIONS]');
-  return lines.join('\n');
-}
-
-function formatTimeAgo(ms) {
-  const seconds = Math.floor(ms / 1000);
-  if (seconds < 60) return `${seconds}s ago`;
-  const minutes = Math.floor(seconds / 60);
-  if (minutes < 60) return `${minutes}min ago`;
-  const hours = Math.floor(minutes / 60);
-  if (hours < 24) return `${hours}h ago`;
-  const days = Math.floor(hours / 24);
-  return `${days}d ago`;
-}
-
-// ---------------------------------------------------------------------------
-// Step C: Build stranger context prefix (factual only, no personality)
-// ---------------------------------------------------------------------------
-function buildStrangerContext(pushName, phone, strangerJid) {
-  const convo = activeConversations.get(strangerJid);
-  const messageCount = convo ? convo.messageCount : 1;
-  const firstMessageAt = convo && convo.messages.length > 0
-    ? new Date(convo.messages[0].timestamp).toISOString()
-    : new Date().toISOString();
-
-  return [
-    '[WHATSAPP_STRANGER_CONTEXT]',
-    `Incoming WhatsApp message from: ${pushName} (${phone})`,
-    `This person is NOT the owner. They are an external contact.`,
-    `Active conversation: ${messageCount} messages, started ${firstMessageAt}`,
-    '',
-    'Available routing tags:',
-    '- [NOTIFY_OWNER]{"reason": "...", "summary": "..."}[/NOTIFY_OWNER] — sends a notification to the owner',
-    '[/WHATSAPP_STRANGER_CONTEXT]',
-    '',
-  ].join('\n');
-}
 
 // ---------------------------------------------------------------------------
 // Step C: Parse NOTIFY_OWNER tags from agent response
@@ -1719,10 +1602,6 @@ async function startConnection() {
 
       // Forward to LibreFang agent
       try {
-        // Track stranger messages
-        if (isStranger) {
-          trackMessage(sender, pushName, phone, messageText, 'inbound');
-        }
 
         // Build the message to send to the agent
         let messageToSend;
@@ -1732,8 +1611,10 @@ async function startConnection() {
           // Include sender identity so the LLM knows who is talking in the group
           messageToSend = `[Group message from ${pushName || phone}]\n${messageText}`;
         } else if (isStranger) {
-          const strangerContext = buildStrangerContext(pushName, phone, sender);
-          messageToSend = strangerContext + messageText;
+          // PLAN-03 §C will replace this passthrough with an inline
+          // <stranger_inbound> XML wrap. For now the stranger's raw text
+          // is forwarded as-is — no [WHATSAPP_STRANGER_CONTEXT] prefix.
+          messageToSend = messageText;
         } else if (isOwner && activeConversations.size > 0 && ownerIntentsRelay(messageText)) {
           // Only inject the relay system instruction when the owner's text
           // expresses an explicit delegated-speech intent. A neutral greeting
@@ -1871,23 +1752,17 @@ async function startConnection() {
               const sentKey = await sendOrEdit(sender, formattedText);
               console.log(`[gateway] Replied to stranger ${pushName} (${phone})${streamMsgKey ? ' (streamed)' : ''}`);
 
-              // Track outbound message
-              trackMessage(sender, pushName, phone, cleanedText, 'outbound');
               // Save outbound to DB
               dbSaveMessage({ id: sentKey?.id || randomUUID(), jid: sender, senderJid: ownJid, pushName: null, phone, text: cleanedText, direction: 'outbound', timestamp: Date.now(), processed: 1, rawType: 'text' });
             }
 
             // Step C + F: If NOTIFY_OWNER tags found, send notification to owner
             for (const notif of notifications) {
-              const convo = activeConversations.get(sender);
               // F: Escalation deduplication
               if (shouldDebounceEscalation(sender)) {
                 console.log(`[gateway] Debounced escalation for ${pushName} — skipping duplicate notification`);
                 continue;
               }
-
-              // Mark conversation as escalated
-              if (convo) convo.escalated = true;
 
               const ownerNotif = notif.summary || `[${pushName}] ${notif.reason}`;
 
@@ -2039,10 +1914,10 @@ async function startConnection() {
       if (now - row.last_timestamp > 2 * 60 * 60 * 1000) continue;
       const gap = now - row.last_timestamp;
       if (gap > GAP_THRESHOLD_MS) {
-        // Check if there's an active conversation for this JID (only warn for active ones)
-        if (activeConversations.has(row.jid)) {
-          console.warn(`[gateway][gap-detect] No messages from ${row.jid} for ${Math.round(gap / 60000)}min — possible message loss`);
-        }
+        // The "recent activity" window above (2h since last_timestamp) is
+        // now the only liveness proxy — Phase 07 removed the in-memory
+        // activeConversations Map.
+        console.warn(`[gateway][gap-detect] No messages from ${row.jid} for ${Math.round(gap / 60000)}min — possible message loss`);
       }
     }
   }, GAP_DETECTION_INTERVAL_MS);
@@ -3245,7 +3120,6 @@ module.exports = {
   extractNotifyOwner,
   extractRelayCommands,
   ownerIntentsRelay,
-  buildConversationsContext,
   isRateLimited,
   buildCorsHeaders,
   isAllowedOrigin,
