@@ -575,3 +575,78 @@ fn no_whatsapp_send_tool_registered() {
         "phase 07 PLAN-02 must NOT register a parallel whatsapp_send tool"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Acceptance replay — 2026-04-18 19:48 incident.
+//
+// Owner verbatim:
+//   "Bene dille che mangi leggera che c'è da vorticare dopo 🤣"
+//
+// In the original incident the model paraphrased to
+//   "le suggeriamo un pasto leggero..."
+// dropping the joke + the laughing emoji. Phase 07 fixes this via:
+//   - PLAN-01 §F: removal of the relay reformulation pipeline
+//   - PLAN-04 §E: removal of the regex intent classifier
+//   - PLAN-02 §B: tool `channel_send (channel="whatsapp", ...)` taking the
+//     `message` string verbatim, no rewriting layer in between.
+//
+// This test does NOT exercise the LLM (would be flaky). It tests the
+// kernel-side fidelity surface: given a `channel_send` invocation with the
+// exact owner message, the recorded adapter call MUST preserve all three
+// markers byte-for-byte:
+//   1. word "leggera"
+//   2. word "vorticare"
+//   3. emoji 🤣 (U+1F923)
+//
+// If any of these regress, the relay-reformulation regression has slipped
+// back in.
+// ---------------------------------------------------------------------------
+#[tokio::test]
+async fn channel_send_whatsapp_preserves_owner_words_and_emoji() {
+    let (capturing, log) = CapturingKernel::new();
+    let kernel: Arc<dyn KernelHandle> = capturing.clone();
+    let ctx = make_ctx(&kernel, None);
+
+    let owner_message = "Bene dille che mangi leggera che c'è da vorticare dopo 🤣";
+
+    let input = json!({
+        "channel": "whatsapp",
+        "recipient": "393480000000@s.whatsapp.net",
+        "message": owner_message,
+    });
+    let result = execute_tool_raw("acceptance-replay", "channel_send", &input, &ctx).await;
+    assert!(
+        !result.is_error,
+        "tool call should succeed; got: {}",
+        result.content
+    );
+
+    let calls = log.text.lock().unwrap();
+    assert_eq!(
+        calls.len(),
+        1,
+        "exactly one channel_send adapter call expected, got {}",
+        calls.len()
+    );
+    let captured_msg = &calls[0].message;
+
+    // The 3 fidelity markers from the incident.
+    assert!(
+        captured_msg.contains("leggera"),
+        "must preserve word 'leggera' (Phase 07 fidelity rule); got: {captured_msg:?}"
+    );
+    assert!(
+        captured_msg.contains("vorticare"),
+        "must preserve word 'vorticare' (Phase 07 fidelity rule); got: {captured_msg:?}"
+    );
+    assert!(
+        captured_msg.contains('\u{1F923}'),
+        "must preserve emoji 🤣 (U+1F923) (Phase 07 fidelity rule); got: {captured_msg:?}"
+    );
+    // Stronger guarantee: byte-for-byte match. The incident was a
+    // paraphrase, not a stripped emoji.
+    assert_eq!(
+        captured_msg, owner_message,
+        "owner message must reach the adapter byte-for-byte; got: {captured_msg:?}"
+    );
+}
