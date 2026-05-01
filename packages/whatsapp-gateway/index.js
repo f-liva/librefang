@@ -245,25 +245,16 @@ function readWhatsAppConfig(configPath) {
   const defaults = {
     default_agent: 'assistant',
     owner_numbers: [],
-    // English-only by default keeps upstream deployments locale-neutral;
-    // set `[relay_intent].languages = ["en", "it", …]` in config.toml
-    // to enable extra language packs.
-    relay_intent_languages: ['en'],
   };
   try {
     const content = fs.readFileSync(configPath, 'utf8');
     const parsed = toml.parse(content);
     const wa = parsed?.channels?.whatsapp || {};
-    const relay = parsed?.relay_intent || {};
     const cfg = {
       default_agent: wa.default_agent || defaults.default_agent,
       owner_numbers: Array.isArray(wa.owner_numbers) ? wa.owner_numbers : defaults.owner_numbers,
-      relay_intent_languages:
-        Array.isArray(relay.languages) && relay.languages.length > 0
-          ? relay.languages
-          : defaults.relay_intent_languages,
     };
-    console.log(`[gateway] Read config from ${configPath}: default_agent="${cfg.default_agent}", owner_numbers=${JSON.stringify(cfg.owner_numbers)}, relay_intent_languages=${JSON.stringify(cfg.relay_intent_languages)}`);
+    console.log(`[gateway] Read config from ${configPath}: default_agent="${cfg.default_agent}", owner_numbers=${JSON.stringify(cfg.owner_numbers)}`);
     return cfg;
   } catch (err) {
     console.warn(`[gateway] Could not read ${configPath}: ${err.message} — using defaults/env vars`);
