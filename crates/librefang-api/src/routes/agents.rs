@@ -5767,7 +5767,14 @@ pub async fn push_message(
             // No bridge manager — fall back to kernel's channel adapter registry
             state
                 .kernel
-                .send_channel_message(&req.channel, &req.recipient, &req.message, thread_id, None)
+                .send_channel_message(
+                    &req.channel,
+                    &req.recipient,
+                    &req.message,
+                    thread_id,
+                    None,
+                    None,
+                )
                 .await
         }
     };

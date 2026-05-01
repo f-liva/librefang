@@ -2109,7 +2109,7 @@ impl ChannelBridgeHandle for KernelBridgeAdapter {
     ) -> Result<String, String> {
         use librefang_runtime::kernel_handle::KernelHandle;
         self.kernel
-            .send_channel_message(channel_type, recipient, message, thread_id, None)
+            .send_channel_message(channel_type, recipient, message, thread_id, None, None)
             .await
     }
 

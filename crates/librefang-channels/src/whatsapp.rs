@@ -262,80 +262,12 @@ impl WhatsAppAdapter {
         Ok(())
     }
 
-    /// Send a voice message via the WhatsApp Web gateway (Web/QR mode).
-    ///
-    /// The gateway is expected to accept `POST /message/send-voice` with a JSON body
-    /// containing `{ "to": "...", "audio": "<base64>", "mime_type": "..." }`.
-    #[allow(dead_code)]
-    async fn gateway_send_voice(
-        &self,
-        gateway_url: &str,
-        to: &str,
-        audio: &[u8],
-        mime_type: &str,
-    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        let url = format!("{}/message/send-voice", gateway_url.trim_end_matches('/'));
-
-        // base64-encode without pulling in a new crate — use standard library approach
-        let mut encoded = String::new();
-        {
-            use std::fmt::Write as FmtWrite;
-            const TABLE: &[u8] =
-                b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-            let mut buf = [0u8; 3];
-            let mut i = 0;
-            while i < audio.len() {
-                let remaining = audio.len() - i;
-                let chunk_len = remaining.min(3);
-                buf[..chunk_len].copy_from_slice(&audio[i..i + chunk_len]);
-                if chunk_len < 3 {
-                    buf[chunk_len..].fill(0);
-                }
-                let b0 = (buf[0] >> 2) as usize;
-                let b1 = (((buf[0] & 0x03) << 4) | (buf[1] >> 4)) as usize;
-                let b2 = (((buf[1] & 0x0f) << 2) | (buf[2] >> 6)) as usize;
-                let b3 = (buf[2] & 0x3f) as usize;
-                let _ = write!(encoded, "{}", TABLE[b0] as char);
-                let _ = write!(encoded, "{}", TABLE[b1] as char);
-                let _ = write!(
-                    encoded,
-                    "{}",
-                    if chunk_len >= 2 {
-                        TABLE[b2] as char
-                    } else {
-                        '='
-                    }
-                );
-                let _ = write!(
-                    encoded,
-                    "{}",
-                    if chunk_len >= 3 {
-                        TABLE[b3] as char
-                    } else {
-                        '='
-                    }
-                );
-                i += chunk_len;
-            }
-        }
-
-        let body = serde_json::json!({
-            "to": to,
-            "audio": encoded,
-            "mime_type": mime_type,
-        });
-
-        let resp = self.client.post(&url).json(&body).send().await?;
-
-        if !resp.status().is_success() {
-            let status = resp.status();
-            let body = resp.text().await.unwrap_or_default();
-            error!("WhatsApp gateway send-voice error {status}: {body}");
-            return Err(format!("WhatsApp gateway send-voice error {status}: {body}").into());
-        }
-
-        Ok(())
-    }
+    // NOTE: a previous `gateway_send_voice` helper (POST /message/send-voice
+    // with base64-encoded raw bytes) was removed in Phase 07 PLAN-02. The
+    // gateway has never exposed `/message/send-voice` — the canonical voice-
+    // note endpoint is `/message/send-audio` with `ptt=true`, which is now
+    // wired up via `gateway_send_audio`. Raw byte uploads remain available
+    // through the Cloud API path (`send_voice`) when configured.
 
     /// Send a text message via the WhatsApp Cloud API.
     async fn api_send_message(
@@ -406,24 +338,106 @@ impl WhatsAppAdapter {
     }
 
     /// Send a text message via the WhatsApp Web gateway.
+    ///
+    /// When `reply_to_msg_id` is `Some`, the JSON body carries an extra
+    /// `reply_to` field. The current Baileys gateway does NOT yet honour the
+    /// field — it ignores it silently. This is forward-compatible: a follow-up
+    /// gateway change will pick up the field and emit a `quoted` reply
+    /// without needing further Rust changes.
     async fn gateway_send_message(
         &self,
         gateway_url: &str,
         to: &str,
         text: &str,
+        reply_to_msg_id: Option<&str>,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let url = format!("{}/message/send", gateway_url.trim_end_matches('/'));
-        let body = serde_json::json!({ "to": to, "text": text });
+        let mut body = serde_json::json!({ "to": to, "text": text });
+        if let Some(rid) = reply_to_msg_id.filter(|s| !s.is_empty()) {
+            body["reply_to"] = serde_json::Value::String(rid.to_string());
+        }
 
         let resp = self.client.post(&url).json(&body).send().await?;
 
         if !resp.status().is_success() {
+            // Status codes and raw bodies are NOT propagated upstream — they
+            // leak into LLM prompt context as opaque tokens. Extract the
+            // structured `error` field from the gateway's JSON body and
+            // surface only the reason phrase.
             let status = resp.status();
-            let body = resp.text().await.unwrap_or_default();
-            error!("WhatsApp gateway error {status}: {body}");
-            return Err(format!("WhatsApp gateway error {status}: {body}").into());
+            let body_text = resp.text().await.unwrap_or_default();
+            let reason = extract_gateway_error_reason(&body_text)
+                .unwrap_or_else(|| "gateway request failed".to_string());
+            error!("WhatsApp gateway error {status}: {body_text}");
+            return Err(format!("WhatsApp send failed: {reason}").into());
         }
 
+        Ok(())
+    }
+
+    /// Send an image via the WhatsApp Web gateway (`POST /message/send-image`).
+    async fn gateway_send_image(
+        &self,
+        gateway_url: &str,
+        to: &str,
+        image_url: &str,
+        caption: Option<&str>,
+        reply_to_msg_id: Option<&str>,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let url = format!("{}/message/send-image", gateway_url.trim_end_matches('/'));
+        let mut body = serde_json::json!({
+            "to": to,
+            "image_url": image_url,
+            "caption": caption.unwrap_or(""),
+        });
+        if let Some(rid) = reply_to_msg_id.filter(|s| !s.is_empty()) {
+            body["reply_to"] = serde_json::Value::String(rid.to_string());
+        }
+
+        let resp = self.client.post(&url).json(&body).send().await?;
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let body_text = resp.text().await.unwrap_or_default();
+            let reason = extract_gateway_error_reason(&body_text)
+                .unwrap_or_else(|| "gateway image send failed".to_string());
+            error!("WhatsApp gateway image error {status}: {body_text}");
+            return Err(format!("WhatsApp send failed: {reason}").into());
+        }
+        Ok(())
+    }
+
+    /// Send an audio file (or PTT voice-note when `ptt=true`) via the WhatsApp
+    /// Web gateway (`POST /message/send-audio`).
+    ///
+    /// The gateway defaults `ptt` to `true` when the field is absent, so we
+    /// always send it explicitly to make the intent unambiguous.
+    async fn gateway_send_audio(
+        &self,
+        gateway_url: &str,
+        to: &str,
+        audio_url: &str,
+        ptt: bool,
+        reply_to_msg_id: Option<&str>,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let url = format!("{}/message/send-audio", gateway_url.trim_end_matches('/'));
+        let mut body = serde_json::json!({
+            "to": to,
+            "audio_url": audio_url,
+            "ptt": ptt,
+        });
+        if let Some(rid) = reply_to_msg_id.filter(|s| !s.is_empty()) {
+            body["reply_to"] = serde_json::Value::String(rid.to_string());
+        }
+
+        let resp = self.client.post(&url).json(&body).send().await?;
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let body_text = resp.text().await.unwrap_or_default();
+            let reason = extract_gateway_error_reason(&body_text)
+                .unwrap_or_else(|| "gateway audio send failed".to_string());
+            error!("WhatsApp gateway audio error {status}: {body_text}");
+            return Err(format!("WhatsApp send failed: {reason}").into());
+        }
         Ok(())
     }
 
@@ -486,31 +500,103 @@ impl ChannelAdapter for WhatsAppAdapter {
         user: &ChannelUser,
         content: ChannelContent,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        // Web/QR gateway mode: route all messages through the gateway
+        self.gateway_or_cloud_send(user, content, None).await
+    }
+
+    async fn send_with_reply(
+        &self,
+        user: &ChannelUser,
+        content: ChannelContent,
+        reply_to_msg_id: Option<&str>,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        self.gateway_or_cloud_send(user, content, reply_to_msg_id)
+            .await
+    }
+
+    async fn stop(&self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let _ = self.shutdown_tx.send(true);
+        Ok(())
+    }
+}
+
+impl WhatsAppAdapter {
+    /// Unified send entry point that branches between gateway and Cloud API
+    /// modes. Used by both `send` (no reply quoting) and `send_with_reply`.
+    ///
+    /// In gateway mode:
+    /// - `Voice { url }` is delivered via `POST /message/send-audio` with
+    ///   `ptt=true`. (The previous "(Voice message: <url>)" text-fallback
+    ///   was a bug — the gateway has supported `/message/send-audio` since
+    ///   the gateway hardening landed; the Rust adapter just never wired
+    ///   it up.)
+    /// - `Image { url, caption }` is delivered via
+    ///   `POST /message/send-image`.
+    /// - `Text` and other variants degrade to `POST /message/send` with the
+    ///   text body (existing behaviour).
+    /// - `reply_to_msg_id`, when present, is added as a `reply_to` field in
+    ///   the JSON body of every gateway endpoint. The gateway currently
+    ///   ignores it; a follow-up gateway change will pick it up without
+    ///   requiring further Rust changes.
+    ///
+    /// In Cloud API mode:
+    /// - `Voice { url }` is delivered as a Cloud API `audio` message with
+    ///   the URL link.
+    /// - `Image { url, caption }`, `File { url, filename }`, and
+    ///   `Location { lat, lon }` are delivered via the Cloud API
+    ///   `messages` endpoint with their native types.
+    /// - `reply_to_msg_id`, when present, is attached as a `context.message_id`
+    ///   field per the Cloud API reply-context spec.
+    async fn gateway_or_cloud_send(
+        &self,
+        user: &ChannelUser,
+        content: ChannelContent,
+        reply_to_msg_id: Option<&str>,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        // Web/QR gateway mode: route through gateway HTTP endpoints.
         if let Some(ref gw) = self.gateway_url {
             match &content {
                 ChannelContent::Voice { url, .. } => {
-                    // For voice messages in gateway mode, send as a text link fallback
-                    // unless the gateway supports send-voice (handled separately via send_voice()).
-                    let text = format!("(Voice message: {url})");
-                    self.gateway_send_message(gw, &user.platform_id, &text)
+                    self.gateway_send_audio(
+                        gw,
+                        &user.platform_id,
+                        url,
+                        true, // ptt = true for voice notes
+                        reply_to_msg_id,
+                    )
+                    .await?;
+                }
+                ChannelContent::Audio { url, .. } => {
+                    // Music/podcast — send as audio file (ptt = false).
+                    self.gateway_send_audio(gw, &user.platform_id, url, false, reply_to_msg_id)
                         .await?;
+                }
+                ChannelContent::Image { url, caption, .. } => {
+                    self.gateway_send_image(
+                        gw,
+                        &user.platform_id,
+                        url,
+                        caption.as_deref(),
+                        reply_to_msg_id,
+                    )
+                    .await?;
                 }
                 other => {
                     let text = match other {
                         ChannelContent::Text(t) => t.clone(),
-                        ChannelContent::Image { caption, .. } => caption
-                            .clone()
-                            .unwrap_or_else(|| "(Image — not supported in Web mode)".to_string()),
                         ChannelContent::File { filename, .. } => {
                             format!("(File: {filename} — not supported in Web mode)")
                         }
                         _ => "(Unsupported content type in Web mode)".to_string(),
                     };
-                    // Split long messages the same way as Cloud API mode
+                    // Split long messages the same way as Cloud API mode.
+                    // reply_to_msg_id only attaches to the first chunk (a
+                    // message can only quote-reply once).
                     let chunks = crate::types::split_message(&text, MAX_MESSAGE_LEN);
+                    let mut first = true;
                     for chunk in chunks {
-                        self.gateway_send_message(gw, &user.platform_id, chunk)
+                        let rid = if first { reply_to_msg_id } else { None };
+                        first = false;
+                        self.gateway_send_message(gw, &user.platform_id, chunk, rid)
                             .await?;
                     }
                 }
@@ -518,20 +604,30 @@ impl ChannelAdapter for WhatsAppAdapter {
             return Ok(());
         }
 
-        // Cloud API mode (default)
+        // Cloud API mode (default).
+        let context = reply_to_msg_id
+            .filter(|s| !s.is_empty())
+            .map(|rid| serde_json::json!({ "message_id": rid }));
+
         match content {
             ChannelContent::Text(text) => {
+                // api_send_message handles chunking and reply context is not
+                // currently threaded into Cloud API text sends — keep
+                // behaviour identical when reply_to is None, and degrade
+                // gracefully when set (ignored Cloud-side; the gateway path
+                // is the primary consumer of reply_to_msg_id).
                 self.api_send_message(&user.platform_id, &text).await?;
             }
             ChannelContent::Voice { url, .. } => {
-                // Voice messages with a URL are sent as audio links via the Cloud API.
-                // For raw byte uploads use `send_voice()` directly.
-                let body = serde_json::json!({
+                let mut body = serde_json::json!({
                     "messaging_product": "whatsapp",
                     "to": user.platform_id,
                     "type": "audio",
                     "audio": { "link": url }
                 });
+                if let Some(ctx) = &context {
+                    body["context"] = ctx.clone();
+                }
                 let api_url = format!(
                     "https://graph.facebook.com/v21.0/{}/messages",
                     self.phone_number_id
@@ -547,11 +643,13 @@ impl ChannelAdapter for WhatsAppAdapter {
                     let status = resp.status();
                     let err = resp.text().await.unwrap_or_default();
                     error!("WhatsApp voice send error {status}: {err}");
-                    return Err(format!("WhatsApp voice send error {status}: {err}").into());
+                    let reason = extract_gateway_error_reason(&err)
+                        .unwrap_or_else(|| "voice send failed".to_string());
+                    return Err(format!("WhatsApp send failed: {reason}").into());
                 }
             }
             ChannelContent::Image { url, caption, .. } => {
-                let body = serde_json::json!({
+                let mut body = serde_json::json!({
                     "messaging_product": "whatsapp",
                     "to": user.platform_id,
                     "type": "image",
@@ -560,6 +658,9 @@ impl ChannelAdapter for WhatsAppAdapter {
                         "caption": caption.unwrap_or_default()
                     }
                 });
+                if let Some(ctx) = &context {
+                    body["context"] = ctx.clone();
+                }
                 let api_url = format!(
                     "https://graph.facebook.com/v21.0/{}/messages",
                     self.phone_number_id
@@ -572,7 +673,7 @@ impl ChannelAdapter for WhatsAppAdapter {
                     .await?;
             }
             ChannelContent::File { url, filename } => {
-                let body = serde_json::json!({
+                let mut body = serde_json::json!({
                     "messaging_product": "whatsapp",
                     "to": user.platform_id,
                     "type": "document",
@@ -581,6 +682,9 @@ impl ChannelAdapter for WhatsAppAdapter {
                         "filename": filename
                     }
                 });
+                if let Some(ctx) = &context {
+                    body["context"] = ctx.clone();
+                }
                 let api_url = format!(
                     "https://graph.facebook.com/v21.0/{}/messages",
                     self.phone_number_id
@@ -593,7 +697,7 @@ impl ChannelAdapter for WhatsAppAdapter {
                     .await?;
             }
             ChannelContent::Location { lat, lon } => {
-                let body = serde_json::json!({
+                let mut body = serde_json::json!({
                     "messaging_product": "whatsapp",
                     "to": user.platform_id,
                     "type": "location",
@@ -602,6 +706,9 @@ impl ChannelAdapter for WhatsAppAdapter {
                         "longitude": lon
                     }
                 });
+                if let Some(ctx) = &context {
+                    body["context"] = ctx.clone();
+                }
                 let api_url = format!(
                     "https://graph.facebook.com/v21.0/{}/messages",
                     self.phone_number_id
@@ -620,11 +727,22 @@ impl ChannelAdapter for WhatsAppAdapter {
         }
         Ok(())
     }
+}
 
-    async fn stop(&self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        let _ = self.shutdown_tx.send(true);
-        Ok(())
-    }
+/// Extract a structured error reason from a gateway 4xx/5xx body.
+///
+/// The gateway returns either `{ error: "..." }` (for 400 missing fields)
+/// or `{ success: false, error: "..." }` (for downstream Baileys errors).
+/// Returns the human-readable reason phrase if either shape parses, or
+/// `None` to let the caller emit a generic message — this guarantees the
+/// adapter never leaks raw status codes or JSON-with-braces into the LLM
+/// prompt context.
+fn extract_gateway_error_reason(body: &str) -> Option<String> {
+    let parsed: serde_json::Value = serde_json::from_str(body.trim()).ok()?;
+    parsed
+        .get("error")
+        .and_then(|e| e.as_str())
+        .map(|s| s.to_string())
 }
 
 #[cfg(test)]

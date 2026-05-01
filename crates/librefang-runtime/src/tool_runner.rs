@@ -2026,20 +2026,22 @@ pub fn builtin_tool_definitions() -> Vec<ToolDefinition> {
         // --- Channel send tool (proactive outbound messaging) ---
         ToolDefinition {
             name: "channel_send".to_string(),
-            description: "Send a message or media to a user on a configured channel (email, telegram, slack, etc). For email: recipient is the email address; optionally set subject. For media: set image_url, file_url, or file_path to send an image or file instead of (or alongside) text. Use thread_id to reply in a specific thread/topic. When recipient is omitted during message handling, the tool automatically replies to the original sender.".to_string(),
+            description: "Send a message or media to a user on a configured channel (email, telegram, slack, whatsapp, etc). For email: recipient is the email address; optionally set subject. For media: set image_url, file_url, or file_path to send an image or file instead of (or alongside) text. Use thread_id to reply in a specific thread/topic. When recipient is omitted during message handling, the tool automatically replies to the original sender. WhatsApp-specific: recipient must be a WhatsApp JID (e.g., '393401234567@s.whatsapp.net' for a DM or '120363xxxx@g.us' for a group). Optional 'reply_to_msg_id' threads the response as a quote-reply to a specific inbound message ID. Optional 'as_voice_note=true' (requires file_url with audio/* content) sends the audio as a PTT voice-note bubble instead of a regular audio file. Both 'reply_to_msg_id' and 'as_voice_note' are silently ignored on non-WhatsApp channels.".to_string(),
             input_schema: serde_json::json!({
                 "type": "object",
                 "properties": {
-                    "channel": { "type": "string", "description": "Channel adapter name (e.g., 'email', 'telegram', 'slack', 'discord')" },
-                    "recipient": { "type": "string", "description": "Platform-specific recipient identifier (email address, user ID, etc.). Omit only when replying from an inbound message context where the original sender is available." },
+                    "channel": { "type": "string", "description": "Channel adapter name (e.g., 'email', 'telegram', 'slack', 'discord', 'whatsapp')" },
+                    "recipient": { "type": "string", "description": "Platform-specific recipient identifier (email address, user ID, WhatsApp JID, etc.). Omit only when replying from an inbound message context where the original sender is available." },
                     "subject": { "type": "string", "description": "Optional subject line (used for email; ignored for other channels)" },
                     "message": { "type": "string", "description": "The message body to send (required for text, optional caption for media)" },
-                    "image_url": { "type": "string", "description": "URL of an image to send (supported on Telegram, Discord, Slack)" },
+                    "image_url": { "type": "string", "description": "URL of an image to send (supported on Telegram, Discord, Slack, WhatsApp)" },
                     "file_url": { "type": "string", "description": "URL of a file to send as attachment" },
                     "file_path": { "type": "string", "description": "Local file path to send as attachment (reads from disk; use instead of file_url for local files)" },
                     "filename": { "type": "string", "description": "Filename for file attachments (defaults to the basename of file_path, or 'file')" },
                     "thread_id": { "type": "string", "description": "Thread/topic ID to reply in (e.g., Telegram message_thread_id, Slack thread_ts)" },
                     "account_id": { "type": "string", "description": "Optional account_id of the specific configured bot to send through (e.g., 'admin-bot'). When omitted, uses the first configured adapter for this channel." },
+                    "reply_to_msg_id": { "type": "string", "description": "[WhatsApp only] Inbound message ID to quote-reply-thread the outbound response to. Silently ignored on non-WhatsApp channels." },
+                    "as_voice_note": { "type": "boolean", "description": "[WhatsApp only] Send an audio attachment as a PTT voice-note bubble instead of a regular audio file. Requires file_url to point at audio/* content. Silently ignored on non-WhatsApp channels." },
                     "poll_question": { "type": "string", "description": "Question for a poll (starts a poll, mutually exclusive with image_url/file_url/file_path)" },
                     "poll_options": { "type": "array", "items": { "type": "string" }, "description": "Answer options for the poll (2-10 items, required with poll_question)" },
                     "poll_is_quiz": { "type": "boolean", "description": "Set to true for a quiz mode (one correct answer)" },
@@ -4012,6 +4014,14 @@ fn parse_poll_options(raw: Option<&serde_json::Value>) -> Result<Vec<String>, St
     Ok(out)
 }
 
+/// Permissive WhatsApp JID regex: accepts DM (`<digits>@s.whatsapp.net`),
+/// Baileys multi-device suffixes (`<digits>:<dev>@s.whatsapp.net`), groups
+/// (`<digits>@g.us`), and linked-device addresses (`<digits>@lid`).
+/// Built once via `LazyLock` to avoid repeated compile cost on every call.
+static WHATSAPP_JID_RE: std::sync::LazyLock<regex_lite::Regex> = std::sync::LazyLock::new(|| {
+    regex_lite::Regex::new(r"^\d+(?::\d+)?@(s\.whatsapp\.net|g\.us|lid)$").unwrap()
+});
+
 async fn tool_channel_send(
     input: &serde_json::Value,
     kernel: Option<&Arc<dyn KernelHandle>>,
@@ -4044,10 +4054,63 @@ async fn tool_channel_send(
     let thread_id = input["thread_id"].as_str().filter(|s| !s.is_empty());
     let account_id = input["account_id"].as_str().filter(|s| !s.is_empty());
 
+    // WhatsApp-specific extension fields (silently ignored on other channels).
+    let reply_to_msg_id = input["reply_to_msg_id"].as_str().filter(|s| !s.is_empty());
+    let as_voice_note = input["as_voice_note"].as_bool().unwrap_or(false);
+
     // Check for media content (image_url, file_url, or file_path)
     let image_url = input["image_url"].as_str().filter(|s| !s.is_empty());
     let file_url = input["file_url"].as_str().filter(|s| !s.is_empty());
     let file_path = input["file_path"].as_str().filter(|s| !s.is_empty());
+
+    // WhatsApp validation: JID format + as_voice_note prerequisites.
+    if channel == "whatsapp" {
+        if !WHATSAPP_JID_RE.is_match(recipient) {
+            return Err(format!(
+                "Invalid WhatsApp JID format: '{recipient}'. \
+                 Expected '<digits>[:<device>]@s.whatsapp.net', \
+                 '<digits>@g.us', or '<digits>@lid'."
+            ));
+        }
+        if as_voice_note && file_url.is_none() {
+            // file_path -> raw bytes path doesn't carry voice-note semantics
+            // through to the gateway (no upload-bytes endpoint). Restrict to
+            // file_url so the contract is honoured end-to-end.
+            return Err(
+                "as_voice_note=true requires an audio attachment via file_url \
+                 (file_path raw-bytes voice-notes are not supported by the \
+                 gateway; use a publicly reachable audio URL instead)."
+                    .to_string(),
+            );
+        }
+    }
+
+    // Voice-note routing (WhatsApp-only). Takes precedence over image_url /
+    // file_url so a single tool call with `as_voice_note=true` lands as a
+    // PTT bubble even if the agent also set image_url for some reason.
+    if channel == "whatsapp" && as_voice_note {
+        if let Some(url) = file_url {
+            let caption = input["message"].as_str().filter(|s| !s.is_empty());
+            if let Some(c) = caption {
+                if let Some(violation) = check_taint_outbound_text(c, &TaintSink::agent_message()) {
+                    return Err(violation);
+                }
+            }
+            return kh
+                .send_channel_media(
+                    &channel,
+                    recipient,
+                    "voice",
+                    url,
+                    caption,
+                    None,
+                    thread_id,
+                    account_id,
+                    reply_to_msg_id,
+                )
+                .await;
+        }
+    }
 
     if let Some(url) = image_url {
         let caption = input["message"].as_str().filter(|s| !s.is_empty());
@@ -4058,7 +4121,15 @@ async fn tool_channel_send(
         }
         return kh
             .send_channel_media(
-                &channel, recipient, "image", url, caption, None, thread_id, account_id,
+                &channel,
+                recipient,
+                "image",
+                url,
+                caption,
+                None,
+                thread_id,
+                account_id,
+                reply_to_msg_id,
             )
             .await;
     }
@@ -4073,7 +4144,15 @@ async fn tool_channel_send(
         }
         return kh
             .send_channel_media(
-                &channel, recipient, "file", url, caption, filename, thread_id, account_id,
+                &channel,
+                recipient,
+                "file",
+                url,
+                caption,
+                filename,
+                thread_id,
+                account_id,
+                reply_to_msg_id,
             )
             .await;
     }
@@ -4130,7 +4209,14 @@ async fn tool_channel_send(
 
         return kh
             .send_channel_file_data(
-                &channel, recipient, data, &filename, mime_type, thread_id, account_id,
+                &channel,
+                recipient,
+                data,
+                &filename,
+                mime_type,
+                thread_id,
+                account_id,
+                reply_to_msg_id,
             )
             .await;
     }
@@ -4242,8 +4328,15 @@ async fn tool_channel_send(
         return Err(violation);
     }
 
-    kh.send_channel_message(&channel, recipient, &final_message, thread_id, account_id)
-        .await
+    kh.send_channel_message(
+        &channel,
+        recipient,
+        &final_message,
+        thread_id,
+        account_id,
+        reply_to_msg_id,
+    )
+    .await
 }
 
 // ---------------------------------------------------------------------------

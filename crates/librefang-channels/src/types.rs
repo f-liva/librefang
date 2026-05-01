@@ -691,6 +691,21 @@ pub trait ChannelAdapter: Send + Sync {
         self.send(user, content).await
     }
 
+    /// Send a response that quotes/threads a specific inbound message ID
+    /// (optional — default falls back to `send()`).
+    ///
+    /// Used by the WhatsApp adapter to attach a `quoted` field to outgoing
+    /// Baileys messages so they render as a reply bubble. Adapters that
+    /// don't support reply-threading silently ignore `_reply_to_msg_id`.
+    async fn send_with_reply(
+        &self,
+        user: &ChannelUser,
+        content: ChannelContent,
+        _reply_to_msg_id: Option<&str>,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        self.send(user, content).await
+    }
+
     /// Whether this adapter supports streaming output (progressive message updates).
     ///
     /// When true, the bridge will use `send_streaming()` instead of `send()` for

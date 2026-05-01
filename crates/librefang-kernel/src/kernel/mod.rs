@@ -6918,7 +6918,7 @@ system_prompt = "You are a helpful assistant."
             for (channel, platform_id) in &bindings {
                 if kernel.channel_adapters.contains_key(channel.as_str()) {
                     if let Err(e) = kernel
-                        .send_channel_message(channel, platform_id, &message, None, None)
+                        .send_channel_message(channel, platform_id, &message, None, None, None)
                         .await
                     {
                         warn!(channel = %channel, error = %e, "Failed to send owner notification");
@@ -16217,7 +16217,14 @@ impl crate::cron_delivery::CronChannelSender for KernelCronBridge {
         account_id: Option<&str>,
     ) -> Result<(), String> {
         self.kernel
-            .send_channel_message(channel_type, recipient, message, thread_id, account_id)
+            .send_channel_message(
+                channel_type,
+                recipient,
+                message,
+                thread_id,
+                account_id,
+                None,
+            )
             .await
             .map(|_| ())
     }
@@ -16311,7 +16318,7 @@ async fn cron_deliver_response(
                 .memory
                 .structured_set(agent_id, "delivery.last_channel", kv_val);
             if let Err(e) = kernel
-                .send_channel_message(channel, to, response, None, None)
+                .send_channel_message(channel, to, response, None, None, None)
                 .await
             {
                 tracing::warn!(channel = %channel, to = %to, error = %e, "Cron channel delivery failed");
@@ -16332,7 +16339,7 @@ async fn cron_deliver_response(
                             "Cron: delivering to last channel"
                         );
                         if let Err(e) = kernel
-                            .send_channel_message(channel, recipient, response, None, None)
+                            .send_channel_message(channel, recipient, response, None, None, None)
                             .await
                         {
                             tracing::warn!(channel = %channel, recipient = %recipient, error = %e, "Cron last_channel delivery failed");
@@ -16465,6 +16472,7 @@ impl LibreFangKernel {
                 &target.recipient,
                 message,
                 target.thread_id.as_deref(),
+                None,
                 None,
             )
             .await
@@ -17723,6 +17731,7 @@ impl KernelHandle for LibreFangKernel {
             .map(|(key, _)| key.clone())
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn send_channel_message(
         &self,
         channel: &str,
@@ -17730,6 +17739,7 @@ impl KernelHandle for LibreFangKernel {
         message: &str,
         thread_id: Option<&str>,
         account_id: Option<&str>,
+        reply_to_msg_id: Option<&str>,
     ) -> Result<String, String> {
         let cfg = self.config.load_full();
         let lookup_key = account_id
@@ -17785,6 +17795,11 @@ impl KernelHandle for LibreFangKernel {
                 .send_in_thread(&user, content, tid)
                 .await
                 .map_err(|e| format!("Channel send failed: {e}"))?;
+        } else if reply_to_msg_id.is_some() {
+            adapter
+                .send_with_reply(&user, content, reply_to_msg_id)
+                .await
+                .map_err(|e| format!("Channel send failed: {e}"))?;
         } else {
             adapter
                 .send(&user, content)
@@ -17795,6 +17810,7 @@ impl KernelHandle for LibreFangKernel {
         Ok(format!("Message sent to {} via {}", recipient, channel))
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn send_channel_media(
         &self,
         channel: &str,
@@ -17805,6 +17821,7 @@ impl KernelHandle for LibreFangKernel {
         filename: Option<&str>,
         thread_id: Option<&str>,
         account_id: Option<&str>,
+        reply_to_msg_id: Option<&str>,
     ) -> Result<String, String> {
         let lookup_key = account_id
             .filter(|s| !s.is_empty())
@@ -17848,9 +17865,14 @@ impl KernelHandle for LibreFangKernel {
                 url: media_url.to_string(),
                 filename: filename.unwrap_or("file").to_string(),
             },
+            "voice" => librefang_channels::types::ChannelContent::Voice {
+                url: media_url.to_string(),
+                caption: caption.map(|s| s.to_string()),
+                duration_seconds: 0,
+            },
             _ => {
                 return Err(format!(
-                    "Unsupported media type: '{media_type}'. Use 'image' or 'file'."
+                    "Unsupported media type: '{media_type}'. Use 'image', 'file', or 'voice'."
                 ));
             }
         };
@@ -17858,6 +17880,11 @@ impl KernelHandle for LibreFangKernel {
         if let Some(tid) = thread_id {
             adapter
                 .send_in_thread(&user, content, tid)
+                .await
+                .map_err(|e| format!("Channel media send failed: {e}"))?;
+        } else if reply_to_msg_id.is_some() {
+            adapter
+                .send_with_reply(&user, content, reply_to_msg_id)
                 .await
                 .map_err(|e| format!("Channel media send failed: {e}"))?;
         } else {
@@ -17883,6 +17910,7 @@ impl KernelHandle for LibreFangKernel {
         mime_type: &str,
         thread_id: Option<&str>,
         account_id: Option<&str>,
+        reply_to_msg_id: Option<&str>,
     ) -> Result<String, String> {
         let lookup_key = account_id
             .filter(|s| !s.is_empty())
@@ -17925,6 +17953,11 @@ impl KernelHandle for LibreFangKernel {
         if let Some(tid) = thread_id {
             adapter
                 .send_in_thread(&user, content, tid)
+                .await
+                .map_err(|e| format!("Channel file send failed: {e}"))?;
+        } else if reply_to_msg_id.is_some() {
+            adapter
+                .send_with_reply(&user, content, reply_to_msg_id)
                 .await
                 .map_err(|e| format!("Channel file send failed: {e}"))?;
         } else {

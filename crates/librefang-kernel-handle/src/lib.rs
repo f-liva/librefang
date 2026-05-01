@@ -354,7 +354,12 @@ pub trait KernelHandle: Send + Sync {
     /// Send a message to a user on a named channel adapter (e.g., "email", "telegram").
     /// When `thread_id` is provided, the message is sent as a thread reply.
     /// When `account_id` is provided, routes through the specific configured bot with that ID.
+    /// When `reply_to_msg_id` is provided and the channel supports it (currently
+    /// WhatsApp gateway mode), the outbound message threads as a reply to that
+    /// inbound message ID. Adapters that don't support reply-threading silently
+    /// ignore the value.
     /// Returns a confirmation string on success.
+    #[allow(clippy::too_many_arguments)]
     async fn send_channel_message(
         &self,
         channel: &str,
@@ -362,15 +367,26 @@ pub trait KernelHandle: Send + Sync {
         message: &str,
         thread_id: Option<&str>,
         account_id: Option<&str>,
+        reply_to_msg_id: Option<&str>,
     ) -> Result<String, String> {
-        let _ = (channel, recipient, message, thread_id, account_id);
+        let _ = (
+            channel,
+            recipient,
+            message,
+            thread_id,
+            account_id,
+            reply_to_msg_id,
+        );
         Err("Channel send not available".to_string())
     }
 
-    /// Send media content (image/file) to a user on a named channel adapter.
-    /// `media_type` is "image" or "file", `media_url` is the URL, `caption` is optional text.
-    /// When `thread_id` is provided, the media is sent as a thread reply.
-    /// When `account_id` is provided, routes through the specific configured bot with that ID.
+    /// Send media content (image/file/voice) to a user on a named channel adapter.
+    /// `media_type` is "image", "file", or "voice"; `media_url` is the URL,
+    /// `caption` is optional text. When `thread_id` is provided, the media is
+    /// sent as a thread reply. When `account_id` is provided, routes through
+    /// the specific configured bot with that ID. When `reply_to_msg_id` is
+    /// provided and the channel supports it (WhatsApp gateway mode), the media
+    /// threads as a reply to that inbound message ID.
     #[allow(clippy::too_many_arguments)]
     async fn send_channel_media(
         &self,
@@ -382,9 +398,18 @@ pub trait KernelHandle: Send + Sync {
         filename: Option<&str>,
         thread_id: Option<&str>,
         account_id: Option<&str>,
+        reply_to_msg_id: Option<&str>,
     ) -> Result<String, String> {
         let _ = (
-            channel, recipient, media_type, media_url, caption, filename, thread_id, account_id,
+            channel,
+            recipient,
+            media_type,
+            media_url,
+            caption,
+            filename,
+            thread_id,
+            account_id,
+            reply_to_msg_id,
         );
         Err("Channel media send not available".to_string())
     }
@@ -393,6 +418,14 @@ pub trait KernelHandle: Send + Sync {
     /// Used by the `channel_send` tool when `file_path` is provided.
     /// When `thread_id` is provided, the file is sent as a thread reply.
     /// When `account_id` is provided, routes through the specific configured bot with that ID.
+    /// When `reply_to_msg_id` is provided and the channel supports it
+    /// (WhatsApp gateway mode), the file threads as a reply to that inbound
+    /// message ID.
+    ///
+    /// Note: voice-note (PTT) rendering is only supported via `file_url`
+    /// through `send_channel_media` with `media_type = "voice"`. Sending
+    /// raw audio bytes through this method delivers the file as a generic
+    /// document/file attachment.
     #[allow(clippy::too_many_arguments)]
     async fn send_channel_file_data(
         &self,
@@ -403,9 +436,17 @@ pub trait KernelHandle: Send + Sync {
         mime_type: &str,
         thread_id: Option<&str>,
         account_id: Option<&str>,
+        reply_to_msg_id: Option<&str>,
     ) -> Result<String, String> {
         let _ = (
-            channel, recipient, data, filename, mime_type, thread_id, account_id,
+            channel,
+            recipient,
+            data,
+            filename,
+            mime_type,
+            thread_id,
+            account_id,
+            reply_to_msg_id,
         );
         Err("Channel file data send not available".to_string())
     }
