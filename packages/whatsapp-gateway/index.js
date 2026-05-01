@@ -2058,27 +2058,6 @@ async function processMediaMessage(fullMsg, innerMsg, agentId) {
 }
 
 // ---------------------------------------------------------------------------
-// Detect whether an owner message expresses relay intent.
-//
-// Phase 07 §F retired the relay-tag parser and the inline
-// system-instruction injection that this predicate used to gate. The
-// predicate itself is preserved for PLAN-04 §E, where it will be removed
-// together with the [relay_intent] config field. Until then it remains
-// dead code reachable only from the (also dead) owner-intent branch in
-// the inbound dispatcher; both go away in PLAN-04.
-const RELAY_INTENT_RE = require('./lib/intent_patterns').compileIntentRegex(
-  tomlConfig.relay_intent_languages,
-);
-
-function ownerIntentsRelay(text) {
-  const t = (text || '').trim().toLowerCase();
-  if (!t) return false;
-  if (t.startsWith('/relay') || t.startsWith('/reply')) return true;
-  if (/(^|\s)@[\w.+-]+/.test(t)) return true;
-  return RELAY_INTENT_RE.test(t);
-}
-
-// ---------------------------------------------------------------------------
 // Forward incoming message to LibreFang API, return agent response
 // ---------------------------------------------------------------------------
 const MAX_FORWARD_RETRIES = 1;
@@ -2970,7 +2949,6 @@ process.on('SIGTERM', () => gracefulShutdown('SIGTERM'));
 module.exports = {
   markdownToWhatsApp,
   extractNotifyOwner,
-  ownerIntentsRelay,
   isRateLimited,
   buildCorsHeaders,
   isAllowedOrigin,
