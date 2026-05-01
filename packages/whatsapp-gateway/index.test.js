@@ -1497,3 +1497,98 @@ describe('createHoldbackAccumulator (OB-07 streaming hold-back)', () => {
   });
 });
 
+// ---------------------------------------------------------------------------
+// Phase 07 — Regression guards
+//
+// Each of these strings is a fence: if it ever reappears in the gateway
+// bundle, the corresponding refactor was undone. Fail fast.
+//
+// The guards read `index.js` from disk (NOT this test file) so historical
+// references in test comments do not poison the assertion.
+// ---------------------------------------------------------------------------
+describe('Phase 07 regression guards', () => {
+  const fs = require('node:fs');
+  const path = require('node:path');
+  const indexSrc = fs.readFileSync(path.join(__dirname, 'index.js'), 'utf8');
+
+  it('does not reintroduce activeConversations Map', () => {
+    assert.equal(
+      indexSrc.includes('activeConversations'),
+      false,
+      'activeConversations was eradicated by Phase 07 §A — reintroducing it brings back stranger session state'
+    );
+  });
+
+  it('does not reintroduce [RELAY_TO_STRANGER] tag', () => {
+    assert.equal(
+      indexSrc.includes('[RELAY_TO_STRANGER]'),
+      false,
+      'Phase 07 §F removed the relay tag entirely — use channel_send(channel="whatsapp", ...) instead'
+    );
+  });
+
+  it('does not reintroduce [ACTIVE_STRANGER_CONVERSATIONS] injection', () => {
+    assert.equal(indexSrc.includes('[ACTIVE_STRANGER_CONVERSATIONS]'), false);
+  });
+
+  it('does not reintroduce [SYSTEM_INSTRUCTION_WHATSAPP_RELAY]', () => {
+    assert.equal(indexSrc.includes('[SYSTEM_INSTRUCTION_WHATSAPP_RELAY]'), false);
+  });
+
+  it('does not reintroduce [WHATSAPP_STRANGER_CONTEXT] marker', () => {
+    assert.equal(indexSrc.includes('[WHATSAPP_STRANGER_CONTEXT]'), false);
+  });
+
+  it('does not reintroduce ownerIntentsRelay function', () => {
+    assert.equal(
+      /function\s+ownerIntentsRelay/.test(indexSrc),
+      false,
+      'Phase 07 §E removed regex-based intent detection'
+    );
+    assert.equal(indexSrc.includes('ownerIntentsRelay'), false);
+  });
+
+  it('does not reintroduce intent_patterns require / config', () => {
+    assert.equal(indexSrc.includes('intent_patterns'), false);
+    assert.equal(indexSrc.includes('relay_intent'), false);
+    assert.equal(indexSrc.includes('RELAY_INTENT_RE'), false);
+  });
+
+  it('does not reintroduce buildConversationsContext / buildStrangerContext / trackMessage', () => {
+    assert.equal(indexSrc.includes('buildConversationsContext'), false);
+    assert.equal(indexSrc.includes('buildStrangerContext'), false);
+    assert.equal(/function\s+trackMessage/.test(indexSrc), false);
+    assert.equal(indexSrc.includes('evictExpiredConversations'), false);
+  });
+
+  it('does not reintroduce executeRelay / extractRelayCommands / buildRelaySystemInstruction', () => {
+    assert.equal(indexSrc.includes('executeRelay'), false);
+    assert.equal(indexSrc.includes('extractRelayCommands'), false);
+    assert.equal(indexSrc.includes('buildRelaySystemInstruction'), false);
+  });
+
+  it('does not reintroduce conversation TTL constants', () => {
+    assert.equal(indexSrc.includes('MAX_CONVERSATION_MESSAGES'), false);
+    assert.equal(indexSrc.includes('CONVERSATION_TTL_HOURS'), false);
+    assert.equal(indexSrc.includes('CONVERSATION_TTL_MS'), false);
+  });
+
+  it('does retain wrapStrangerInbound (Phase 07 §C replacement)', () => {
+    assert.ok(
+      indexSrc.includes('wrapStrangerInbound'),
+      'wrapStrangerInbound is the new XML wrap — must be present'
+    );
+    assert.ok(
+      indexSrc.includes('<stranger_inbound'),
+      '<stranger_inbound XML opening tag must be emitted somewhere in the gateway'
+    );
+  });
+
+  it('does retain shouldDebounceEscalation (preserved per Phase 07 §A decision)', () => {
+    assert.ok(
+      indexSrc.includes('shouldDebounceEscalation'),
+      'shouldDebounceEscalation is anti-spam for NOTIFY_OWNER, NOT stranger session state — must be preserved'
+    );
+  });
+});
+

@@ -734,7 +734,7 @@ setInterval(() => {
 // Anticipates Phase 06 XML migration. The model receives structured context
 // (jid, sender name, timestamp) without any persistent state being held by
 // the gateway. This is the canonical replacement for the legacy
-// [WHATSAPP_STRANGER_CONTEXT] flat-text block removed in PLAN-01.
+// flat-text stranger-context block removed in PLAN-01.
 //
 // Defense-in-depth: Phase 05 §A first-char '<' detection on OUTPUT path
 // catches model echo-leak of this tag. The per-agent persona deployment
@@ -1617,7 +1617,7 @@ async function startConnection() {
           messageToSend = `[Group message from ${pushName || phone}]\n${messageText}`;
         } else if (isStranger) {
           // Phase 07 §C — inline XML wrap. Replaces the legacy
-          // [WHATSAPP_STRANGER_CONTEXT] flat-text block (removed PLAN-01).
+          // flat-text stranger-context block (removed PLAN-01).
           // Owner DM and group branches stay UN-wrapped on purpose.
           //
           // Timestamp source: prefer Baileys `msgTimestamp` (already
