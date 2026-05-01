@@ -729,6 +729,87 @@ setInterval(() => {
 }, 10 * 60 * 1000);
 
 // ---------------------------------------------------------------------------
+// Phase 07 §C — Wrap inbound stranger messages in <stranger_inbound> XML
+// ---------------------------------------------------------------------------
+// Anticipates Phase 06 XML migration. The model receives structured context
+// (jid, sender name, timestamp) without any persistent state being held by
+// the gateway. This is the canonical replacement for the legacy
+// [WHATSAPP_STRANGER_CONTEXT] flat-text block removed in PLAN-01.
+//
+// Defense-in-depth: Phase 05 §A first-char '<' detection on OUTPUT path
+// catches model echo-leak of this tag. The per-agent persona deployment
+// (CONTEXT §H) teaches the agent to read this XML format — until that
+// rolls out, an agent that doesn't recognize the tag may copy it back in
+// its reply, which the output guard then strips.
+
+/**
+ * Escape a string for safe insertion as an XML attribute value.
+ * Handles &, <, >, ", '.
+ */
+function xmlAttrEscape(s) {
+  return String(s ?? '')
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&apos;');
+}
+
+/**
+ * Escape body text. We only neutralize the closing fence to prevent a
+ * stranger from injecting `</stranger_inbound>` followed by attacker XML
+ * (parser-confusion / fence-injection vector). Other characters are passed
+ * through — the model handles them naturally and full XML body escaping
+ * would only obscure user content for the LLM.
+ */
+function xmlBodyEscape(s) {
+  return String(s ?? '').replace(/<\/stranger_inbound>/gi, '&lt;/stranger_inbound&gt;');
+}
+
+/**
+ * Wrap an inbound stranger message in <stranger_inbound> XML.
+ *
+ * @param {string} jid           - Stranger WhatsApp JID (e.g., '393480000000@s.whatsapp.net')
+ * @param {string|null} pushName - Sender's WhatsApp display name (may be null)
+ * @param {string} isoTimestamp  - ISO 8601 timestamp of inbound (caller-provided)
+ * @param {string} text          - Message body (may be empty for media-only)
+ * @param {object} [opts]
+ * @param {string} [opts.mediaType]   - 'voice' | 'image' | 'document' (omit for text-only)
+ * @param {string} [opts.mediaUrl]    - URL of media file (when mediaType set; may be undefined)
+ * @param {string} [opts.transcript]  - Pre-computed Whisper transcript for voice
+ * @returns {string} XML-wrapped message ready to forward to kernel
+ */
+function wrapStrangerInbound(jid, pushName, isoTimestamp, text, opts = {}) {
+  const safeJid = xmlAttrEscape(jid);
+  const safeName = xmlAttrEscape(pushName || '(unknown)');
+  const safeTs = xmlAttrEscape(isoTimestamp);
+  const attrs = [`jid="${safeJid}"`, `name="${safeName}"`, `timestamp="${safeTs}"`];
+
+  if (opts.mediaType) {
+    attrs.push(`media_type="${xmlAttrEscape(opts.mediaType)}"`);
+  }
+
+  let body;
+  if (opts.mediaType === 'voice') {
+    const transcript = opts.transcript ? xmlBodyEscape(opts.transcript) : '(no transcript available)';
+    const url = opts.mediaUrl ? `\nurl: ${xmlAttrEscape(opts.mediaUrl)}` : '';
+    body = `voice note from ${safeName}${url}\ntranscript: ${transcript}`;
+  } else if (opts.mediaType === 'image') {
+    const caption = text ? xmlBodyEscape(text) : '(no caption)';
+    const url = opts.mediaUrl ? `\nurl: ${xmlAttrEscape(opts.mediaUrl)}` : '';
+    body = `image from ${safeName}${url}\ncaption: ${caption}`;
+  } else if (opts.mediaType === 'document') {
+    const caption = text ? xmlBodyEscape(text) : '(no caption)';
+    const url = opts.mediaUrl ? `\nurl: ${xmlAttrEscape(opts.mediaUrl)}` : '';
+    body = `document from ${safeName}${url}\ncaption: ${caption}`;
+  } else {
+    body = xmlBodyEscape(text || '');
+  }
+
+  return `<stranger_inbound ${attrs.join(' ')}>\n${body}\n</stranger_inbound>`;
+}
+
+// ---------------------------------------------------------------------------
 // Step C: Parse NOTIFY_OWNER tags from agent response
 // ---------------------------------------------------------------------------
 const NOTIFY_OWNER_RE = /\[NOTIFY_OWNER\]\s*(\{[\s\S]*?\})\s*\[\/NOTIFY_OWNER\]/g;
@@ -1535,10 +1616,48 @@ async function startConnection() {
           // Include sender identity so the LLM knows who is talking in the group
           messageToSend = `[Group message from ${pushName || phone}]\n${messageText}`;
         } else if (isStranger) {
-          // PLAN-03 §C will replace this passthrough with an inline
-          // <stranger_inbound> XML wrap. For now the stranger's raw text
-          // is forwarded as-is — no [WHATSAPP_STRANGER_CONTEXT] prefix.
-          messageToSend = messageText;
+          // Phase 07 §C — inline XML wrap. Replaces the legacy
+          // [WHATSAPP_STRANGER_CONTEXT] flat-text block (removed PLAN-01).
+          // Owner DM and group branches stay UN-wrapped on purpose.
+          //
+          // Timestamp source: prefer Baileys `msgTimestamp` (already
+          // computed at the message-store save site downstream as
+          // ms-since-epoch). Fall back to wall clock if the field is
+          // missing for any reason.
+          const tsMs = msg.messageTimestamp
+            ? (typeof msg.messageTimestamp === 'number'
+                ? msg.messageTimestamp * 1000
+                : Number(msg.messageTimestamp) * 1000)
+            : Date.now();
+          const isoTs = new Date(tsMs).toISOString();
+
+          // Detect media via `innerMsg` (set at line ~1226 as
+          // `msg.message || {}`) — same convention as
+          // `getDownloadableMedia()` and the contextInfo collector
+          // earlier in this handler. NOT `msg.message?.audioMessage`.
+          if (innerMsg.audioMessage) {
+            // For voice: `messageText` already contains the Whisper
+            // transcript when audio_understanding is enabled (see L1430
+            // `[Voice transcription]: ...`). Strip the prefix so the XML
+            // body holds clean transcript text.
+            const transcriptOnly = transcriptionText
+              || messageText.replace(/^\[(Voice|Audio) transcription\]:\s*/, '');
+            messageToSend = wrapStrangerInbound(sender, pushName, isoTs, '', {
+              mediaType: 'voice',
+              transcript: transcriptOnly || undefined,
+            });
+          } else if (innerMsg.imageMessage) {
+            messageToSend = wrapStrangerInbound(sender, pushName, isoTs, messageText, {
+              mediaType: 'image',
+            });
+          } else if (innerMsg.documentMessage
+                  || innerMsg.documentWithCaptionMessage?.message?.documentMessage) {
+            messageToSend = wrapStrangerInbound(sender, pushName, isoTs, messageText, {
+              mediaType: 'document',
+            });
+          } else {
+            messageToSend = wrapStrangerInbound(sender, pushName, isoTs, messageText);
+          }
         } else {
           messageToSend = messageText;
         }
@@ -2940,6 +3059,10 @@ process.on('SIGTERM', () => gracefulShutdown('SIGTERM'));
 module.exports = {
   markdownToWhatsApp,
   extractNotifyOwner,
+  // Phase 07 §C — inbound stranger XML wrap (testing + introspection)
+  wrapStrangerInbound,
+  xmlAttrEscape,
+  xmlBodyEscape,
   isRateLimited,
   buildCorsHeaders,
   isAllowedOrigin,
