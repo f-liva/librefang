@@ -2827,23 +2827,6 @@ const server = http.createServer(async (req, res) => {
       return jsonResponse(req, res, 200, { success: true, message: 'Audio sent' });
     }
 
-    // GET /conversations — list active stranger conversations (Step B)
-    if (req.method === 'GET' && path === '/conversations') {
-      const conversations = [];
-      for (const [jid, convo] of activeConversations) {
-        conversations.push({
-          jid,
-          pushName: convo.pushName,
-          phone: convo.phone,
-          messageCount: convo.messageCount,
-          lastActivity: convo.lastActivity,
-          escalated: convo.escalated,
-          lastMessage: convo.messages[convo.messages.length - 1] || null,
-        });
-      }
-      return jsonResponse(req, res, 200, { conversations });
-    }
-
     // GET /messages/unprocessed — messages that failed to forward (Fase 2.2)
     if (req.method === 'GET' && path === '/messages/unprocessed') {
       const rows = dbGetUnprocessed(Date.now());
@@ -2889,7 +2872,6 @@ const server = http.createServer(async (req, res) => {
         status: 'ok',
         connected: connStatus === 'connected',
         session_id: sessionId || null,
-        active_conversations: activeConversations.size,
       });
     }
 
@@ -2919,7 +2901,6 @@ server.listen(PORT, '127.0.0.1', async () => {
   console.log(`[gateway] WhatsApp Web gateway listening on http://127.0.0.1:${PORT}`);
   console.log(`[gateway] LibreFang URL: ${LIBREFANG_URL}`);
   console.log(`[gateway] Default agent: ${DEFAULT_AGENT} (name: ${AGENT_NAME})`);
-  console.log(`[gateway] Conversation TTL: ${CONVERSATION_TTL_HOURS}h`);
 
   // Auto-connect from existing credentials on startup
   const fs = require('node:fs');
