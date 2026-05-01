@@ -1818,9 +1818,7 @@ async function startConnection() {
       if (now - row.last_timestamp > 2 * 60 * 60 * 1000) continue;
       const gap = now - row.last_timestamp;
       if (gap > GAP_THRESHOLD_MS) {
-        // The "recent activity" window above (2h since last_timestamp) is
-        // now the only liveness proxy — Phase 07 removed the in-memory
-        // activeConversations Map.
+        // The 2h `last_timestamp` window above is the only liveness proxy.
         console.warn(`[gateway][gap-detect] No messages from ${row.jid} for ${Math.round(gap / 60000)}min — possible message loss`);
       }
     }
@@ -2062,7 +2060,7 @@ async function processMediaMessage(fullMsg, innerMsg, agentId) {
 // ---------------------------------------------------------------------------
 // Detect whether an owner message expresses relay intent.
 //
-// Phase 07 §F retired the [RELAY_TO_STRANGER] parser and the inline
+// Phase 07 §F retired the relay-tag parser and the inline
 // system-instruction injection that this predicate used to gate. The
 // predicate itself is preserved for PLAN-04 §E, where it will be removed
 // together with the [relay_intent] config field. Until then it remains
