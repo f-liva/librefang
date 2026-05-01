@@ -944,73 +944,6 @@ function createHoldbackAccumulator({ onFlush, onSilent, minChars = SILENT_HOLDBA
 }
 
 // ---------------------------------------------------------------------------
-// Step E: Parse relay commands from agent response
-// ---------------------------------------------------------------------------
-
-// The agent can embed a relay command in its response using this JSON format:
-// [RELAY_TO_STRANGER]{"jid":"...@s.whatsapp.net","message":"..."}[/RELAY_TO_STRANGER]
-const RELAY_RE = /\[RELAY_TO_STRANGER\]\s*(\{[\s\S]*?\})\s*\[\/RELAY_TO_STRANGER\]/g;
-
-function extractRelayCommands(responseText) {
-  const relays = [];
-  for (const match of responseText.matchAll(RELAY_RE)) {
-    try {
-      const parsed = JSON.parse(match[1]);
-      if (parsed.jid && parsed.message) {
-        relays.push({ jid: parsed.jid, message: parsed.message });
-      }
-    } catch {
-      console.error('[gateway] Failed to parse relay command JSON:', match[1]);
-    }
-  }
-  const cleanedText = responseText.replace(RELAY_RE, '').trim();
-  return { relays, cleanedText };
-}
-
-// ---------------------------------------------------------------------------
-// Step F: Anti-confusion safeguards — relay validation + audit logging
-// ---------------------------------------------------------------------------
-
-/**
- * Validate and execute a relay to a stranger.
- * Returns a status string for the owner confirmation.
- */
-async function executeRelay(relay) {
-  const { jid, message } = relay;
-
-  // F1: JID must exist in active conversations
-  const convo = activeConversations.get(jid);
-  if (!convo) {
-    const errorMsg = `Relay rejected: no active conversation for JID ${jid}. The conversation may have expired.`;
-    console.warn(`[gateway] ${errorMsg}`);
-    return { success: false, error: errorMsg };
-  }
-
-  // F2: Socket must be connected
-  if (!sock || connStatus !== 'connected') {
-    return { success: false, error: 'WhatsApp not connected' };
-  }
-
-  try {
-    const sentRelay = await sock.sendMessage(jid, { text: markdownToWhatsApp(message) });
-    if (ECHO_TRACKER_ENABLED) echoTracker.track(message);
-
-    // F4: Audit log
-    console.log(`[gateway] RELAY SENT | to: ${convo.pushName} (${convo.phone}) [${jid}] | message: "${message.substring(0, 100)}" | timestamp: ${new Date().toISOString()}`);
-
-    // Update conversation tracker with outbound message
-    trackMessage(jid, convo.pushName, convo.phone, message, 'outbound');
-    // Save relay outbound to DB
-    dbSaveMessage({ id: sentRelay?.key?.id || randomUUID(), jid, senderJid: ownJid, pushName: null, phone: convo.phone, text: message, direction: 'outbound', timestamp: Date.now(), processed: 1, rawType: 'text' });
-
-    return { success: true, recipient: convo.pushName, phone: convo.phone };
-  } catch (err) {
-    console.error(`[gateway] Relay send failed to ${jid}:`, err.message);
-    return { success: false, error: err.message };
-  }
-}
-
-// ---------------------------------------------------------------------------
 // Resolve agent name → UUID via LibreFang API
 // ---------------------------------------------------------------------------
 function resolveAgentId() {
@@ -1615,14 +1548,6 @@ async function startConnection() {
           // <stranger_inbound> XML wrap. For now the stranger's raw text
           // is forwarded as-is — no [WHATSAPP_STRANGER_CONTEXT] prefix.
           messageToSend = messageText;
-        } else if (isOwner && activeConversations.size > 0 && ownerIntentsRelay(messageText)) {
-          // Only inject the relay system instruction when the owner's text
-          // expresses an explicit delegated-speech intent. A neutral greeting
-          // from the owner to the agent during an active stranger conversation
-          // must NOT be forced into relay mode.
-          const context = buildConversationsContext();
-          systemPrefix = buildRelaySystemInstruction();
-          messageToSend = context + '\n\n[OWNER_MESSAGE]\n' + messageText;
         } else {
           messageToSend = messageText;
         }
@@ -1634,10 +1559,9 @@ async function startConnection() {
           // Strip internal tags before sending partial text to WhatsApp.
           // Bail early if no brackets — most chunks won't contain tags.
           let cleaned = partialText;
-          if (cleaned.includes('[NOTIFY_OWNER]') || cleaned.includes('[RELAY_TO_STRANGER]') || cleaned.includes('[no reply needed]')) {
+          if (cleaned.includes('[NOTIFY_OWNER]') || cleaned.includes('[no reply needed]')) {
             cleaned = cleaned
               .replace(NOTIFY_OWNER_RE, '')
-              .replace(RELAY_RE, '')
               .replace(/\[no reply needed\]/gi, '');
           }
           // OB-07 hold-back gate: until we have already established a
@@ -1773,30 +1697,10 @@ async function startConnection() {
             }
 
           } else if (isOwner && !isGroup) {
-            // Step E: Check for relay commands in the agent response (DMs only, never groups)
-            const { relays, cleanedText } = extractRelayCommands(response);
-
-            // Execute any relay commands
-            const relayResults = [];
-            for (const relay of relays) {
-              const result = await executeRelay(relay);
-              relayResults.push(result);
-            }
-
-            // Build owner confirmation message
-            let ownerReply = cleanedText;
-
-            // Log relay results (don't append technical details to owner message)
-            for (let i = 0; i < relayResults.length; i++) {
-              const r = relayResults[i];
-              if (r.success) {
-                console.log(`[gateway] Relay delivered to ${r.recipient} (${r.phone})`);
-              } else {
-                console.error(`[gateway] Relay failed: ${r.error}`);
-                const failLine = `\n✗ Relay failed: ${r.error}`;
-                ownerReply = ownerReply ? ownerReply + failLine : failLine.trim();
-              }
-            }
+            // Phase 07 §F — relay parser eradicated. Owner DM responses are
+            // forwarded verbatim; PLAN-02 (§B channel_send WhatsApp extension)
+            // will introduce LLM-routed delivery to strangers via tool calls.
+            let ownerReply = response;
 
             if (ownerReply) {
               ownerReply = markdownToWhatsApp(ownerReply);
@@ -2158,19 +2062,12 @@ async function processMediaMessage(fullMsg, innerMsg, agentId) {
 // ---------------------------------------------------------------------------
 // Detect whether an owner message expresses relay intent.
 //
-// Before this guard, `buildRelaySystemInstruction` was injected for every
-// owner turn whenever any stranger conversation was active — which forced
-// the model to interpret neutral owner-to-bot messages ("saludos", "hola",
-// "come stai?") as requests to relay a reply to the last stranger. Result
-// observed in production: owner writing "saludos" to the bot triggered a
-// RELAY_TO_STRANGER to an unrelated namesake contact.
-//
-// Only inject the relay instruction when the owner's message expresses an
-// explicit delegated-speech intent. Everything else is treated as owner
-// talking directly to the agent.
-// Regex compiled once at module load from the configured language
-// packs in `lib/intent_patterns.js`. Adding a locale is a file-level
-// change; adding the code to the config toggles it on.
+// Phase 07 §F retired the [RELAY_TO_STRANGER] parser and the inline
+// system-instruction injection that this predicate used to gate. The
+// predicate itself is preserved for PLAN-04 §E, where it will be removed
+// together with the [relay_intent] config field. Until then it remains
+// dead code reachable only from the (also dead) owner-intent branch in
+// the inbound dispatcher; both go away in PLAN-04.
 const RELAY_INTENT_RE = require('./lib/intent_patterns').compileIntentRegex(
   tomlConfig.relay_intent_languages,
 );
@@ -2181,30 +2078,6 @@ function ownerIntentsRelay(text) {
   if (t.startsWith('/relay') || t.startsWith('/reply')) return true;
   if (/(^|\s)@[\w.+-]+/.test(t)) return true;
   return RELAY_INTENT_RE.test(t);
-}
-
-// ---------------------------------------------------------------------------
-// Build relay system instruction (Step E — separate from user text)
-// ---------------------------------------------------------------------------
-function buildRelaySystemInstruction() {
-  return [
-    '[SYSTEM_INSTRUCTION_WHATSAPP_RELAY]',
-    'You are acting as a bridge between the owner and external contacts.',
-    'When the owner wants to reply to a stranger, you MUST:',
-    '1. Determine which stranger the owner is addressing (from the active conversations list above)',
-    '2. Reformulate the message appropriately (never forward the raw owner message)',
-    '3. Wrap the outgoing message in this exact format:',
-    '[RELAY_TO_STRANGER]{"jid":"<stranger_jid>","message":"<your reformulated message>"}[/RELAY_TO_STRANGER]',
-    '',
-    'RULES:',
-    '- The "jid" MUST be one from the [ACTIVE_STRANGER_CONVERSATIONS] list',
-    '- The "message" MUST be a reformulated, polished version — never copy the owner\'s raw words',
-    '- If the intended recipient is ambiguous, ask the owner to clarify instead of guessing',
-    '- If the owner is talking to you (the agent) and NOT replying to a stranger, respond normally without any relay block',
-    '- You can include both a relay block AND a confirmation message to the owner in the same response',
-    '[/SYSTEM_INSTRUCTION_WHATSAPP_RELAY]',
-    '',
-  ].join('\n');
 }
 
 // ---------------------------------------------------------------------------
@@ -3118,7 +2991,6 @@ process.on('SIGTERM', () => gracefulShutdown('SIGTERM'));
 module.exports = {
   markdownToWhatsApp,
   extractNotifyOwner,
-  extractRelayCommands,
   ownerIntentsRelay,
   isRateLimited,
   buildCorsHeaders,

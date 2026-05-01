@@ -16,7 +16,6 @@ process.env.LIBREFANG_URL = `http://127.0.0.1:${MOCK_LIBREFANG_PORT}`;
 const {
   markdownToWhatsApp,
   extractNotifyOwner,
-  extractRelayCommands,
   ownerIntentsRelay,
   isRateLimited,
   buildCorsHeaders,
@@ -173,58 +172,6 @@ describe('extractNotifyOwner', () => {
     const r2 = extractNotifyOwner(text);
     assert.equal(r1.notifications.length, 1);
     assert.equal(r2.notifications.length, 1);
-  });
-});
-
-// ---------------------------------------------------------------------------
-// extractRelayCommands
-// ---------------------------------------------------------------------------
-describe('extractRelayCommands', () => {
-  it('extracts a relay command', () => {
-    const text = 'Sure! [RELAY_TO_STRANGER]{"jid":"123@s.whatsapp.net","message":"Hi there"}[/RELAY_TO_STRANGER] Done.';
-    const { relays, cleanedText } = extractRelayCommands(text);
-    assert.equal(relays.length, 1);
-    assert.equal(relays[0].jid, '123@s.whatsapp.net');
-    assert.equal(relays[0].message, 'Hi there');
-    assert.match(cleanedText, /^Sure!\s+Done\.$/);
-
-  });
-
-  it('extracts multiple relay commands', () => {
-    const text = '[RELAY_TO_STRANGER]{"jid":"a@s.whatsapp.net","message":"m1"}[/RELAY_TO_STRANGER] [RELAY_TO_STRANGER]{"jid":"b@s.whatsapp.net","message":"m2"}[/RELAY_TO_STRANGER]';
-    const { relays } = extractRelayCommands(text);
-    assert.equal(relays.length, 2);
-    assert.equal(relays[0].jid, 'a@s.whatsapp.net');
-    assert.equal(relays[1].jid, 'b@s.whatsapp.net');
-  });
-
-  it('returns empty array when no tags', () => {
-    const { relays, cleanedText } = extractRelayCommands('Normal text');
-    assert.equal(relays.length, 0);
-    assert.equal(cleanedText, 'Normal text');
-  });
-
-  it('skips entries with missing jid or message', () => {
-    const text = '[RELAY_TO_STRANGER]{"jid":"x@s.whatsapp.net"}[/RELAY_TO_STRANGER]';
-    const { relays } = extractRelayCommands(text);
-    assert.equal(relays.length, 0);
-  });
-
-  it('handles malformed JSON gracefully', () => {
-    // The regex expects {...} — "not json" won't match so the block stays in cleanedText
-    const text = '[RELAY_TO_STRANGER]{"jid":"x"}[/RELAY_TO_STRANGER] ok';
-    const { relays, cleanedText } = extractRelayCommands(text);
-    // jid present but message missing → skipped
-    assert.equal(relays.length, 0);
-    assert.match(cleanedText, /ok/);
-  });
-
-  it('works correctly when called twice in succession (no lastIndex bug)', () => {
-    const text = '[RELAY_TO_STRANGER]{"jid":"x@s.whatsapp.net","message":"hi"}[/RELAY_TO_STRANGER]';
-    const r1 = extractRelayCommands(text);
-    const r2 = extractRelayCommands(text);
-    assert.equal(r1.relays.length, 1);
-    assert.equal(r2.relays.length, 1);
   });
 });
 
@@ -723,11 +670,15 @@ describe('echo tracker wiring (Phase 3 §A)', () => {
     assert.match(src, /\.slice\(0,\s*80\)/);
   });
 
-  it('outbound wire-in covers all 7 text sendMessage sites', () => {
+  it('outbound wire-in covers all 6 text sendMessage sites', () => {
+    // Phase 07 §F dropped the relay outbound site (executeRelay's
+    // sock.sendMessage), bringing the outbound text-emission count from
+    // 7 down to 6. PLAN-02 §B (channel_send WhatsApp extension) will
+    // re-introduce a routed delivery site and bump this back up.
     const src = require('node:fs').readFileSync(require('node:path').join(__dirname, 'index.js'), 'utf8');
     const trackCount = (src.match(/echoTracker\.track\(/g) || []).length;
-    assert.equal(trackCount, 7,
-      `expected 7 echoTracker.track() calls (one per outbound text site), got ${trackCount}`);
+    assert.equal(trackCount, 6,
+      `expected 6 echoTracker.track() calls (one per outbound text site), got ${trackCount}`);
     });
 });
 
