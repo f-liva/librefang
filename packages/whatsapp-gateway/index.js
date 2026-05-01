@@ -484,15 +484,24 @@ async function resolveLidProactively(sock, lid, cache, timeoutMs = 5000) {
 // ---------------------------------------------------------------------------
 // Message store for Baileys retry mechanism
 // ---------------------------------------------------------------------------
-// Baileys needs getMessage() to re-decrypt messages on retry.  We keep a
-// bounded in-memory store of recently received raw messages.
+// Baileys needs getMessage() to re-decrypt messages on retry. We keep a
+// bounded in-memory store of recently received messages.
+//
+// Each entry holds both the inner `message` payload (what Baileys' getMessage
+// hook returns for retry decryption) and the full `waMessage` envelope
+// (key + message + timestamp + participant — what `sock.sendMessage` needs
+// for the `quoted` option to render a reply-thread bubble on the WA UI).
+//
+// Issue #40: agent-side `reply_to_msg_id` was being POSTed to the gateway
+// but silently dropped. The fix wires the body field through here so the
+// outbound send can quote the original message.
 const MESSAGE_STORE_MAX = 500;
 const MESSAGE_STORE_TTL_MS = 10 * 60 * 1000; // 10 min
-const messageStore = new Map(); // key: msgId → { message, ts }
+const messageStore = new Map(); // key: msgId → { message, waMessage?, ts }
 
-function messageStoreSet(msgId, message) {
+function messageStoreSet(msgId, message, waMessage) {
   if (!msgId || !message) return;
-  messageStore.set(msgId, { message, ts: Date.now() });
+  messageStore.set(msgId, { message, waMessage, ts: Date.now() });
   // Evict oldest entries if over limit
   if (messageStore.size > MESSAGE_STORE_MAX) {
     const oldest = messageStore.keys().next().value;
@@ -508,6 +517,65 @@ function messageStoreGet(msgId) {
     return undefined;
   }
   return entry.message;
+}
+
+// Returns the full `WAMessage` envelope (or undefined when missing/expired).
+// Required by Baileys' `quoted` option on outbound sends, which expects the
+// whole message — not just the inner `message` content.
+function messageStoreGetWAMessage(msgId) {
+  const entry = messageStore.get(msgId);
+  if (!entry) return undefined;
+  if (Date.now() - entry.ts > MESSAGE_STORE_TTL_MS) {
+    messageStore.delete(msgId);
+    return undefined;
+  }
+  return entry.waMessage;
+}
+
+// Strip the optional `WAID:` prefix that the Rust runtime tags onto WhatsApp
+// message IDs to disambiguate them from other channels' IDs (Telegram,
+// Slack, …). Lookup keys in the store use bare `msg.key.id`. The match is
+// case-insensitive so either casing works; ids without the prefix pass
+// through unchanged.
+function stripWaidPrefix(id) {
+  if (typeof id !== 'string') return '';
+  const trimmed = id.trim();
+  if (!trimmed) return '';
+  if (trimmed.length >= 5 && trimmed.slice(0, 5).toUpperCase() === 'WAID:') {
+    return trimmed.slice(5);
+  }
+  return trimmed;
+}
+
+// Resolve the `quoted` payload for an outbound send from the body's
+// `reply_to` field. Returns:
+//   - `undefined`         when `replyTo` is null/empty/non-string OR when the
+//                         stored message has expired / never existed (fail
+//                         soft: send goes through without a quote bubble)
+//   - the WAMessage object when the lookup hit
+//
+// `lookup` is injected so unit tests can supply a stub instead of touching
+// the module-level `messageStore`.
+function resolveQuotedFromReplyTo(replyTo, lookup) {
+  if (replyTo === null || replyTo === undefined) return undefined;
+  if (typeof replyTo !== 'string') {
+    console.warn(`[gateway][reply_to] ignoring non-string value: ${typeof replyTo}`);
+    return undefined;
+  }
+  const stripped = stripWaidPrefix(replyTo);
+  if (!stripped) return undefined;
+  let waMessage;
+  try {
+    waMessage = lookup(stripped);
+  } catch (err) {
+    console.warn(`[gateway][reply_to] lookup threw for "${stripped}": ${err?.message || err}`);
+    return undefined;
+  }
+  if (!waMessage) {
+    console.warn(`[gateway][reply_to] no stored message for "${stripped}" — sending without quote`);
+    return undefined;
+  }
+  return waMessage;
 }
 
 // ---------------------------------------------------------------------------
@@ -1275,9 +1343,11 @@ async function startConnection() {
     if (type !== 'notify') return;
 
     for (const msg of messages) {
-      // Store raw message for Baileys retry mechanism and resolve successful retries
+      // Store raw message for Baileys retry mechanism and resolve successful retries.
+      // The third argument (`msg`) is the full WAMessage envelope, used by
+      // outbound sends with `reply_to` to render a quote-reply bubble.
       if (msg.key?.id && msg.message) {
-        messageStoreSet(msg.key.id, msg.message);
+        messageStoreSet(msg.key.id, msg.message, msg);
         const retryKey = getDecryptRetryKey(msg.key.remoteJid || '', msg.key.id);
         if (decryptRetryMap.has(retryKey)) {
           console.log(`[gateway][retry] Decryption retry succeeded for ${msg.key.id}`);
@@ -2644,7 +2714,7 @@ setInterval(runDbCleanup, CLEANUP_INTERVAL_MS);
 // ---------------------------------------------------------------------------
 // Send a message via Baileys (called by LibreFang for outgoing)
 // ---------------------------------------------------------------------------
-async function sendMessage(to, text) {
+async function sendMessage(to, text, options = {}) {
   if (!sock || connStatus !== 'connected') {
     throw new Error('WhatsApp not connected');
   }
@@ -2653,7 +2723,8 @@ async function sendMessage(to, text) {
   const jid = phoneToJid(to);
 
   const formatted = markdownToWhatsApp(text);
-  const sent = await sock.sendMessage(jid, { text: formatted });
+  const sendOpts = options && options.quoted ? { quoted: options.quoted } : undefined;
+  const sent = await sock.sendMessage(jid, { text: formatted }, sendOpts);
   if (ECHO_TRACKER_ENABLED) echoTracker.track(text);
   // Save outbound message to DB (store formatted text to match what was delivered)
   dbSaveMessage({
@@ -2670,7 +2741,7 @@ async function sendMessage(to, text) {
   });
 }
 
-async function sendImage(to, imageUrl, caption) {
+async function sendImage(to, imageUrl, caption, options = {}) {
   if (!sock || connStatus !== 'connected') {
     throw new Error('WhatsApp not connected');
   }
@@ -2705,7 +2776,8 @@ async function sendImage(to, imageUrl, caption) {
   const imgMsg = { image: buffer };
   if (caption) imgMsg.caption = caption;
 
-  const sent = await sock.sendMessage(jid, imgMsg);
+  const sendOpts = options && options.quoted ? { quoted: options.quoted } : undefined;
+  const sent = await sock.sendMessage(jid, imgMsg, sendOpts);
   dbSaveMessage({
     id: sent?.key?.id || randomUUID(),
     jid,
@@ -2720,7 +2792,7 @@ async function sendImage(to, imageUrl, caption) {
   });
 }
 
-async function sendAudio(to, audioUrl, ptt = true) {
+async function sendAudio(to, audioUrl, ptt = true, options = {}) {
   if (!sock || connStatus !== 'connected') {
     throw new Error('WhatsApp not connected');
   }
@@ -2755,7 +2827,8 @@ async function sendAudio(to, audioUrl, ptt = true) {
   // ptt: true sends as a voice note (push-to-talk bubble); false sends as audio file
   const audioMsg = { audio: buffer, mimetype: 'audio/ogg; codecs=opus', ptt };
 
-  const sent = await sock.sendMessage(jid, audioMsg);
+  const sendOpts = options && options.quoted ? { quoted: options.quoted } : undefined;
+  const sent = await sock.sendMessage(jid, audioMsg, sendOpts);
   dbSaveMessage({
     id: sent?.key?.id || randomUUID(),
     jid,
@@ -2877,40 +2950,43 @@ const server = http.createServer(async (req, res) => {
     // POST /message/send — send outgoing message via Baileys
     if (req.method === 'POST' && path === '/message/send') {
       const body = await parseBody(req);
-      const { to, text } = body;
+      const { to, text, reply_to } = body;
 
       if (!to || !text) {
         return jsonResponse(req, res, 400, { error: 'Missing "to" or "text" field' });
       }
 
-      await sendMessage(to, text);
+      const quoted = resolveQuotedFromReplyTo(reply_to, messageStoreGetWAMessage);
+      await sendMessage(to, text, { quoted });
       return jsonResponse(req, res, 200, { success: true, message: 'Sent' });
     }
 
     // POST /message/send-image — send image via URL
     if (req.method === 'POST' && path === '/message/send-image') {
       const body = await parseBody(req);
-      const { to, image_url, caption } = body;
+      const { to, image_url, caption, reply_to } = body;
 
       if (!to || !image_url) {
         return jsonResponse(req, res, 400, { error: 'Missing "to" or "image_url" field' });
       }
 
-      await sendImage(to, image_url, caption || '');
+      const quoted = resolveQuotedFromReplyTo(reply_to, messageStoreGetWAMessage);
+      await sendImage(to, image_url, caption || '', { quoted });
       return jsonResponse(req, res, 200, { success: true, message: 'Image sent' });
     }
 
     // POST /message/send-audio — send audio file or voice note via URL
     if (req.method === 'POST' && path === '/message/send-audio') {
       const body = await parseBody(req);
-      const { to, audio_url, ptt } = body;
+      const { to, audio_url, ptt, reply_to } = body;
 
       if (!to || !audio_url) {
         return jsonResponse(req, res, 400, { error: 'Missing "to" or "audio_url" field' });
       }
 
       // ptt (push-to-talk) defaults to true — sends as voice note bubble
-      await sendAudio(to, audio_url, ptt !== false);
+      const quoted = resolveQuotedFromReplyTo(reply_to, messageStoreGetWAMessage);
+      await sendAudio(to, audio_url, ptt !== false, { quoted });
       return jsonResponse(req, res, 200, { success: true, message: 'Audio sent' });
     }
 
@@ -3098,4 +3174,10 @@ module.exports = {
   runDispatchSelfTest,
   channelTypeForChat,
   buildSessionKey,
+  // Issue #40 — reply_to → quoted bubble
+  stripWaidPrefix,
+  resolveQuotedFromReplyTo,
+  messageStoreSet,
+  messageStoreGet,
+  messageStoreGetWAMessage,
 };

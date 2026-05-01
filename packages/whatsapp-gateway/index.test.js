@@ -48,6 +48,12 @@ const {
   SESSION_RECOVERY_MAX_ATTEMPTS,
   runDispatchSelfTest,
   channelTypeForChat,
+  // Issue #40 — reply_to → quoted bubble
+  stripWaidPrefix,
+  resolveQuotedFromReplyTo,
+  messageStoreSet,
+  messageStoreGet,
+  messageStoreGetWAMessage,
 } = require('./index.js');
 
 // ---------------------------------------------------------------------------
@@ -1588,6 +1594,146 @@ describe('Phase 07 regression guards', () => {
     assert.ok(
       indexSrc.includes('shouldDebounceEscalation'),
       'shouldDebounceEscalation is anti-spam for NOTIFY_OWNER, NOT stranger session state — must be preserved'
+    );
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Issue #40 — reply_to body field → Baileys quoted option
+// ---------------------------------------------------------------------------
+// The Rust adapter posts `reply_to: "WAID:xxx"` (or bare id) on the three
+// /message/send* endpoints. The gateway must:
+//   1. Strip the optional WAID: prefix (case-insensitive)
+//   2. Look the inbound WAMessage up in the in-memory store
+//   3. Forward it to Baileys as `{ quoted: storedMsg }` so the WhatsApp UI
+//      renders a reply-thread bubble.
+//   4. Fail soft on missing/expired/garbage input — never block the send.
+describe('stripWaidPrefix (issue #40)', () => {
+  it('strips uppercase WAID: prefix', () => {
+    assert.equal(stripWaidPrefix('WAID:abc123'), 'abc123');
+  });
+
+  it('strips mixed-case waid: prefix', () => {
+    assert.equal(stripWaidPrefix('waid:abc123'), 'abc123');
+    assert.equal(stripWaidPrefix('Waid:abc123'), 'abc123');
+  });
+
+  it('passes through ids without the prefix unchanged', () => {
+    assert.equal(stripWaidPrefix('abc123'), 'abc123');
+    assert.equal(stripWaidPrefix('3EB0ABCDEF1234567890'), '3EB0ABCDEF1234567890');
+  });
+
+  it('trims surrounding whitespace', () => {
+    assert.equal(stripWaidPrefix('  WAID:abc123  '), 'abc123');
+  });
+
+  it('returns empty string for empty / non-string input', () => {
+    assert.equal(stripWaidPrefix(''), '');
+    assert.equal(stripWaidPrefix(null), '');
+    assert.equal(stripWaidPrefix(undefined), '');
+    assert.equal(stripWaidPrefix(42), '');
+    assert.equal(stripWaidPrefix({}), '');
+  });
+});
+
+describe('resolveQuotedFromReplyTo (issue #40)', () => {
+  function makeWAMessage(id) {
+    // Minimal WAMessage shape — `quoted` only needs `key` + `message`
+    // present; Baileys does not validate the rest at send time.
+    return {
+      key: { id, remoteJid: '393401234567@s.whatsapp.net', fromMe: false },
+      message: { conversation: `inbound text for ${id}` },
+      messageTimestamp: 1700000000,
+    };
+  }
+
+  it('returns the WAMessage when lookup hits (bare id)', () => {
+    const msg = makeWAMessage('abc123');
+    const lookup = (id) => (id === 'abc123' ? msg : undefined);
+    const result = resolveQuotedFromReplyTo('abc123', lookup);
+    assert.strictEqual(result, msg);
+  });
+
+  it('returns the WAMessage when lookup hits (WAID-prefixed id)', () => {
+    const msg = makeWAMessage('abc123');
+    const calls = [];
+    const lookup = (id) => {
+      calls.push(id);
+      return id === 'abc123' ? msg : undefined;
+    };
+    const result = resolveQuotedFromReplyTo('WAID:abc123', lookup);
+    assert.strictEqual(result, msg);
+    assert.deepEqual(calls, ['abc123'], 'lookup must be called with the stripped id');
+  });
+
+  it('returns undefined when reply_to is null/undefined/empty', () => {
+    const lookup = () => assert.fail('lookup must NOT be called when reply_to is absent');
+    assert.equal(resolveQuotedFromReplyTo(null, lookup), undefined);
+    assert.equal(resolveQuotedFromReplyTo(undefined, lookup), undefined);
+    assert.equal(resolveQuotedFromReplyTo('', lookup), undefined);
+    assert.equal(resolveQuotedFromReplyTo('   ', lookup), undefined);
+  });
+
+  it('returns undefined when reply_to is non-string', () => {
+    const lookup = () => assert.fail('lookup must NOT be called for non-string reply_to');
+    assert.equal(resolveQuotedFromReplyTo(123, lookup), undefined);
+    assert.equal(resolveQuotedFromReplyTo({ id: 'x' }, lookup), undefined);
+    assert.equal(resolveQuotedFromReplyTo(['x'], lookup), undefined);
+  });
+
+  it('returns undefined when message is not in the store (graceful no-quote)', () => {
+    const lookup = () => undefined;
+    assert.equal(resolveQuotedFromReplyTo('WAID:never-stored', lookup), undefined);
+  });
+
+  it('returns undefined when lookup throws (graceful no-quote)', () => {
+    const lookup = () => { throw new Error('store offline'); };
+    // Must not bubble — the send path needs to keep going.
+    assert.equal(resolveQuotedFromReplyTo('WAID:abc123', lookup), undefined);
+  });
+});
+
+describe('messageStore WAMessage round-trip (issue #40)', () => {
+  it('persists and retrieves the full WAMessage envelope', () => {
+    const id = 'roundtrip-msg-1';
+    const waMsg = {
+      key: { id, remoteJid: '393401234567@s.whatsapp.net', fromMe: false },
+      message: { conversation: 'hello' },
+      messageTimestamp: 1700000001,
+    };
+    messageStoreSet(id, waMsg.message, waMsg);
+    // Inner content is what Baileys' getMessage hook returns
+    assert.deepEqual(messageStoreGet(id), waMsg.message);
+    // Full envelope is what `quoted:` needs
+    assert.strictEqual(messageStoreGetWAMessage(id), waMsg);
+  });
+
+  it('is backward-compatible: legacy two-arg call leaves WAMessage undefined', () => {
+    const id = 'roundtrip-msg-2';
+    const content = { conversation: 'legacy path' };
+    messageStoreSet(id, content);
+    assert.deepEqual(messageStoreGet(id), content);
+    assert.equal(messageStoreGetWAMessage(id), undefined,
+      'no full envelope was provided, so the WAMessage getter must return undefined');
+  });
+
+  it('end-to-end: resolveQuotedFromReplyTo wired to the real store', () => {
+    const id = 'e2e-msg-1';
+    const waMsg = {
+      key: { id, remoteJid: '393401234567@s.whatsapp.net', fromMe: false },
+      message: { conversation: 'quote me' },
+      messageTimestamp: 1700000002,
+    };
+    messageStoreSet(id, waMsg.message, waMsg);
+    assert.strictEqual(
+      resolveQuotedFromReplyTo(`WAID:${id}`, messageStoreGetWAMessage),
+      waMsg,
+      'WAID-prefixed lookup must resolve through the live store'
+    );
+    assert.equal(
+      resolveQuotedFromReplyTo('WAID:does-not-exist', messageStoreGetWAMessage),
+      undefined,
+      'unknown ids must fall back to no-quote (not throw)'
     );
   });
 });
