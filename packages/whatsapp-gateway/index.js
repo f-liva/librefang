@@ -907,6 +907,63 @@ function extractNotifyOwner(responseText) {
 }
 
 // ---------------------------------------------------------------------------
+// Issue #42: stranger-turn owner-prose leak detector.
+//
+// During a turn opened by a stranger, the model is supposed to address the
+// stranger only — owner notifications go via [NOTIFY_OWNER]. If the model
+// leaks owner-addressed prose ("Signore, …"), raw REST acks ({"success":true}),
+// or gateway internals into the plain response, this would be sent verbatim
+// to the stranger by the dispatch site. The patterns below are conservative
+// (high-precision, low-recall) markers that strongly imply the text was meant
+// for the owner, not the stranger. When detected, the dispatch site drops the
+// matching segments from the stranger payload and routes them to the owner via
+// a synthesized leak_redirect notification.
+// ---------------------------------------------------------------------------
+const OWNER_LEAK_PATTERNS = [
+  { name: 'direct_address_signore', re: /\b(Signore|Padrone)\b\s*[,!.\?:;]/i },
+  { name: 'rest_success_ack', re: /\{["']?success["']?\s*:\s*true/ },
+  { name: 'gateway_rest_mention', re: /\b(gateway|REST)\b[^.]{0,40}\/message\/send/i },
+];
+
+function detectStrangerTurnOwnerLeak(text) {
+  if (!text || typeof text !== 'string') {
+    return { detected: false, residual: text || '', leaked: '', marker: null, excerpt: '' };
+  }
+  // Split into sentences/paragraphs and classify each independently so a
+  // legitimate stranger-addressed sentence isn't dropped along with a leaky
+  // one. Conservative split on newlines + sentence terminators.
+  const segments = text
+    .split(/(?<=[.!?])\s+|\n+/)
+    .map((s) => s.trim())
+    .filter((s) => s.length > 0);
+  if (segments.length === 0) {
+    return { detected: false, residual: text, leaked: '', marker: null, excerpt: '' };
+  }
+  const safe = [];
+  const leaked = [];
+  let firstMarker = null;
+  for (const seg of segments) {
+    const hit = OWNER_LEAK_PATTERNS.find((p) => p.re.test(seg));
+    if (hit) {
+      leaked.push(seg);
+      if (!firstMarker) firstMarker = hit.name;
+    } else {
+      safe.push(seg);
+    }
+  }
+  if (leaked.length === 0) {
+    return { detected: false, residual: text, leaked: '', marker: null, excerpt: '' };
+  }
+  return {
+    detected: true,
+    residual: safe.join(' ').trim(),
+    leaked: leaked.join(' ').trim(),
+    marker: firstMarker,
+    excerpt: leaked.join(' ').slice(0, 120),
+  };
+}
+
+// ---------------------------------------------------------------------------
 // Silent-response sentinel — gateway-side mirror of the canonical Rust
 // detector at crates/librefang-runtime/src/silent_response.rs.
 // ---------------------------------------------------------------------------
@@ -1858,14 +1915,40 @@ async function startConnection() {
             // Step C: Agent response goes to STRANGER, not owner
             const { notifications, cleanedText } = extractNotifyOwner(response);
 
+            // Issue #42: detect owner-addressed prose that the model leaked into
+            // a stranger turn (direct address "Signore"/"Padrone", raw REST acks,
+            // gateway internals). Redirect to owner via NOTIFY_OWNER instead of
+            // delivering to the stranger.
+            const leak = detectStrangerTurnOwnerLeak(cleanedText);
+            const strangerSafeText = leak.detected ? leak.residual : cleanedText;
+
+            if (leak.detected) {
+              try {
+                console.log(JSON.stringify({
+                  event: 'stranger_turn_leak_redirect',
+                  chat_jid: sender,
+                  push_name: pushName,
+                  marker: leak.marker,
+                  excerpt: leak.excerpt,
+                }));
+              } catch { /* noop */ }
+              // Synthesize a leak_redirect notification for the owner with the
+              // text that would have leaked. Joins the regular notifications[]
+              // pipeline so it inherits dedup, escalation, and delivery.
+              notifications.push({
+                reason: 'leak_redirect',
+                summary: `[leak_redirect ${pushName}] ${leak.leaked.slice(0, 600)}`,
+              });
+            }
+
             // Send cleaned response to the stranger (format after tag extraction)
-            if (cleanedText) {
-              const formattedText = markdownToWhatsApp(cleanedText);
+            if (strangerSafeText && strangerSafeText.trim()) {
+              const formattedText = markdownToWhatsApp(strangerSafeText);
               const sentKey = await sendOrEdit(sender, formattedText);
-              console.log(`[gateway] Replied to stranger ${pushName} (${phone})${streamMsgKey ? ' (streamed)' : ''}`);
+              console.log(`[gateway] Replied to stranger ${pushName} (${phone})${streamMsgKey ? ' (streamed)' : ''}${leak.detected ? ' (leak_redirected)' : ''}`);
 
               // Save outbound to DB
-              dbSaveMessage({ id: sentKey?.id || randomUUID(), jid: sender, senderJid: ownJid, pushName: null, phone, text: cleanedText, direction: 'outbound', timestamp: Date.now(), processed: 1, rawType: 'text' });
+              dbSaveMessage({ id: sentKey?.id || randomUUID(), jid: sender, senderJid: ownJid, pushName: null, phone, text: strangerSafeText, direction: 'outbound', timestamp: Date.now(), processed: 1, rawType: 'text' });
             }
 
             // Step C + F: If NOTIFY_OWNER tags found, send notification to owner
@@ -3143,6 +3226,7 @@ process.on('SIGTERM', () => gracefulShutdown('SIGTERM'));
 module.exports = {
   markdownToWhatsApp,
   extractNotifyOwner,
+  detectStrangerTurnOwnerLeak,
   // Phase 07 §C — inbound stranger XML wrap (testing + introspection)
   wrapStrangerInbound,
   xmlAttrEscape,

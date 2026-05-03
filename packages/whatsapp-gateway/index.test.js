@@ -16,6 +16,7 @@ process.env.LIBREFANG_URL = `http://127.0.0.1:${MOCK_LIBREFANG_PORT}`;
 const {
   markdownToWhatsApp,
   extractNotifyOwner,
+  detectStrangerTurnOwnerLeak,
   // Phase 07 §C — inbound stranger XML wrap
   wrapStrangerInbound,
   xmlAttrEscape,
@@ -181,6 +182,55 @@ describe('extractNotifyOwner', () => {
     const r2 = extractNotifyOwner(text);
     assert.equal(r1.notifications.length, 1);
     assert.equal(r2.notifications.length, 1);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// detectStrangerTurnOwnerLeak (issue #42)
+// ---------------------------------------------------------------------------
+describe('detectStrangerTurnOwnerLeak', () => {
+  it('returns detected=false on empty / null input', () => {
+    assert.equal(detectStrangerTurnOwnerLeak('').detected, false);
+    assert.equal(detectStrangerTurnOwnerLeak(null).detected, false);
+    assert.equal(detectStrangerTurnOwnerLeak(undefined).detected, false);
+  });
+
+  it('passes through stranger-safe prose untouched', () => {
+    const text = 'Buongiorno Jessica! Come posso aiutarLa? Resto a Sua disposizione.';
+    const r = detectStrangerTurnOwnerLeak(text);
+    assert.equal(r.detected, false);
+    assert.equal(r.residual, text);
+  });
+
+  it('detects direct address to Signore', () => {
+    const text = 'Recapitato a Jessica, Signore. Tutto a posto.';
+    const r = detectStrangerTurnOwnerLeak(text);
+    assert.equal(r.detected, true);
+    assert.equal(r.marker, 'direct_address_signore');
+    assert.match(r.leaked, /Signore/);
+  });
+
+  it('detects raw REST success ack', () => {
+    const text = 'Inviato. Risposta del gateway: {"success":true,"message":"Sent"}';
+    const r = detectStrangerTurnOwnerLeak(text);
+    assert.equal(r.detected, true);
+    assert.equal(r.marker, 'rest_success_ack');
+  });
+
+  it('separates leaked sentences from safe ones', () => {
+    const text = 'Buongiorno Jessica, grazie del messaggio. Recapitato, Signore. Resto in ascolto.';
+    const r = detectStrangerTurnOwnerLeak(text);
+    assert.equal(r.detected, true);
+    assert.match(r.residual, /Buongiorno Jessica/);
+    assert.match(r.residual, /Resto in ascolto/);
+    assert.doesNotMatch(r.residual, /Signore/);
+    assert.match(r.leaked, /Signore/);
+  });
+
+  it('does not flag the word "signore" inside ordinary prose without direct-address punctuation', () => {
+    const text = 'Il signore con cui lavoro Le scriverà domani';
+    const r = detectStrangerTurnOwnerLeak(text);
+    assert.equal(r.detected, false);
   });
 });
 
