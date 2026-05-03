@@ -4769,6 +4769,9 @@ system_prompt = "You are a helpful assistant."
                     librefang_runtime::agent_context::load_context_md(w, manifest.cache_context)
                 }),
                 dynamic_sections,
+                // §B Phase 08 — ephemeral build path (e.g. spawn-time prebuild)
+                // has no real inbound; the stranger-turn contract is irrelevant.
+                is_stranger_turn: false,
             };
             manifest.model.system_prompt =
                 librefang_runtime::prompt_builder::build_system_prompt(&prompt_ctx);
@@ -6116,6 +6119,12 @@ system_prompt = "You are a helpful assistant."
                     librefang_runtime::agent_context::load_context_md(w, manifest.cache_context)
                 }),
                 dynamic_sections,
+                // §B Phase 08 — kernel-level stranger-turn detection.
+                // Channel-agnostic: trips on the Phase 07 §C wrap convention.
+                is_stranger_turn: librefang_runtime::prompt_builder::detect_stranger_turn(
+                    message,
+                    sender_context.map(|s| s.is_group).unwrap_or(false),
+                ),
             };
             manifest.model.system_prompt =
                 librefang_runtime::prompt_builder::build_system_prompt(&prompt_ctx);
@@ -7712,6 +7721,12 @@ system_prompt = "You are a helpful assistant."
                     librefang_runtime::agent_context::load_context_md(w, manifest.cache_context)
                 }),
                 dynamic_sections,
+                // §B Phase 08 — kernel-level stranger-turn detection.
+                // Channel-agnostic: trips on the Phase 07 §C wrap convention.
+                is_stranger_turn: librefang_runtime::prompt_builder::detect_stranger_turn(
+                    message,
+                    sender_context.map(|s| s.is_group).unwrap_or(false),
+                ),
             };
             manifest.model.system_prompt =
                 librefang_runtime::prompt_builder::build_system_prompt(&prompt_ctx);
