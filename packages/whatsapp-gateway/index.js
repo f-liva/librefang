@@ -1750,6 +1750,14 @@ async function startConnection() {
         let streamMsgKey = null; // key of the initial WhatsApp message we'll edit
         const onProgress = async (partialText) => {
           if (!sock) return;
+          // HOT-FIX (issue #41): never stream live to a stranger. The
+          // streaming path edits `sender` (the stranger's chat) with each
+          // cumulative chunk before the post-stream extractor splits
+          // [NOTIFY_OWNER] / [RELAY_TO_STRANGER] / owner-addressed prose.
+          // Buffer the full response and let the post-stream dispatcher
+          // route the cleaned text to the stranger and any [NOTIFY_OWNER]
+          // payloads to the owner.
+          if (isStranger) return;
           // Strip internal tags before sending partial text to WhatsApp.
           // Bail early if no brackets — most chunks won't contain tags.
           let cleaned = partialText;
