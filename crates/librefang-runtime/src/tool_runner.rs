@@ -360,8 +360,10 @@ pub async fn execute_tool_raw(
 
     // §A — notify_owner is dispatched before the result-string wrapper so it
     // can carry a structured `owner_notice` side-channel back to the agent
-    // loop. The model sees only an opaque ack in `content` (so it cannot echo
-    // the private summary in a public reply); the real payload travels in
+    // loop. The model sees a structured JSON ack in `content`
+    // (`{success, delivered_to, urgency}`, Phase 08 §A) so it gets typed
+    // feedback without ever seeing the private summary back. The actual
+    // owner-bound payload (`🎩 [{urgency}] {reason}: {summary}`) travels in
     // `ToolResult.owner_notice` and is consumed by `agent_loop.rs`.
     if tool_name == "notify_owner" {
         return tool_notify_owner(tool_use_id, input);
@@ -1500,7 +1502,10 @@ pub fn builtin_tool_definitions() -> Vec<ToolDefinition> {
         // --- Owner-side channel ---
         ToolDefinition {
             name: "notify_owner".to_string(),
-            description: "Send a private notice to the agent's owner (operator DM) WITHOUT posting it to the source chat. Use this in groups when you have something to tell the owner that should not be visible to other participants. Returns an opaque ack — do NOT repeat the summary in your public reply.".to_string(),
+            description: "Send a private notice to the agent's owner (operator DM) WITHOUT posting it to the source chat. Use this in groups when you have something to tell the owner that should not be visible to other participants. Optional `urgency` (low|normal|high, default normal) modulates downstream delivery — `high` bypasses owner-side dedup so escalations always land. Returns a structured JSON result {success, delivered_to, urgency, error?}. The `summary` is delivered to the owner privately; do NOT repeat it in your public reply.".to_string(),
+            // NB: properties listed alphabetically (`reason`, `summary`,
+            // `urgency`) for deterministic prompt ordering — see CLAUDE.md
+            // §"Deterministic prompt ordering (#3298)".
             input_schema: serde_json::json!({
                 "type": "object",
                 "properties": {
@@ -1511,6 +1516,11 @@ pub fn builtin_tool_definitions() -> Vec<ToolDefinition> {
                     "summary": {
                         "type": "string",
                         "description": "Human-readable message body addressed to the owner."
+                    },
+                    "urgency": {
+                        "type": "string",
+                        "enum": ["low", "normal", "high"],
+                        "description": "Optional priority hint. 'high' bypasses owner-side dedup so escalations always land. Defaults to 'normal'."
                     }
                 },
                 "required": ["reason", "summary"]
@@ -3109,16 +3119,25 @@ fn tool_agent_kill(
     Ok(format!("Agent {agent_id} killed successfully."))
 }
 
-/// `notify_owner(reason, summary)` — typed channel for owner-only speech.
+/// `notify_owner(reason, summary, urgency?)` — typed channel for owner-only
+/// speech.
 ///
-/// Records the `summary` in `ToolResult.owner_notice` so the agent loop can
-/// route it to the operator's DM (e.g. WhatsApp `OWNER_JID`) instead of the
-/// source chat. Returns an opaque, model-visible acknowledgement so the LLM
-/// does NOT see (and therefore cannot leak) the private summary back into a
+/// Records `🎩 [{urgency}] {reason}: {summary}` in `ToolResult.owner_notice`
+/// so the agent loop can route it to the operator's DM (e.g. WhatsApp
+/// `OWNER_JID`) instead of the source chat. The `[urgency]` marker lets
+/// channel adapters (Phase 08 §C/D plan 03) modulate dedup/escalation
+/// without parsing free text.
+///
+/// Returns a structured JSON ack `{success, delivered_to, urgency}` so the
+/// model gets typed feedback (issue #44). The ack is intentionally devoid
+/// of the private `summary` content — the LLM cannot leak it back into a
 /// public reply.
 ///
-/// Errors are returned via `ToolResult.is_error = true` with a descriptive
-/// message; the model is expected to retry with corrected arguments.
+/// Phase 08 §A — `urgency` is optional, enum {low, normal, high}, default
+/// `normal`. Invalid values fall back to `normal` with a tracing warn (D-01:
+/// graceful default rather than hard reject). Empty `reason` or `summary`
+/// remains a hard error (`is_error = true`); the model is expected to retry
+/// with corrected arguments.
 /// Resolve the pool `tool_load` / `tool_search` search against.
 ///
 /// - `Some(pool)` — the agent's granted `ToolDefinition` list from the
@@ -3287,10 +3306,35 @@ fn tool_notify_owner(tool_use_id: &str, input: &serde_json::Value) -> ToolResult
         };
     }
 
-    // Compose the owner-side payload. The reason is prefixed so the operator
-    // can scan a long stream of notices without parsing the body. Format:
-    //     🎩 {reason}: {summary}
-    let owner_payload = format!("🎩 {reason}: {summary}");
+    // Phase 08 §A — optional `urgency` enum {low, normal, high}, default
+    // `normal`. D-01: invalid values are a soft warning + fall back to
+    // `normal`, NOT a hard error — the model can keep going on its first try
+    // instead of having to retry. Empty `reason` / `summary` is still hard
+    // error (above).
+    let urgency_in = input
+        .get("urgency")
+        .and_then(|v| v.as_str())
+        .unwrap_or("normal")
+        .to_lowercase();
+    let urgency_str: &'static str = match urgency_in.as_str() {
+        "low" => "low",
+        "normal" => "normal",
+        "high" => "high",
+        _ => {
+            tracing::warn!(
+                event = "owner_notify_invalid_urgency",
+                got = %urgency_in,
+                "notify_owner received invalid urgency, falling back to normal"
+            );
+            "normal"
+        }
+    };
+
+    // Compose the owner-side payload. The `[urgency]` marker lets channel
+    // adapters (e.g. WhatsApp gateway, Phase 08 §C/D plan 03) read the
+    // urgency without parsing free text — `high` bypasses owner-side dedup.
+    // Format: `🎩 [{urgency}] {reason}: {summary}`.
+    let owner_payload = format!("🎩 [{urgency_str}] {reason}: {summary}");
 
     // Structured log per OBS-01 — dispatch decision is recorded even before
     // the gateway fans it out. Target JID(s) are resolved downstream.
@@ -3298,14 +3342,23 @@ fn tool_notify_owner(tool_use_id: &str, input: &serde_json::Value) -> ToolResult
         event = "owner_notify",
         reason = %reason,
         summary_len = summary.len(),
+        urgency = %urgency_str,
         "notify_owner tool invoked"
     );
 
+    // Phase 08 §A — structured JSON ack so the model gets typed feedback
+    // (issue #44). The opaque sentence is gone; the model now sees
+    // `{success, delivered_to, urgency}` and can branch on it.
+    let ack = serde_json::json!({
+        "success": true,
+        "delivered_to": "owner",
+        "urgency": urgency_str,
+    })
+    .to_string();
+
     ToolResult {
         tool_use_id: tool_use_id.to_string(),
-        // Opaque ack — intentionally devoid of summary content.
-        content: "Notice queued for the owner. Do not repeat the summary in your public reply."
-            .to_string(),
+        content: ack,
         is_error: false,
         owner_notice: Some(owner_payload),
         ..Default::default()
@@ -9914,8 +9967,79 @@ description = "test"
         assert!(names.contains(&"summary"));
     }
 
+    /// Phase 08 §A — schema must advertise the optional `urgency` enum so the
+    /// model knows it can pass `low | normal | high` without having to guess.
+    /// `urgency` MUST NOT appear in `required`; default is `normal`.
     #[test]
-    fn notify_owner_tool_sets_owner_notice_and_opaque_ack() {
+    fn notify_owner_tool_schema_advertises_urgency_enum() {
+        let defs = builtin_tool_definitions();
+        let notify = defs
+            .iter()
+            .find(|d| d.name == "notify_owner")
+            .expect("notify_owner registered");
+        let schema = &notify.input_schema;
+        let urgency_prop = &schema["properties"]["urgency"];
+        assert!(
+            urgency_prop.is_object(),
+            "schema.properties.urgency must be an object, got: {urgency_prop}"
+        );
+        let enum_values: Vec<&str> = urgency_prop["enum"]
+            .as_array()
+            .expect("urgency.enum array")
+            .iter()
+            .filter_map(|v| v.as_str())
+            .collect();
+        assert_eq!(
+            enum_values,
+            vec!["low", "normal", "high"],
+            "urgency enum must list the three accepted values in canonical order"
+        );
+        // urgency MUST NOT be in `required`.
+        let required: Vec<&str> = schema["required"]
+            .as_array()
+            .expect("required array")
+            .iter()
+            .filter_map(|v| v.as_str())
+            .collect();
+        assert!(
+            !required.contains(&"urgency"),
+            "urgency must remain optional, got required={required:?}"
+        );
+    }
+
+    /// Phase 08 §A — the description string must explicitly tell the model
+    /// it gets a structured JSON ack instead of an opaque sentence; otherwise
+    /// drivers (which receive the description verbatim) will keep the legacy
+    /// expectation.
+    #[test]
+    fn notify_owner_tool_description_documents_structured_ack() {
+        let defs = builtin_tool_definitions();
+        let notify = defs
+            .iter()
+            .find(|d| d.name == "notify_owner")
+            .expect("notify_owner registered");
+        let desc = &notify.description;
+        assert!(
+            desc.contains("JSON"),
+            "description must mention the JSON return shape, got: {desc}"
+        );
+        assert!(
+            desc.contains("urgency"),
+            "description must mention urgency parameter, got: {desc}"
+        );
+        // The legacy opaque-ack phrase MUST be gone — drivers cache the
+        // description in the prompt, so the new contract has to surface.
+        assert!(
+            !desc.contains("opaque ack"),
+            "description must drop the legacy opaque-ack wording, got: {desc}"
+        );
+    }
+
+    /// Phase 08 §A (renamed from `notify_owner_tool_sets_owner_notice_and_opaque_ack`):
+    /// default urgency is `normal`, owner_notice carries the `🎩 [normal] `
+    /// prefix, content is JSON-parseable.
+    #[test]
+    fn notify_owner_tool_sets_owner_notice_with_urgency_marker() {
         let input = serde_json::json!({
             "reason": "confirmation_needed",
             "summary": "Caterina has asked for confirmation of the appointment."
@@ -9923,13 +10047,137 @@ description = "test"
         let r = tool_notify_owner("toolu_1", &input);
         assert!(!r.is_error, "notify_owner should not be an error: {r:?}");
         assert_eq!(r.tool_use_id, "toolu_1");
-        // Owner-side payload populated with prefixed reason.
+
+        // Owner-side payload prefixed with the [urgency] marker so adapters
+        // can route on it without parsing free text.
         let payload = r.owner_notice.as_deref().expect("owner_notice set");
+        assert!(
+            payload.starts_with("🎩 [normal] "),
+            "owner_notice must start with `🎩 [normal] `, got: {payload}"
+        );
         assert!(payload.contains("confirmation_needed"));
         assert!(payload.contains("Caterina"));
-        // Opaque ack does NOT echo the summary back to the model.
-        assert!(!r.content.contains("Caterina"));
-        assert!(!r.content.contains("confirmation_needed"));
+
+        // Content is the structured JSON ack — must parse and include the
+        // expected three keys.
+        let parsed: serde_json::Value =
+            serde_json::from_str(&r.content).expect("content must parse as JSON");
+        assert_eq!(parsed["success"], serde_json::Value::Bool(true));
+        assert_eq!(
+            parsed["delivered_to"],
+            serde_json::Value::String("owner".into())
+        );
+        assert_eq!(
+            parsed["urgency"],
+            serde_json::Value::String("normal".into())
+        );
+
+        // The JSON ack must NOT echo the private summary back to the model.
+        assert!(
+            !r.content.contains("Caterina"),
+            "ack must not leak summary, got: {}",
+            r.content
+        );
+        assert!(
+            !r.content.contains("confirmation_needed"),
+            "ack must not leak reason, got: {}",
+            r.content
+        );
+    }
+
+    /// Phase 08 §A — explicit `urgency: "high"` must propagate to both the
+    /// owner_notice prefix and the structured ack.
+    #[test]
+    fn notify_owner_tool_high_urgency_propagates_in_payload() {
+        let input = serde_json::json!({
+            "reason": "escalation",
+            "summary": "stranger persistente, terzo tentativo"
+        });
+        let mut input = input;
+        input.as_object_mut().unwrap().insert(
+            "urgency".to_string(),
+            serde_json::Value::String("high".into()),
+        );
+        let r = tool_notify_owner("toolu_h", &input);
+        assert!(!r.is_error, "high urgency must not error: {r:?}");
+
+        let payload = r.owner_notice.as_deref().expect("owner_notice set");
+        assert!(
+            payload.starts_with("🎩 [high] "),
+            "expected [high] prefix, got: {payload}"
+        );
+
+        let parsed: serde_json::Value = serde_json::from_str(&r.content).unwrap();
+        assert_eq!(parsed["urgency"], serde_json::Value::String("high".into()));
+        assert_eq!(parsed["success"], serde_json::Value::Bool(true));
+    }
+
+    /// Phase 08 §A — explicit `urgency: "low"` round-trips identically.
+    #[test]
+    fn notify_owner_tool_low_urgency_propagates() {
+        let input = serde_json::json!({
+            "reason": "fyi",
+            "summary": "promemoria leggero",
+            "urgency": "low"
+        });
+        let r = tool_notify_owner("toolu_l", &input);
+        assert!(!r.is_error);
+        let payload = r.owner_notice.as_deref().unwrap();
+        assert!(
+            payload.starts_with("🎩 [low] "),
+            "expected [low] prefix, got: {payload}"
+        );
+        let parsed: serde_json::Value = serde_json::from_str(&r.content).unwrap();
+        assert_eq!(parsed["urgency"], serde_json::Value::String("low".into()));
+    }
+
+    /// Phase 08 §A — invalid urgency values fall back to `"normal"` with a
+    /// tracing warn (NOT an error). D-01: graceful default rather than hard
+    /// reject — the model can keep going on its first try.
+    #[test]
+    fn notify_owner_tool_invalid_urgency_falls_back_to_normal() {
+        let cases = vec![
+            serde_json::json!({"reason": "x", "summary": "y", "urgency": "BOGUS"}),
+            serde_json::json!({"reason": "x", "summary": "y", "urgency": "URGENT"}),
+            serde_json::json!({"reason": "x", "summary": "y", "urgency": ""}),
+            serde_json::json!({"reason": "x", "summary": "y", "urgency": "Normal"}), // case-insensitive
+        ];
+        for input in cases {
+            let r = tool_notify_owner("t", &input);
+            assert!(
+                !r.is_error,
+                "invalid urgency must NOT be a hard error, input={input:?}, got: {r:?}"
+            );
+            let payload = r.owner_notice.as_deref().unwrap();
+            // case-insensitive: "Normal" -> "normal", others fall back too.
+            assert!(
+                payload.starts_with("🎩 [normal] "),
+                "expected fallback to [normal], input={input:?}, got: {payload}"
+            );
+            let parsed: serde_json::Value = serde_json::from_str(&r.content).unwrap();
+            assert_eq!(
+                parsed["urgency"],
+                serde_json::Value::String("normal".into()),
+                "input={input:?}"
+            );
+        }
+    }
+
+    /// Phase 08 §A — backward compat: callers omitting `urgency` get
+    /// `"normal"`. Same shape as the explicit-normal test, just covers the
+    /// unset path explicitly.
+    #[test]
+    fn notify_owner_tool_missing_urgency_defaults_to_normal() {
+        let input = serde_json::json!({"reason": "r", "summary": "s"});
+        let r = tool_notify_owner("t", &input);
+        assert!(!r.is_error);
+        let payload = r.owner_notice.as_deref().unwrap();
+        assert_eq!(payload, "🎩 [normal] r: s");
+        let parsed: serde_json::Value = serde_json::from_str(&r.content).unwrap();
+        assert_eq!(
+            parsed["urgency"],
+            serde_json::Value::String("normal".into())
+        );
     }
 
     #[test]
@@ -9940,6 +10188,8 @@ description = "test"
             serde_json::json!({"reason": "x"}),
             serde_json::json!({"summary": "x"}),
             serde_json::json!({}),
+            // Empty reason/summary even with explicit urgency: still hard error.
+            serde_json::json!({"reason": "", "summary": "y", "urgency": "high"}),
         ];
         for input in cases {
             let r = tool_notify_owner("t", &input);
