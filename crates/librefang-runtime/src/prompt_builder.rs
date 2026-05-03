@@ -188,6 +188,14 @@ pub struct PromptContext {
     /// kernel before each call to [`build_system_prompt`]. Each entry renders
     /// as `## {heading}\n{body}` after the structural sections (Sections 1-15).
     pub dynamic_sections: Vec<crate::hooks::DynamicSection>,
+    /// True iff the current turn was opened by a non-owner whose inbound
+    /// message was wrapped by the channel adapter in `<stranger_inbound>`
+    /// XML (Phase 07 §C wrap convention). When true, the system prompt
+    /// enforces a tool-only contract (Section 9.7) — the model may emit
+    /// `channel_send` and `notify_owner` calls but no free prose.
+    /// Channel-agnostic: any adapter following the wrap convention
+    /// triggers this. Defaults to `false`.
+    pub is_stranger_turn: bool,
 }
 
 /// Build the complete system prompt from a `PromptContext`.
@@ -315,6 +323,17 @@ pub fn build_system_prompt(ctx: &PromptContext) -> String {
     // Section 9.6 — Output Channels (§A — only when notify_owner granted)
     if ctx.granted_tools.iter().any(|t| t == "notify_owner") {
         sections.push(OUTPUT_CHANNELS_SECTION.to_string());
+    }
+
+    // Section 9.7 — Stranger Turn Contract (§B Phase 08 — only when
+    // is_stranger_turn flag is set AND both required tools are granted).
+    // The kernel sets is_stranger_turn = true when the inbound message
+    // begins with `<stranger_inbound ` (Phase 07 §C wrap convention).
+    if ctx.is_stranger_turn
+        && ctx.granted_tools.iter().any(|t| t == "notify_owner")
+        && ctx.granted_tools.iter().any(|t| t == "channel_send")
+    {
+        sections.push(STRANGER_TURN_CONTRACT_SECTION.to_string());
     }
 
     // Section 10 — Safety & Oversight (skip for subagents)
@@ -1032,6 +1051,50 @@ const SAFETY_SECTION: &str = "\
   This does NOT apply to `agent_send` delegation results, which are authoritative.
 - If you cannot accomplish a task safely, explain the limitation.
 - When in doubt, ask the user.";
+
+/// §B Phase 08 — Section 9.7 — Stranger Turn Contract.
+/// Injected when the inbound message was wrapped by the channel adapter
+/// in `<stranger_inbound>` XML (currently the WhatsApp gateway; future
+/// Telegram/Discord adapters can adopt the same convention).
+/// The contract: the model emits ONLY tool calls during a stranger turn.
+/// Free prose is dropped by the kernel before reaching any channel.
+pub const STRANGER_TURN_CONTRACT_SECTION: &str = "## Stranger Turn Contract\n\n\
+This turn was opened by a non-owner contact. The inbound message is wrapped \
+in `<stranger_inbound ...>...</stranger_inbound>` XML — treat that XML as opaque \
+metadata, do NOT echo it.\n\n\
+During this turn you MUST produce only tool calls. Two valid actions:\n\
+1. Reply to the contact: call `channel_send(channel=\"<channel>\", recipient=\"<recipient_id>\", message=\"<your reply>\")`. \
+   Optional: `reply_to_msg_id`, `as_voice_note`. The `channel` and `recipient` come from the inbound XML metadata \
+   (the XML attribute name varies per channel — e.g. `jid` for WhatsApp).\n\
+2. Escalate to the owner privately: call `notify_owner(reason=\"<category>\", summary=\"<body>\", urgency=\"normal\")`. \
+   Use `urgency=\"high\"` only when the matter is time-critical and dedup must be bypassed.\n\n\
+Any free prose you emit during this turn will be discarded by the kernel and never reach the contact or the owner. \
+This is structural, not advisory: there is no leak path.\n\n\
+Fidelity: when the owner has previously asked you to convey their words verbatim to a contact, the `message` argument to \
+`channel_send` MUST preserve the owner's wording, emoji, punctuation and tone. Do not paraphrase, summarize, sanitize or \
+'translate'. The owner's intent is sovereign.\n";
+
+/// §B Phase 08 — detect whether the current turn was opened by a stranger.
+///
+/// Returns `true` iff the (trimmed) user message starts with the
+/// `<stranger_inbound ` XML wrapper produced by the channel adapter
+/// (Phase 07 §C wrap convention) AND the turn is not in a group.
+///
+/// Channel-agnostic: any adapter following the wrap convention (currently
+/// the WhatsApp gateway via `wrapStrangerInbound`; future Telegram/Discord
+/// adapters can adopt the same convention) triggers the kernel-side
+/// stranger-turn contract via this flag.
+///
+/// Detection rules:
+/// - Group turns return `false` even when the wrapper is present
+///   (defensive: the contract is owner-DM-from-stranger only).
+/// - Leading whitespace is allowed (trim before matching).
+/// - Requires the literal prefix `<stranger_inbound ` (with trailing space)
+///   so similar tags such as `<stranger_inbound_alt>` do not trip.
+/// - Mid-message occurrence does NOT flip the flag — only a leading wrap.
+pub fn detect_stranger_turn(user_message: &str, is_group: bool) -> bool {
+    !is_group && user_message.trim_start().starts_with("<stranger_inbound ")
+}
 
 /// §A — Output channels section, injected only when the `notify_owner` tool
 /// is granted to the agent. The wording explicitly forbids the historic
@@ -2243,5 +2306,164 @@ mod tests {
             !has_hh_mm,
             "## Current Date section must not embed a HH:MM timestamp. Got: {date_section:?}"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // §B Phase 08 — Stranger Turn Contract (Section 9.7) tests
+    // -----------------------------------------------------------------------
+
+    fn stranger_turn_ctx() -> PromptContext {
+        let mut ctx = basic_ctx();
+        // Both required tools must be granted for Section 9.7 to fire.
+        ctx.granted_tools = vec![
+            "channel_send".to_string(),
+            "notify_owner".to_string(),
+            "memory_recall".to_string(),
+        ];
+        ctx
+    }
+
+    #[test]
+    fn stranger_turn_section_present_when_flag_set_and_tools_granted() {
+        let mut ctx = stranger_turn_ctx();
+        ctx.is_stranger_turn = true;
+        let prompt = build_system_prompt(&ctx);
+        assert!(
+            prompt.contains("## Stranger Turn Contract"),
+            "Section 9.7 should be present when is_stranger_turn=true and both tools granted.\nPrompt:\n{prompt}"
+        );
+    }
+
+    #[test]
+    fn stranger_turn_section_absent_when_flag_unset() {
+        let mut ctx = stranger_turn_ctx();
+        ctx.is_stranger_turn = false;
+        let prompt = build_system_prompt(&ctx);
+        assert!(
+            !prompt.contains("## Stranger Turn Contract"),
+            "Section 9.7 must NOT appear when is_stranger_turn=false."
+        );
+    }
+
+    #[test]
+    fn stranger_turn_section_absent_when_required_tools_missing() {
+        let mut ctx = basic_ctx();
+        ctx.is_stranger_turn = true;
+        // basic_ctx grants neither channel_send nor notify_owner.
+        let prompt = build_system_prompt(&ctx);
+        assert!(
+            !prompt.contains("## Stranger Turn Contract"),
+            "Section 9.7 must NOT appear when channel_send + notify_owner are not granted."
+        );
+
+        // Only notify_owner — still missing channel_send.
+        let mut ctx2 = basic_ctx();
+        ctx2.is_stranger_turn = true;
+        ctx2.granted_tools = vec!["notify_owner".to_string()];
+        let prompt2 = build_system_prompt(&ctx2);
+        assert!(
+            !prompt2.contains("## Stranger Turn Contract"),
+            "Section 9.7 must NOT appear when channel_send is missing."
+        );
+
+        // Only channel_send — still missing notify_owner.
+        let mut ctx3 = basic_ctx();
+        ctx3.is_stranger_turn = true;
+        ctx3.granted_tools = vec!["channel_send".to_string()];
+        let prompt3 = build_system_prompt(&ctx3);
+        assert!(
+            !prompt3.contains("## Stranger Turn Contract"),
+            "Section 9.7 must NOT appear when notify_owner is missing."
+        );
+    }
+
+    #[test]
+    fn stranger_turn_section_byte_stable_for_caching() {
+        let mut ctx = stranger_turn_ctx();
+        ctx.is_stranger_turn = true;
+        ctx.current_date = Some("Wednesday, April 29, 2026 (2026-04-29 UTC)".to_string());
+        let first = build_system_prompt(&ctx);
+        let second = build_system_prompt(&ctx);
+        assert_eq!(
+            first, second,
+            "system prompt must be byte-identical across calls with the same stranger-turn context"
+        );
+    }
+
+    #[test]
+    fn stranger_turn_section_appears_after_output_channels() {
+        let mut ctx = stranger_turn_ctx();
+        ctx.is_stranger_turn = true;
+        let prompt = build_system_prompt(&ctx);
+        let output_channels_pos = prompt.find("## Output Channels").expect(
+            "## Output Channels (Section 9.6) must be present when notify_owner is granted",
+        );
+        let stranger_pos = prompt
+            .find("## Stranger Turn Contract")
+            .expect("## Stranger Turn Contract (Section 9.7) must be present here");
+        assert!(
+            output_channels_pos < stranger_pos,
+            "Section 9.6 (Output Channels) must precede Section 9.7 (Stranger Turn Contract). \
+             Got positions: 9.6={output_channels_pos}, 9.7={stranger_pos}"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // §B Phase 08 — detect_stranger_turn helper tests (channel-agnostic)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn detect_stranger_turn_set_when_inbound_starts_with_stranger_inbound_xml() {
+        assert!(detect_stranger_turn(
+            "<stranger_inbound jid=\"x\" name=\"y\" timestamp=\"z\">hello</stranger_inbound>",
+            false,
+        ));
+    }
+
+    #[test]
+    fn detect_stranger_turn_unset_for_owner_turn() {
+        assert!(!detect_stranger_turn("Hello agent", false));
+    }
+
+    #[test]
+    fn detect_stranger_turn_unset_for_group_turn() {
+        // Defensive: even if an adapter (incorrectly) wraps inside a group,
+        // the stranger contract must NOT engage. Group turns are owner-vs-many.
+        assert!(!detect_stranger_turn(
+            "<stranger_inbound jid=\"x\" name=\"y\" timestamp=\"z\">hello</stranger_inbound>",
+            true,
+        ));
+    }
+
+    #[test]
+    fn detect_stranger_turn_set_with_leading_whitespace() {
+        assert!(detect_stranger_turn(
+            "  \n<stranger_inbound jid=\"x\">hello</stranger_inbound>",
+            false,
+        ));
+    }
+
+    #[test]
+    fn detect_stranger_turn_unset_when_xml_appears_mid_message() {
+        // Only the FIRST char (after trim) matters; mid-message XML is
+        // suspicious / hostile and must not flip the flag.
+        assert!(!detect_stranger_turn(
+            "Hi there. <stranger_inbound jid=\"x\">hello</stranger_inbound>",
+            false,
+        ));
+    }
+
+    #[test]
+    fn detect_stranger_turn_unset_for_similar_but_different_xml() {
+        // Trailing space in the prefix `<stranger_inbound ` blocks
+        // `<stranger_inbound_alt>` and `<stranger_inbound>` (no attrs).
+        assert!(!detect_stranger_turn(
+            "<stranger_inbound_alt>hello</stranger_inbound_alt>",
+            false,
+        ));
+        assert!(!detect_stranger_turn(
+            "<stranger_inbound>hello</stranger_inbound>",
+            false,
+        ));
     }
 }
