@@ -1796,7 +1796,7 @@ async function startConnection() {
           // HOT-FIX (issue #41): never stream live to a stranger. The
           // streaming path edits `sender` (the stranger's chat) with each
           // cumulative chunk before the post-stream extractor splits
-          // [NOTIFY_OWNER] / [RELAY_TO_STRANGER] / owner-addressed prose.
+          // NOTIFY_OWNER / relay / owner-addressed prose.
           // Buffer the full response and let the post-stream dispatcher
           // route the cleaned text to the stranger and any [NOTIFY_OWNER]
           // payloads to the owner.
