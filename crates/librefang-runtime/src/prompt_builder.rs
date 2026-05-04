@@ -1062,17 +1062,26 @@ pub const STRANGER_TURN_CONTRACT_SECTION: &str = "## Stranger Turn Contract\n\n\
 This turn was opened by a non-owner contact. The inbound message is wrapped \
 in `<stranger_inbound ...>...</stranger_inbound>` XML — treat that XML as opaque \
 metadata, do NOT echo it.\n\n\
-During this turn you MUST produce only tool calls. Two valid actions:\n\
-1. Reply to the contact: call `channel_send(channel=\"<channel>\", recipient=\"<recipient_id>\", message=\"<your reply>\")`. \
-   Optional: `reply_to_msg_id`, `as_voice_note`. The `channel` and `recipient` come from the inbound XML metadata \
-   (the XML attribute name varies per channel — e.g. `jid` for WhatsApp).\n\
-2. Escalate to the owner privately: call `notify_owner(reason=\"<category>\", summary=\"<body>\", urgency=\"normal\")`. \
-   Use `urgency=\"high\"` only when the matter is time-critical and dedup must be bypassed.\n\n\
-Any free prose you emit during this turn will be discarded by the kernel and never reach the contact or the owner. \
-This is structural, not advisory: there is no leak path.\n\n\
-Fidelity: when the owner has previously asked you to convey their words verbatim to a contact, the `message` argument to \
-`channel_send` MUST preserve the owner's wording, emoji, punctuation and tone. Do not paraphrase, summarize, sanitize or \
-'translate'. The owner's intent is sovereign.\n";
+You MUST produce only tool calls during this turn. Free prose is discarded by the kernel \
+and never reaches the contact or the owner — this is structural, not advisory.\n\n\
+**Default action: respond autonomously.** Call `channel_send(channel=\"<channel>\", \
+recipient=\"<recipient_id>\", message=\"<your reply>\")` to reply directly to the contact. \
+Optional: `reply_to_msg_id`, `as_voice_note`. The `channel` and `recipient` come from the \
+inbound XML metadata (attribute name varies per channel — e.g. `jid` for WhatsApp).\n\n\
+You are autonomous: handle requests within your competence (questions, conversation, \
+information, scheduling, fitness/wellness advice, etc.) without asking the owner for \
+permission. Asking the owner what to say next is NOT a valid response — reply to the \
+contact instead. The owner configured you to handle these conversations on their behalf.\n\n\
+**Conditional action: `notify_owner(reason=\"<category>\", summary=\"<body>\", urgency=\"normal\")`** — \
+call this ONLY in addition to `channel_send`, and only when one of these conditions holds:\n\
+- The contact explicitly asks to relay a message to the owner or to ask the owner something.\n\
+- The matter requires the owner's personal decision (e.g. money transfers, identity \
+  verification, legal/contractual content) that you cannot decide on their behalf.\n\n\
+Use `urgency=\"high\"` only when time-critical and dedup must be bypassed. Do NOT call \
+`notify_owner` to seek permission — that contradicts your autonomy.\n\n\
+Fidelity: when the owner has previously asked you to convey their words verbatim to a contact, \
+the `message` argument to `channel_send` MUST preserve the owner's wording, emoji, punctuation \
+and tone. Do not paraphrase, summarize, sanitize or 'translate'. The owner's intent is sovereign.\n";
 
 /// §B Phase 08 — detect whether the current turn was opened by a stranger.
 ///
@@ -2405,6 +2414,58 @@ mod tests {
             output_channels_pos < stranger_pos,
             "Section 9.6 (Output Channels) must precede Section 9.7 (Stranger Turn Contract). \
              Got positions: 9.6={output_channels_pos}, 9.7={stranger_pos}"
+        );
+    }
+
+    /// §B Phase 08 — anti-bias contract: response autonomy.
+    ///
+    /// Per fork issue #44 comment 4372743129 (2026-05-04 Jessica fitness case):
+    /// listing `notify_owner` as a peer to `channel_send` induces a model bias
+    /// toward "ask the owner first" instead of replying autonomously. The
+    /// Section 9.7 wording MUST mark `channel_send` as the **default** action
+    /// and `notify_owner` as **conditional**, plus an explicit anti-bias rule.
+    #[test]
+    fn stranger_turn_section_marks_channel_send_as_default() {
+        let mut ctx = stranger_turn_ctx();
+        ctx.is_stranger_turn = true;
+        let prompt = build_system_prompt(&ctx);
+        let section = prompt
+            .split("## Stranger Turn Contract")
+            .nth(1)
+            .expect("Section 9.7 must be present");
+
+        // Default action language must be present and tied to channel_send.
+        assert!(
+            section.contains("Default action") || section.contains("default action"),
+            "Section 9.7 must label channel_send as the default action. Got: {section:?}"
+        );
+
+        // Conditional language must be present and tied to notify_owner.
+        assert!(
+            section.contains("Conditional action") || section.contains("conditional"),
+            "Section 9.7 must label notify_owner as conditional. Got: {section:?}"
+        );
+
+        // Anti-bias enforcement: the model must NOT use notify_owner as a
+        // permission-seeking shortcut. Wording flexible but key intent must
+        // surface. Accept any of the canonical anti-bias phrasings.
+        let anti_bias_present = section.contains("not a valid response")
+            || section.contains("contradicts your autonomy")
+            || section.contains("NOT to seek permission")
+            || section.contains("not to seek permission")
+            || section.contains("Asking the owner what to say next");
+        assert!(
+            anti_bias_present,
+            "Section 9.7 must include anti-bias wording forbidding notify_owner as a \
+             permission-seeking shortcut. Got: {section:?}"
+        );
+
+        // notify_owner usage must be gated on explicit conditions, not phrased
+        // as a peer alternative ("Two valid actions" was the buggy wording).
+        assert!(
+            !section.contains("Two valid actions"),
+            "Section 9.7 must NOT phrase channel_send and notify_owner as peers \
+             ('Two valid actions' is the bias-inducing phrasing). Got: {section:?}"
         );
     }
 
