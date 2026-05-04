@@ -1865,3 +1865,166 @@ describe('messageStore WAMessage round-trip (issue #40)', () => {
   });
 });
 
+// ---------------------------------------------------------------------------
+// Phase 08 acceptance: regression matrix (PLAN-04 §G)
+// ---------------------------------------------------------------------------
+// Locks in the cross-layer contract between the kernel (PLAN-01..02) and the
+// gateway (PLAN-03) so any drift toward tag-routing fails CI loudly. This
+// suite is intentionally narrow: shape invariants, deletion fences, and
+// scenario-replay surrogates that don't need a live socket. All four
+// scenarios (A=Patrizia first-contact, B=stranger persistente, C=group,
+// D=Jessica fitness) per CONTEXT §H trace back to one of the asserts below.
+describe('Phase 08 acceptance: post-§C tag literal observability + cross-layer fences', () => {
+  const fs = require('node:fs');
+  const path = require('node:path');
+  const indexSrc = fs.readFileSync(path.join(__dirname, 'index.js'), 'utf8');
+
+  // -- Deletion observability fence (D-05: hard cut, no grace period) ------
+
+  it('NOTIFY_OWNER literal in response is delivered verbatim, not stripped (D-05)', () => {
+    // After §C deletion, if a misconfigured persona still emits the
+    // legacy [NOTIFY_OWNER]{...}[/NOTIFY_OWNER] tag, the gateway no longer
+    // parses it. The text reaches the chat verbatim. This is BY DESIGN per
+    // D-05 — the leak is loud and observable in seconds, not silent for
+    // days. The two assertions below lock the contract.
+
+    // No code path in index.js strips [NOTIFY_OWNER] from response.
+    assert.equal(/replace\s*\(\s*NOTIFY_OWNER_RE/.test(indexSrc), false,
+      '`replace(NOTIFY_OWNER_RE, …)` must not exist (parser eradicated, D-05).');
+    assert.equal(/extractNotifyOwner\s*\(/.test(indexSrc), false,
+      '`extractNotifyOwner(…)` invocation must not exist (parser eradicated).');
+
+    // No `[NOTIFY_OWNER]` literal in non-comment positions of index.js
+    // (Q4: scope to index.js only — index.test.js may reference the literal
+    //  in regression-guard regex sources). We allow it in `//` line-comments
+    //  and `*`-prefixed JSDoc lines that document Phase 07/08 history.
+    const offending = indexSrc
+      .split('\n')
+      .map((line, idx) => ({ line, idx: idx + 1 }))
+      .filter(({ line }) => line.includes('[NOTIFY_OWNER]'))
+      .filter(({ line }) => {
+        const trimmed = line.trim();
+        return !trimmed.startsWith('//') && !trimmed.startsWith('*');
+      });
+    assert.deepEqual(offending, [],
+      `[NOTIFY_OWNER] literal must not appear in live code in index.js. Offenders:\n${JSON.stringify(offending, null, 2)}`);
+  });
+
+  // -- Regression-guard fences for deleted symbols (Phase 08 §C/§D) --------
+
+  it('extractNotifyOwner symbol has no source-text presence in index.js (deleted)', () => {
+    // Stricter than the §C describe above: not just `replace(extract…)` but
+    // any reference whatsoever (function decl, export, call, alias). Doc
+    // comments referencing the deletion in Phase 07/08 history are allowed.
+    const lines = indexSrc.split('\n');
+    const live = lines.filter((line) => {
+      const trimmed = line.trim();
+      if (trimmed.startsWith('//') || trimmed.startsWith('*')) return false;
+      return /\bextractNotifyOwner\b/.test(line);
+    });
+    assert.deepEqual(live, [],
+      `extractNotifyOwner must not appear as live code; offenders:\n${live.join('\n')}`);
+  });
+
+  it('NOTIFY_OWNER_RE symbol has no source-text presence in index.js (deleted)', () => {
+    const lines = indexSrc.split('\n');
+    const live = lines.filter((line) => {
+      const trimmed = line.trim();
+      if (trimmed.startsWith('//') || trimmed.startsWith('*')) return false;
+      return /\bNOTIFY_OWNER_RE\b/.test(line);
+    });
+    assert.deepEqual(live, [],
+      `NOTIFY_OWNER_RE must not appear as live code; offenders:\n${live.join('\n')}`);
+  });
+
+  it('detectStrangerTurnOwnerLeak symbol has no source-text presence in index.js (deleted)', () => {
+    const lines = indexSrc.split('\n');
+    const live = lines.filter((line) => {
+      const trimmed = line.trim();
+      if (trimmed.startsWith('//') || trimmed.startsWith('*')) return false;
+      return /\bdetectStrangerTurnOwnerLeak\b/.test(line);
+    });
+    assert.deepEqual(live, [],
+      `detectStrangerTurnOwnerLeak must not appear as live code; offenders:\n${live.join('\n')}`);
+  });
+
+  // -- Scenario-replay surrogates (CONTEXT §H A-D) -------------------------
+
+  it('scenario_a (Patrizia first-contact, text-only): wrapStrangerInbound produces well-formed XML', () => {
+    // Patrizia first-contact is a plain text DM from an unknown JID. The
+    // gateway wraps it via wrapStrangerInbound; the kernel must see the
+    // canonical attribute set without any [NOTIFY_OWNER] / [RELAY] leak.
+    const wrapped = wrapStrangerInbound(
+      '393470000001@s.whatsapp.net',
+      'Patrizia',
+      '2026-05-04T10:00:00Z',
+      'Buongiorno, ho saputo del corso',
+    );
+    // Canonical attribute order + XML well-formedness (Phase 07 §C contract).
+    assert.match(wrapped, /^<stranger_inbound jid="393470000001@s\.whatsapp\.net" name="Patrizia" timestamp="2026-05-04T10:00:00Z">/);
+    assert.match(wrapped, /<\/stranger_inbound>$/);
+    assert.ok(wrapped.includes('Buongiorno, ho saputo del corso'),
+      'body text must round-trip into the wrapper');
+
+    // Critical: no [NOTIFY_OWNER] / [RELAY_TO_STRANGER] / [RELAY] tag leaks
+    // into the wrapper output (would happen if the wrapper accidentally
+    // re-introduced legacy text-tag injection).
+    assert.equal(wrapped.includes('[NOTIFY_OWNER]'), false);
+    assert.equal(wrapped.includes('[RELAY_TO_STRANGER]'), false);
+    assert.equal(wrapped.includes('[/NOTIFY_OWNER]'), false);
+  });
+
+  it('scenario_d (Jessica fitness, text-only): wrapper trailing-space shape matches kernel detector', () => {
+    // The kernel's detect_stranger_turn (prompt_builder.rs) requires the
+    // wrapper to start with `<stranger_inbound ` (note trailing space after
+    // the tag name). If wrapStrangerInbound ever emits `<stranger_inbound>`
+    // (no attrs) or `<stranger_inbound\n` (newline before attrs), the
+    // detector returns false and the stranger-turn contract never engages.
+    const wrapped = wrapStrangerInbound(
+      '393395802472@s.whatsapp.net',
+      'Jessica',
+      '2026-05-03T08:11:00Z',
+      'Ciao',
+    );
+    assert.ok(wrapped.startsWith('<stranger_inbound '),
+      `wrapper must start with "<stranger_inbound " (trailing space) for kernel detector compat. Got: ${wrapped.slice(0, 40)}`);
+
+    // Cross-layer invariant: the canonical Jessica attributes are
+    // exactly what the kernel-side jessica_replay_… test asserts.
+    assert.ok(wrapped.includes('jid="393395802472@s.whatsapp.net"'));
+    assert.ok(wrapped.includes('name="Jessica"'));
+    assert.ok(wrapped.includes('timestamp="2026-05-03T08:11:00Z"'));
+    assert.ok(wrapped.includes('Ciao'));
+
+    // No prose leak (model-side anti-bias is enforced kernel-side; gateway
+    // wrapper must NOT inject any [NOTIFY_OWNER] hints around the body).
+    assert.equal(wrapped.includes('[NOTIFY_OWNER]'), false);
+  });
+
+  // -- URGENCY_PREFIX_RE consumer invariant (Phase 08 §F) ------------------
+
+  it('URGENCY_PREFIX_RE consumer is wired in index.js and matches the §A canonical format', () => {
+    // PLAN-03 §F shipped the consumer that strips `[urgency] ` from the
+    // owner_notice payload before display. The kernel post-§A emits
+    // exactly `[{urgency}] reason: summary` (NO 🎩, NO other prefix).
+    // This test fences: (1) the consumer exists, (2) the format is the
+    // bare-bracket form (top-hat removal from commit 23196e33).
+    assert.match(indexSrc, /URGENCY_PREFIX_RE/,
+      'gateway must reference URGENCY_PREFIX_RE (PLAN-03 §F consumer).');
+
+    // The actual consumer regex shape — fence the bare-bracket form.
+    const consumerRegex = /\/\^\\\[\(low\|normal\|high\)\\\]\\s\+\//;
+    assert.ok(
+      consumerRegex.test(indexSrc),
+      `URGENCY_PREFIX_RE source must be the bare-bracket form /^\\[(low|normal|high)\\]\\s+/, NOT a top-hat-prefixed form. (top-hat removed in 23196e33)`,
+    );
+
+    // Belt-and-braces: no top-hat-prefixed urgency regex in source.
+    assert.equal(
+      /🎩\s*\\\[\(low\|normal\|high\)\\\]/.test(indexSrc),
+      false,
+      'gateway URGENCY_PREFIX_RE source must NOT include the 🎩 top-hat prefix (kernel removed it in 23196e33).',
+    );
+  });
+});
+

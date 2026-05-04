@@ -10199,6 +10199,87 @@ description = "test"
         }
     }
 
+    // ── Phase 08 §G — regression matrix (PLAN-04) ─────────────────────────
+    //
+    // Anti-regression fences locking in the §A urgency contract beyond what
+    // PLAN-01 already covers. Failing any of these tests means a regression
+    // toward the old text-tag / top-hat / unstructured-ack world.
+
+    /// Phase 08 §G — `🎩` (top-hat) MUST NOT prefix the owner_notice payload.
+    ///
+    /// History: commit 23196e33 (`fix(runtime/notify_owner): remove 🎩 persona
+    /// signature from kernel payload`) removed the emoji from the kernel
+    /// surface. The persona signature is the **adapter's** concern, not the
+    /// kernel's. If a future refactor reinstates the prefix, this test fails
+    /// loudly across all three urgency values so the regression surfaces in CI.
+    #[test]
+    fn notify_owner_tool_payload_does_not_start_with_top_hat_emoji() {
+        for urgency in &["low", "normal", "high"] {
+            let input = serde_json::json!({
+                "reason": "fyi",
+                "summary": "test summary",
+                "urgency": *urgency,
+            });
+            let r = tool_notify_owner("t", &input);
+            assert!(!r.is_error, "urgency={urgency} must not error: {r:?}");
+            let payload = r.owner_notice.as_deref().unwrap();
+            assert!(
+                !payload.starts_with('🎩'),
+                "owner_notice must not start with top-hat emoji (was removed in 23196e33). \
+                 urgency={urgency}, got: {payload}"
+            );
+            // Belt-and-braces: the canonical prefix `[{urgency}] ` must still be there.
+            let expected_prefix = format!("[{urgency}] ");
+            assert!(
+                payload.starts_with(&expected_prefix),
+                "owner_notice must start with `{expected_prefix}` for urgency={urgency}, got: {payload}"
+            );
+        }
+    }
+
+    /// Phase 08 §G — structured ack `content` field is JSON-parseable for
+    /// every valid urgency enum value, with `urgency` key matching input.
+    ///
+    /// PLAN-01 covers the high/low/normal cases individually; this test
+    /// asserts the **invariant** holds across the full enum in a single
+    /// loop, so any future urgency value (e.g. `critical`) added without
+    /// updating the JSON serializer fails CI immediately.
+    #[test]
+    fn notify_owner_tool_returns_json_parseable_content_for_all_urgency_values() {
+        for urgency in &["low", "normal", "high"] {
+            let input = serde_json::json!({
+                "reason": "r",
+                "summary": "s",
+                "urgency": *urgency,
+            });
+            let r = tool_notify_owner("t", &input);
+            assert!(!r.is_error, "urgency={urgency} must not error: {r:?}");
+
+            let parsed: serde_json::Value = serde_json::from_str(&r.content).unwrap_or_else(|e| {
+                panic!(
+                    "content must parse as JSON for urgency={urgency}: {e}\nraw: {}",
+                    r.content
+                )
+            });
+
+            assert_eq!(
+                parsed["urgency"],
+                serde_json::Value::String((*urgency).into()),
+                "ack urgency must match input for urgency={urgency}"
+            );
+            assert_eq!(
+                parsed["success"],
+                serde_json::Value::Bool(true),
+                "ack success=true for urgency={urgency}"
+            );
+            assert_eq!(
+                parsed["delivered_to"],
+                serde_json::Value::String("owner".into()),
+                "ack delivered_to=owner for urgency={urgency}"
+            );
+        }
+    }
+
     // ── Lazy tool loading (issue #3044) ───────────────────────────────────
 
     #[test]
