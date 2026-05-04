@@ -878,90 +878,37 @@ function wrapStrangerInbound(jid, pushName, isoTimestamp, text, opts = {}) {
 }
 
 // ---------------------------------------------------------------------------
-// Step C: Parse NOTIFY_OWNER tags from agent response
-// ---------------------------------------------------------------------------
-const NOTIFY_OWNER_RE = /\[NOTIFY_OWNER\]\s*(\{[\s\S]*?\})\s*\[\/NOTIFY_OWNER\]/g;
-
-function extractNotifyOwner(responseText) {
-  const notifications = [];
-  for (const match of responseText.matchAll(NOTIFY_OWNER_RE)) {
-    try {
-      const parsed = JSON.parse(match[1]);
-      notifications.push({
-        reason: parsed.reason || 'unknown',
-        summary: parsed.summary || '',
-      });
-    } catch {
-      console.error('[gateway] Failed to parse NOTIFY_OWNER JSON:', match[1]);
-    }
-  }
-  // §A — legacy text-tag path is kept one release for compatibility, but
-  // every hit is loud-logged so callers can migrate to the typed
-  // `notify_owner` tool. Suppressed when the new envelope already routed
-  // the same payload (caller checks collectedOwnerNotices first).
-  if (notifications.length > 0) {
-    console.warn('[gateway][deprecated] NOTIFY_OWNER text tag detected; migrate to the notify_owner LLM tool. Hits:', notifications.length);
-  }
-  const cleanedText = responseText.replace(NOTIFY_OWNER_RE, '').trim();
-  return { notifications, cleanedText };
-}
-
-// ---------------------------------------------------------------------------
-// Issue #42: stranger-turn owner-prose leak detector.
+// Phase 08 §C — [NOTIFY_OWNER] text-tag parser ERADICATED.
 //
-// During a turn opened by a stranger, the model is supposed to address the
-// stranger only — owner notifications go via [NOTIFY_OWNER]. If the model
-// leaks owner-addressed prose ("Signore, …"), raw REST acks ({"success":true}),
-// or gateway internals into the plain response, this would be sent verbatim
-// to the stranger by the dispatch site. The patterns below are conservative
-// (high-precision, low-recall) markers that strongly imply the text was meant
-// for the owner, not the stranger. When detected, the dispatch site drops the
-// matching segments from the stranger payload and routes them to the owner via
-// a synthesized leak_redirect notification.
+// Removed: NOTIFY_OWNER_RE, extractNotifyOwner.
+//
+// Owner notifications now flow exclusively through the typed `owner_notice`
+// SSE event emitted by the kernel `notify_owner` MCP tool (Phase 08 §A,
+// hardened in PLAN-01). The gateway consumes that event via the
+// `onOwnerNotice` callback wired into `forwardToLibreFangStreaming` and
+// fans out to OWNER_JIDS at the post-stream block below.
+//
+// D-05 hard cut: no compatibility shim, no fallback parser. Persona prompts
+// that still emit `[NOTIFY_OWNER]{...}[/NOTIFY_OWNER]` literal text will
+// deliver that text verbatim to the recipient until the persona is updated
+// (Phase 08 §H deployment note).
 // ---------------------------------------------------------------------------
-const OWNER_LEAK_PATTERNS = [
-  { name: 'direct_address_signore', re: /\b(Signore|Padrone)\b\s*[,!.\?:;]/i },
-  { name: 'rest_success_ack', re: /\{["']?success["']?\s*:\s*true/ },
-  { name: 'gateway_rest_mention', re: /\b(gateway|REST)\b[^.]{0,40}\/message\/send/i },
-];
 
-function detectStrangerTurnOwnerLeak(text) {
-  if (!text || typeof text !== 'string') {
-    return { detected: false, residual: text || '', leaked: '', marker: null, excerpt: '' };
-  }
-  // Split into sentences/paragraphs and classify each independently so a
-  // legitimate stranger-addressed sentence isn't dropped along with a leaky
-  // one. Conservative split on newlines + sentence terminators.
-  const segments = text
-    .split(/(?<=[.!?])\s+|\n+/)
-    .map((s) => s.trim())
-    .filter((s) => s.length > 0);
-  if (segments.length === 0) {
-    return { detected: false, residual: text, leaked: '', marker: null, excerpt: '' };
-  }
-  const safe = [];
-  const leaked = [];
-  let firstMarker = null;
-  for (const seg of segments) {
-    const hit = OWNER_LEAK_PATTERNS.find((p) => p.re.test(seg));
-    if (hit) {
-      leaked.push(seg);
-      if (!firstMarker) firstMarker = hit.name;
-    } else {
-      safe.push(seg);
-    }
-  }
-  if (leaked.length === 0) {
-    return { detected: false, residual: text, leaked: '', marker: null, excerpt: '' };
-  }
-  return {
-    detected: true,
-    residual: safe.join(' ').trim(),
-    leaked: leaked.join(' ').trim(),
-    marker: firstMarker,
-    excerpt: leaked.join(' ').slice(0, 120),
-  };
-}
+// ---------------------------------------------------------------------------
+// Phase 08 §D — detectStrangerTurnOwnerLeak regex defense ERADICATED.
+//
+// Removed: OWNER_LEAK_PATTERNS, detectStrangerTurnOwnerLeak.
+//
+// The Phase 08 §B kernel-level stranger-turn contract (Section 9.7,
+// PLAN-02) structurally enforces tool-only output during a stranger turn:
+// the model emits `channel_send` / `notify_owner` tool calls, no free
+// prose ever reaches the stranger dispatch site. The regex bandage from
+// issue #42 hot-fix (commit 18d9e3c5) is therefore redundant and removed.
+//
+// Bonus: eliminates false-positive risk on legitimate stranger replies
+// containing the literals "Signore", "/message/send", or `{"success":true}`
+// quoted verbatim by the model.
+// ---------------------------------------------------------------------------
 
 // ---------------------------------------------------------------------------
 // Silent-response sentinel — gateway-side mirror of the canonical Rust
@@ -1793,21 +1740,20 @@ async function startConnection() {
         let streamMsgKey = null; // key of the initial WhatsApp message we'll edit
         const onProgress = async (partialText) => {
           if (!sock) return;
-          // HOT-FIX (issue #41): never stream live to a stranger. The
-          // streaming path edits `sender` (the stranger's chat) with each
-          // cumulative chunk before the post-stream extractor splits
-          // NOTIFY_OWNER / relay / owner-addressed prose.
-          // Buffer the full response and let the post-stream dispatcher
-          // route the cleaned text to the stranger and any [NOTIFY_OWNER]
-          // payloads to the owner.
-          if (isStranger) return;
-          // Strip internal tags before sending partial text to WhatsApp.
-          // Bail early if no brackets — most chunks won't contain tags.
+          // Phase 08 §E: removed `if (isStranger) return;` early-return
+          // (issue #41 hot-fix from commit 11adcd8a). Now redundant: the
+          // §B Section 9.7 kernel contract forces tool-only output during a
+          // stranger turn, so no prose ever reaches this onProgress callback
+          // for a stranger anyway. Removing the early-return restores
+          // pre-#41 streaming behaviour for owner / group turns (no
+          // regression — owner streaming was working before #41).
+          //
+          // Phase 08 §C: removed NOTIFY_OWNER_RE strip — the [NOTIFY_OWNER]
+          // text-tag parser was eradicated entirely. The `[no reply needed]`
+          // strip is preserved (separate canonical sentinel).
           let cleaned = partialText;
-          if (cleaned.includes('[NOTIFY_OWNER]') || cleaned.includes('[no reply needed]')) {
-            cleaned = cleaned
-              .replace(NOTIFY_OWNER_RE, '')
-              .replace(/\[no reply needed\]/gi, '');
+          if (cleaned.includes('[no reply needed]')) {
+            cleaned = cleaned.replace(/\[no reply needed\]/gi, '');
           }
           // OB-07 hold-back gate: until we have already established a
           // visible WhatsApp message (streamMsgKey != null), refuse to
@@ -1865,6 +1811,22 @@ async function startConnection() {
         // OB-01: happens regardless of whether a public reply will be sent
         // below; the owner receives the private payload even when the model
         // elects to stay silent in the source chat.
+        //
+        // Phase 08 §F — parse `[urgency]` prefix from owner_notice payloads.
+        //   Format emitted by kernel `notify_owner` (Phase 08 §A, PLAN-01):
+        //     "[{urgency}] {reason}: {summary}"
+        //     where urgency ∈ {low, normal, high}.
+        //   When prefix is `[high]`, the gateway COULD bypass dedup (D-04).
+        //   In current fork/custom there is NO dedup gate on the
+        //   `collectedOwnerNotices` fan-out — `shouldDebounceEscalation`
+        //   was called only inside the legacy `[NOTIFY_OWNER]` loop deleted
+        //   by §C above. So the urgency parsing here is TELEMETRY ONLY:
+        //   we log the urgency level for observability, strip the `[urgency]`
+        //   prefix from the displayed text so the owner sees a clean line,
+        //   and treat the absence of a prefix as `normal` (BC-safe).
+        //   D-04's "bypass on high" is a structural no-op until/unless a
+        //   future dedup gate is added on this code path.
+        const URGENCY_PREFIX_RE = /^\[(low|normal|high)\]\s+/;
         if (OWNER_CHANNEL_ENABLED && collectedOwnerNotices.length > 0) {
           if (OWNER_JIDS.size === 0) {
             console.log(JSON.stringify({
@@ -1875,18 +1837,24 @@ async function startConnection() {
             }));
           } else {
             for (const noticeText of collectedOwnerNotices) {
+              const m = URGENCY_PREFIX_RE.exec(noticeText);
+              const urgency = m ? m[1] : 'normal';
+              const displayText = m
+                ? noticeText.replace(URGENCY_PREFIX_RE, '')
+                : noticeText;
               for (const ownerJid of OWNER_JIDS) {
                 try {
-                  await sock.sendMessage(ownerJid, { text: noticeText });
+                  await sock.sendMessage(ownerJid, { text: displayText });
                 } catch (e) {
                   console.error(`[gateway] owner_notify send failed to ${ownerJid}: ${e.message}`);
                 }
               }
               console.log(JSON.stringify({
                 event: 'owner_notify',
+                urgency,
                 target_jids: [...OWNER_JIDS],
                 source_chat: sender,
-                bytes: noticeText.length,
+                bytes: displayText.length,
               }));
             }
           }
@@ -1912,59 +1880,23 @@ async function startConnection() {
 
         if (response && sock) {
           if (isStranger) {
-            // Step C: Agent response goes to STRANGER, not owner
-            const { notifications, cleanedText } = extractNotifyOwner(response);
+            // Phase 08 §C/§D: extractNotifyOwner deleted (typed owner_notice
+            // channel via `notify_owner` MCP tool is the only owner-notify
+            // path now — see PLAN-01 hardening). detectStrangerTurnOwnerLeak
+            // deleted (Section 9.7 kernel stranger-turn contract enforces
+            // tool-only output, see PLAN-02). The owner notifications loop
+            // that followed has been removed as dead code: notifications no
+            // longer accumulate here, they arrive via the typed channel
+            // fan-out at the `collectedOwnerNotices` block above.
+            const strangerSafeText = response;
 
-            // Issue #42: detect owner-addressed prose that the model leaked into
-            // a stranger turn (direct address "Signore"/"Padrone", raw REST acks,
-            // gateway internals). Redirect to owner via NOTIFY_OWNER instead of
-            // delivering to the stranger.
-            const leak = detectStrangerTurnOwnerLeak(cleanedText);
-            const strangerSafeText = leak.detected ? leak.residual : cleanedText;
-
-            if (leak.detected) {
-              try {
-                console.log(JSON.stringify({
-                  event: 'stranger_turn_leak_redirect',
-                  chat_jid: sender,
-                  push_name: pushName,
-                  marker: leak.marker,
-                  excerpt: leak.excerpt,
-                }));
-              } catch { /* noop */ }
-              // Synthesize a leak_redirect notification for the owner with the
-              // text that would have leaked. Joins the regular notifications[]
-              // pipeline so it inherits dedup, escalation, and delivery.
-              notifications.push({
-                reason: 'leak_redirect',
-                summary: `[leak_redirect ${pushName}] ${leak.leaked.slice(0, 600)}`,
-              });
-            }
-
-            // Send cleaned response to the stranger (format after tag extraction)
             if (strangerSafeText && strangerSafeText.trim()) {
               const formattedText = markdownToWhatsApp(strangerSafeText);
               const sentKey = await sendOrEdit(sender, formattedText);
-              console.log(`[gateway] Replied to stranger ${pushName} (${phone})${streamMsgKey ? ' (streamed)' : ''}${leak.detected ? ' (leak_redirected)' : ''}`);
+              console.log(`[gateway] Replied to stranger ${pushName} (${phone})${streamMsgKey ? ' (streamed)' : ''}`);
 
               // Save outbound to DB
               dbSaveMessage({ id: sentKey?.id || randomUUID(), jid: sender, senderJid: ownJid, pushName: null, phone, text: strangerSafeText, direction: 'outbound', timestamp: Date.now(), processed: 1, rawType: 'text' });
-            }
-
-            // Step C + F: If NOTIFY_OWNER tags found, send notification to owner
-            for (const notif of notifications) {
-              // F: Escalation deduplication
-              if (shouldDebounceEscalation(sender)) {
-                console.log(`[gateway] Debounced escalation for ${pushName} — skipping duplicate notification`);
-                continue;
-              }
-
-              const ownerNotif = notif.summary || `[${pushName}] ${notif.reason}`;
-
-              // Send notification to primary owner
-              await sock.sendMessage(OWNER_JID, { text: ownerNotif });
-              if (ECHO_TRACKER_ENABLED) echoTracker.track(ownerNotif);
-              console.log(`[gateway] NOTIFY_OWNER sent for ${pushName}: ${notif.reason}`);
             }
 
           } else if (isOwner && !isGroup) {
@@ -3225,8 +3157,8 @@ process.on('SIGTERM', () => gracefulShutdown('SIGTERM'));
 // Export for testing
 module.exports = {
   markdownToWhatsApp,
-  extractNotifyOwner,
-  detectStrangerTurnOwnerLeak,
+  // Phase 08 §C — extractNotifyOwner removed (text-tag parser eradicated).
+  // Phase 08 §D — detectStrangerTurnOwnerLeak removed (regex bandage eradicated).
   // Phase 07 §C — inbound stranger XML wrap (testing + introspection)
   wrapStrangerInbound,
   xmlAttrEscape,
