@@ -1072,7 +1072,7 @@ describe('§A owner_notify channel', () => {
   it('Test 1: forwardToLibreFang surfaces owner_notice via onOwnerNotice callback', async () => {
     nextResponse = {
       response: 'Public reply to chat',
-      owner_notice: '🎩 confirmation_needed: Caterina has asked for confirmation',
+      owner_notice: '[normal] confirmation_needed: Caterina has asked for confirmation',
     };
     const captured = [];
     const reply = await forwardToLibreFang(
@@ -1452,14 +1452,14 @@ describe('isSilentResponse', () => {
   });
 
   it('matches sentinels glued to emojis', () => {
-    assert.equal(isSilentResponse('NO_REPLY🎩'), true);
+    assert.equal(isSilentResponse('NO_REPLY✓'), true);
     assert.equal(isSilentResponse('NO_REPLY 😐'), true);
   });
 
   it('matches sentinels at the trailing position after context', () => {
     assert.equal(isSilentResponse('Tutto bene, Signore.\nNO_REPLY'), true);
     assert.equal(isSilentResponse('Some context. [no reply needed]'), true);
-    assert.equal(isSilentResponse('...a Sua disposizione. 🎩NO_REPLY'), true);
+    assert.equal(isSilentResponse('...at your service. ✓NO_REPLY'), true);
   });
 
   it('does not match empty / whitespace-only / normal text', () => {
