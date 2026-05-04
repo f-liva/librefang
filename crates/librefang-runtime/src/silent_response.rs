@@ -221,7 +221,7 @@ mod tests {
     fn glued_to_emoji() {
         // The emoji is stripped as trailing non-ASCII, leaving the sentinel.
         assert!(is_silent_response("NO_REPLY 😐"));
-        assert!(is_silent_response("NO_REPLY🎩"));
+        assert!(is_silent_response("NO_REPLY✓"));
     }
 
     // --- Trailing-suffix legacy compatibility ---
@@ -230,7 +230,7 @@ mod tests {
         assert!(is_silent_response("Let me think.\nNO_REPLY"));
         assert!(is_silent_response("I'll stay quiet. NO_REPLY"));
         assert!(is_silent_response("Some context. [no reply needed]"));
-        assert!(is_silent_response("...a Sua disposizione. 🎩NO_REPLY"));
+        assert!(is_silent_response("...at your service. ✓NO_REPLY"));
     }
 
     // --- Negatives ---
