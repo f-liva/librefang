@@ -15,8 +15,6 @@ process.env.LIBREFANG_URL = `http://127.0.0.1:${MOCK_LIBREFANG_PORT}`;
 
 const {
   markdownToWhatsApp,
-  extractNotifyOwner,
-  detectStrangerTurnOwnerLeak,
   // Phase 07 §C — inbound stranger XML wrap
   wrapStrangerInbound,
   xmlAttrEscape,
@@ -135,102 +133,145 @@ describe('markdownToWhatsApp', () => {
 });
 
 // ---------------------------------------------------------------------------
-// extractNotifyOwner
+// Phase 08 §C: [NOTIFY_OWNER] text-tag parser eradication
 // ---------------------------------------------------------------------------
-describe('extractNotifyOwner', () => {
-  it('extracts a single notification', () => {
-    const text = 'Hello! [NOTIFY_OWNER]{"reason":"urgent","summary":"needs help"}[/NOTIFY_OWNER] Bye!';
-    const { notifications, cleanedText } = extractNotifyOwner(text);
-    assert.equal(notifications.length, 1);
-    assert.equal(notifications[0].reason, 'urgent');
-    assert.equal(notifications[0].summary, 'needs help');
-    assert.match(cleanedText, /^Hello!\s+Bye!$/);
+// extractNotifyOwner + NOTIFY_OWNER_RE were deleted. Owner notifications now
+// flow exclusively through the typed `owner_notice` SSE event. These guards
+// fail fast if the parser sneaks back in.
+describe('Phase 08 §C: [NOTIFY_OWNER] text-tag parser eradication', () => {
+  const fs = require('node:fs');
+  const path = require('node:path');
+  const indexSrc = fs.readFileSync(path.join(__dirname, 'index.js'), 'utf8');
+
+  it('extractNotifyOwner export MUST NOT exist (deleted)', () => {
+    const gw = require('./index.js');
+    assert.equal(gw.extractNotifyOwner, undefined);
   });
 
-  it('extracts multiple notifications', () => {
-    const text = '[NOTIFY_OWNER]{"reason":"a","summary":"x"}[/NOTIFY_OWNER] middle [NOTIFY_OWNER]{"reason":"b","summary":"y"}[/NOTIFY_OWNER]';
-    const { notifications, cleanedText } = extractNotifyOwner(text);
-    assert.equal(notifications.length, 2);
-    assert.equal(notifications[0].reason, 'a');
-    assert.equal(notifications[1].reason, 'b');
-    assert.equal(cleanedText, 'middle');
+  it('NOTIFY_OWNER_RE identifier MUST NOT appear as a JS const in index.js', () => {
+    // Comment references documenting the deletion are allowed; an actual
+    // declaration is not. We grep for the assignment shape.
+    assert.equal(/const\s+NOTIFY_OWNER_RE\s*=/.test(indexSrc), false);
   });
 
-  it('returns empty array when no tags present', () => {
-    const { notifications, cleanedText } = extractNotifyOwner('Just a normal message');
-    assert.equal(notifications.length, 0);
-    assert.equal(cleanedText, 'Just a normal message');
+  it('extractNotifyOwner function definition MUST NOT exist', () => {
+    assert.equal(/function\s+extractNotifyOwner\s*\(/.test(indexSrc), false);
   });
 
-  it('handles malformed JSON gracefully', () => {
-    const text = '[NOTIFY_OWNER]{bad json}[/NOTIFY_OWNER] ok';
-    const { notifications, cleanedText } = extractNotifyOwner(text);
-    assert.equal(notifications.length, 0);
-    assert.equal(cleanedText, 'ok');
-  });
-
-  it('defaults missing fields', () => {
-    const text = '[NOTIFY_OWNER]{}[/NOTIFY_OWNER]';
-    const { notifications } = extractNotifyOwner(text);
-    assert.equal(notifications[0].reason, 'unknown');
-    assert.equal(notifications[0].summary, '');
-  });
-
-  it('works correctly when called twice in succession (no lastIndex bug)', () => {
-    const text = 'A [NOTIFY_OWNER]{"reason":"r1"}[/NOTIFY_OWNER] B';
-    const r1 = extractNotifyOwner(text);
-    const r2 = extractNotifyOwner(text);
-    assert.equal(r1.notifications.length, 1);
-    assert.equal(r2.notifications.length, 1);
+  it('console.warn deprecation message MUST NOT appear', () => {
+    assert.equal(
+      indexSrc.includes('migrate to the notify_owner LLM tool'),
+      false,
+    );
   });
 });
 
 // ---------------------------------------------------------------------------
-// detectStrangerTurnOwnerLeak (issue #42)
+// Phase 08 §D: detectStrangerTurnOwnerLeak regex bandage eradication
 // ---------------------------------------------------------------------------
-describe('detectStrangerTurnOwnerLeak', () => {
-  it('returns detected=false on empty / null input', () => {
-    assert.equal(detectStrangerTurnOwnerLeak('').detected, false);
-    assert.equal(detectStrangerTurnOwnerLeak(null).detected, false);
-    assert.equal(detectStrangerTurnOwnerLeak(undefined).detected, false);
+// The regex bandage from issue #42 hot-fix (commit 18d9e3c5) is replaced
+// structurally by the §B kernel stranger-turn contract (Section 9.7).
+describe('Phase 08 §D: detectStrangerTurnOwnerLeak regex bandage eradication', () => {
+  const fs = require('node:fs');
+  const path = require('node:path');
+  const indexSrc = fs.readFileSync(path.join(__dirname, 'index.js'), 'utf8');
+
+  it('detectStrangerTurnOwnerLeak export MUST NOT exist (deleted)', () => {
+    const gw = require('./index.js');
+    assert.equal(gw.detectStrangerTurnOwnerLeak, undefined);
   });
 
-  it('passes through stranger-safe prose untouched', () => {
-    const text = 'Buongiorno Jessica! Come posso aiutarLa? Resto a Sua disposizione.';
-    const r = detectStrangerTurnOwnerLeak(text);
-    assert.equal(r.detected, false);
-    assert.equal(r.residual, text);
+  it('detectStrangerTurnOwnerLeak function definition MUST NOT exist', () => {
+    assert.equal(/function\s+detectStrangerTurnOwnerLeak\s*\(/.test(indexSrc), false);
   });
 
-  it('detects direct address to Signore', () => {
-    const text = 'Recapitato a Jessica, Signore. Tutto a posto.';
-    const r = detectStrangerTurnOwnerLeak(text);
-    assert.equal(r.detected, true);
-    assert.equal(r.marker, 'direct_address_signore');
-    assert.match(r.leaked, /Signore/);
+  it('OWNER_LEAK_PATTERNS const MUST NOT exist', () => {
+    assert.equal(/const\s+OWNER_LEAK_PATTERNS\s*=/.test(indexSrc), false);
   });
 
-  it('detects raw REST success ack', () => {
-    const text = 'Inviato. Risposta del gateway: {"success":true,"message":"Sent"}';
-    const r = detectStrangerTurnOwnerLeak(text);
-    assert.equal(r.detected, true);
-    assert.equal(r.marker, 'rest_success_ack');
+  it('stranger_turn_leak_redirect log event MUST NOT appear', () => {
+    assert.equal(indexSrc.includes('stranger_turn_leak_redirect'), false);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Phase 08 §E: streaming-to-stranger hotfix eradication
+// ---------------------------------------------------------------------------
+// `if (isStranger) return;` early-return at the top of onProgress (issue #41
+// hot-fix from commit 11adcd8a) is now redundant: the §B kernel contract
+// makes prose-during-stranger-turn structurally impossible.
+describe('Phase 08 §E: streaming-to-stranger hotfix eradication', () => {
+  const fs = require('node:fs');
+  const path = require('node:path');
+  const indexSrc = fs.readFileSync(path.join(__dirname, 'index.js'), 'utf8');
+
+  it('onProgress MUST NOT contain `if (isStranger) return;` as live code', () => {
+    // Strip line-comments before checking, so the block-comment that
+    // documents the historical removal does not match.
+    const stripped = indexSrc
+      .split('\n')
+      .map((l) => l.replace(/\/\/.*$/, ''))
+      .join('\n');
+    assert.equal(/if\s*\(\s*isStranger\s*\)\s*return\s*;/.test(stripped), false);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Phase 08 §F: owner_notice [urgency] prefix routing (telemetry)
+// ---------------------------------------------------------------------------
+// Kernel `notify_owner` (Phase 08 §A, PLAN-01) emits owner_notice payloads
+// prefixed with "[{urgency}] " where urgency ∈ {low, normal, high}.
+// The gateway parses + strips the prefix before delivery and logs the
+// urgency in the structured owner_notify event for observability.
+describe('Phase 08 §F: owner_notice [urgency] prefix routing', () => {
+  const URGENCY_PREFIX_RE = /^\[(low|normal|high)\]\s+/;
+
+  it('strips [normal] prefix from displayed owner text', () => {
+    const incoming = '[normal] new_contact: Jessica scrive: Ciao';
+    const m = URGENCY_PREFIX_RE.exec(incoming);
+    assert.notEqual(m, null);
+    assert.equal(m[1], 'normal');
+    assert.equal(
+      incoming.replace(URGENCY_PREFIX_RE, ''),
+      'new_contact: Jessica scrive: Ciao',
+    );
   });
 
-  it('separates leaked sentences from safe ones', () => {
-    const text = 'Buongiorno Jessica, grazie del messaggio. Recapitato, Signore. Resto in ascolto.';
-    const r = detectStrangerTurnOwnerLeak(text);
-    assert.equal(r.detected, true);
-    assert.match(r.residual, /Buongiorno Jessica/);
-    assert.match(r.residual, /Resto in ascolto/);
-    assert.doesNotMatch(r.residual, /Signore/);
-    assert.match(r.leaked, /Signore/);
+  it('parses [high] urgency for telemetry routing', () => {
+    const incoming = '[high] panic: server is on fire';
+    const m = URGENCY_PREFIX_RE.exec(incoming);
+    assert.notEqual(m, null);
+    assert.equal(m[1], 'high');
   });
 
-  it('does not flag the word "signore" inside ordinary prose without direct-address punctuation', () => {
-    const text = 'Il signore con cui lavoro Le scriverà domani';
-    const r = detectStrangerTurnOwnerLeak(text);
-    assert.equal(r.detected, false);
+  it('parses [low] urgency for telemetry routing', () => {
+    const incoming = '[low] heads_up: minor anomaly';
+    const m = URGENCY_PREFIX_RE.exec(incoming);
+    assert.notEqual(m, null);
+    assert.equal(m[1], 'low');
+  });
+
+  it('treats unprefixed payload as normal (BC-safe)', () => {
+    const incoming = 'some_old_format: text without prefix';
+    const m = URGENCY_PREFIX_RE.exec(incoming);
+    assert.equal(m, null);
+  });
+
+  it('does NOT match a top-hat prefix (Phase 08 §A removed the 🎩)', () => {
+    // Kernel post-§A emits "[urgency] reason: summary" — NOT "🎩 [urgency] …".
+    // Belt-and-braces fence: if a future change reintroduces the top-hat,
+    // this assertion fails fast.
+    const incoming = '🎩 [normal] new_contact: foo';
+    const m = URGENCY_PREFIX_RE.exec(incoming);
+    assert.equal(m, null);
+  });
+
+  it('source MUST contain URGENCY_PREFIX_RE consumer', () => {
+    const fs = require('node:fs');
+    const path = require('node:path');
+    const indexSrc = fs.readFileSync(path.join(__dirname, 'index.js'), 'utf8');
+    assert.match(indexSrc, /URGENCY_PREFIX_RE/);
+    assert.match(indexSrc, /urgency/);
   });
 });
 
@@ -845,15 +886,18 @@ describe('echo tracker wiring (Phase 3 §A)', () => {
     assert.match(src, /\.slice\(0,\s*80\)/);
   });
 
-  it('outbound wire-in covers all 6 text sendMessage sites', () => {
+  it('outbound wire-in covers all 5 text sendMessage sites', () => {
     // Phase 07 §F dropped the relay outbound site (executeRelay's
-    // sock.sendMessage), bringing the outbound text-emission count from
-    // 7 down to 6. PLAN-02 §B (channel_send WhatsApp extension) will
-    // re-introduce a routed delivery site and bump this back up.
+    // sock.sendMessage): 7 → 6.
+    // Phase 08 §C dropped the legacy [NOTIFY_OWNER] dispatch
+    // (`sock.sendMessage(OWNER_JID, { text: ownerNotif })` in the
+    // post-stream stranger-branch dead loop): 6 → 5.
+    // PLAN-02 §B (channel_send WhatsApp extension) will re-introduce a
+    // routed delivery site and bump this back up to 6.
     const src = require('node:fs').readFileSync(require('node:path').join(__dirname, 'index.js'), 'utf8');
     const trackCount = (src.match(/echoTracker\.track\(/g) || []).length;
-    assert.equal(trackCount, 6,
-      `expected 6 echoTracker.track() calls (one per outbound text site), got ${trackCount}`);
+    assert.equal(trackCount, 5,
+      `expected 5 echoTracker.track() calls (one per outbound text site), got ${trackCount}`);
     });
 });
 
@@ -1060,14 +1104,9 @@ describe('§A owner_notify channel', () => {
     assert.equal(captured.length, 0);
   });
 
-  it('Test 3: extractNotifyOwner still parses legacy [NOTIFY_OWNER] tags (BC kept for one release)', () => {
-    const text = 'Hello [NOTIFY_OWNER]{"reason":"x","summary":"y"}[/NOTIFY_OWNER] tail.';
-    const { notifications, cleanedText } = extractNotifyOwner(text);
-    assert.equal(notifications.length, 1);
-    assert.equal(notifications[0].reason, 'x');
-    assert.equal(notifications[0].summary, 'y');
-    assert.equal(cleanedText, 'Hello  tail.');
-  });
+  // Test 3 deleted (Phase 08 §C): extractNotifyOwner BC shim eradicated.
+  // Anti-regression coverage for the deletion lives in
+  // `Phase 08 §C: [NOTIFY_OWNER] text-tag parser eradication` above.
 
   it('Test 4: LIBREFANG_OWNER_CHANNEL flag is read from env at module load', () => {
     // Sanity: verify the module exposes a stable on/off contract by source.
@@ -1645,6 +1684,44 @@ describe('Phase 07 regression guards', () => {
       indexSrc.includes('shouldDebounceEscalation'),
       'shouldDebounceEscalation is anti-spam for NOTIFY_OWNER, NOT stranger session state — must be preserved'
     );
+  });
+
+  // -------------------------------------------------------------------------
+  // Phase 08 fences (duplicate the §C/§D/§E describe blocks above on purpose:
+  // redundancy is the point of regression fences — if either the dedicated
+  // describe block OR this fence trips, the eradication is undone).
+  // -------------------------------------------------------------------------
+  it('does not reintroduce extractNotifyOwner (Phase 08 §C)', () => {
+    assert.equal(/function\s+extractNotifyOwner\s*\(/.test(indexSrc), false);
+    const gw = require('./index.js');
+    assert.equal(gw.extractNotifyOwner, undefined);
+  });
+
+  it('does not reintroduce NOTIFY_OWNER_RE (Phase 08 §C)', () => {
+    assert.equal(/const\s+NOTIFY_OWNER_RE\s*=/.test(indexSrc), false);
+  });
+
+  it('does not reintroduce detectStrangerTurnOwnerLeak (Phase 08 §D)', () => {
+    assert.equal(/function\s+detectStrangerTurnOwnerLeak\s*\(/.test(indexSrc), false);
+    const gw = require('./index.js');
+    assert.equal(gw.detectStrangerTurnOwnerLeak, undefined);
+  });
+
+  it('does not reintroduce OWNER_LEAK_PATTERNS (Phase 08 §D)', () => {
+    assert.equal(/const\s+OWNER_LEAK_PATTERNS\s*=/.test(indexSrc), false);
+  });
+
+  it('does not reintroduce isStranger early-return in onProgress (Phase 08 §E)', () => {
+    const stripped = indexSrc
+      .split('\n')
+      .map((l) => l.replace(/\/\/.*$/, ''))
+      .join('\n');
+    assert.equal(/if\s*\(\s*isStranger\s*\)\s*return\s*;/.test(stripped), false);
+  });
+
+  it('owner_notify event log includes urgency field (Phase 08 §F telemetry)', () => {
+    assert.match(indexSrc, /event:\s*'owner_notify'/);
+    assert.match(indexSrc, /urgency,?\s*$/m);
   });
 });
 
