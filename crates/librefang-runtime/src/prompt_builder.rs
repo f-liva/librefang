@@ -2527,4 +2527,88 @@ mod tests {
             false,
         ));
     }
+
+    // -----------------------------------------------------------------------
+    // §G Phase 08 — regression matrix (PLAN-04)
+    // -----------------------------------------------------------------------
+
+    /// Phase 08 §G — Section 9.7 (Stranger Turn Contract) is a structural
+    /// section (`##`) and MUST appear before any dynamic_sections content
+    /// (which renders as `###` under the `## Provider-Supplied Context`
+    /// umbrella, sourced from `BeforePromptBuild` hooks at section 16).
+    ///
+    /// This test catches a future refactor that moves the stranger-turn
+    /// section into a hook-provided dynamic section (which would lose the
+    /// ordering guarantee + the byte-stable caching property locked in by
+    /// `stranger_turn_section_byte_stable_for_caching`).
+    #[test]
+    fn stranger_turn_section_does_not_appear_in_dynamic_sections_position() {
+        let mut ctx = stranger_turn_ctx();
+        ctx.is_stranger_turn = true;
+        ctx.dynamic_sections = vec![crate::hooks::DynamicSection {
+            provider: "scenario_d".into(),
+            heading: "Custom Provider Block".into(),
+            body: "arbitrary hook body".into(),
+        }];
+        let prompt = build_system_prompt(&ctx);
+
+        let stranger_pos = prompt
+            .find("## Stranger Turn Contract")
+            .expect("Section 9.7 must be present");
+        let provider_umbrella_pos = prompt
+            .find("## Provider-Supplied Context")
+            .expect("Section 16 umbrella must be present when dynamic_sections is non-empty");
+        let custom_heading_pos = prompt
+            .find("### Custom Provider Block")
+            .expect("dynamic section heading must render at `###`");
+
+        // Stranger Turn Contract (section 9.7) precedes both the
+        // dynamic-sections umbrella and any individual `###` block.
+        assert!(
+            stranger_pos < provider_umbrella_pos,
+            "Section 9.7 must precede the dynamic-sections umbrella. \
+             Got: 9.7={stranger_pos}, 16-umbrella={provider_umbrella_pos}"
+        );
+        assert!(
+            stranger_pos < custom_heading_pos,
+            "Section 9.7 must precede individual `###` provider blocks. \
+             Got: 9.7={stranger_pos}, ### Custom Provider Block={custom_heading_pos}"
+        );
+
+        // Belt-and-braces: the stranger-turn section itself must render as
+        // `## Stranger Turn Contract`, NOT promoted/demoted to another level.
+        assert!(
+            prompt.contains("\n## Stranger Turn Contract"),
+            "Section 9.7 must render at the `##` (structural) level, not `###`. Prompt:\n{prompt}"
+        );
+    }
+
+    /// Phase 08 §G — Jessica scenario replay: the WA gateway emits a
+    /// canonical `<stranger_inbound jid name timestamp>` wrapper for first
+    /// contacts; the kernel-side `detect_stranger_turn` MUST flip true for
+    /// that exact shape (DM) and stay false in a group context (Q2).
+    ///
+    /// Locked in test form so the 2026-05-03 fitness incident
+    /// (#41/#42/#43/#44) cannot regress silently. Timestamp is the literal
+    /// from the incident for replay traceability.
+    #[test]
+    fn jessica_replay_stranger_inbound_sets_flag_and_unfilters_message() {
+        // Scenario D — Jessica (real-world replay).
+        let msg = "<stranger_inbound jid=\"393395802472@s.whatsapp.net\" \
+                   name=\"Jessica\" timestamp=\"2026-05-03T08:11:00Z\">\nCiao\n\
+                   </stranger_inbound>";
+
+        // DM path: detector engages.
+        assert!(
+            detect_stranger_turn(msg, false),
+            "Jessica's DM wrapper must trigger stranger-turn detection. msg:\n{msg}"
+        );
+
+        // Group path: Q2 exception — even if a (broken) adapter wrapped the
+        // message inside a group, the stranger contract MUST NOT engage.
+        assert!(
+            !detect_stranger_turn(msg, true),
+            "Group context must suppress stranger-turn detection (Q2 exception). msg:\n{msg}"
+        );
+    }
 }
