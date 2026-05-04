@@ -363,7 +363,7 @@ pub async fn execute_tool_raw(
     // loop. The model sees a structured JSON ack in `content`
     // (`{success, delivered_to, urgency}`, Phase 08 §A) so it gets typed
     // feedback without ever seeing the private summary back. The actual
-    // owner-bound payload (`🎩 [{urgency}] {reason}: {summary}`) travels in
+    // owner-bound payload (`[{urgency}] {reason}: {summary}`) travels in
     // `ToolResult.owner_notice` and is consumed by `agent_loop.rs`.
     if tool_name == "notify_owner" {
         return tool_notify_owner(tool_use_id, input);
@@ -3122,7 +3122,7 @@ fn tool_agent_kill(
 /// `notify_owner(reason, summary, urgency?)` — typed channel for owner-only
 /// speech.
 ///
-/// Records `🎩 [{urgency}] {reason}: {summary}` in `ToolResult.owner_notice`
+/// Records `[{urgency}] {reason}: {summary}` in `ToolResult.owner_notice`
 /// so the agent loop can route it to the operator's DM (e.g. WhatsApp
 /// `OWNER_JID`) instead of the source chat. The `[urgency]` marker lets
 /// channel adapters (Phase 08 §C/D plan 03) modulate dedup/escalation
@@ -3333,8 +3333,9 @@ fn tool_notify_owner(tool_use_id: &str, input: &serde_json::Value) -> ToolResult
     // Compose the owner-side payload. The `[urgency]` marker lets channel
     // adapters (e.g. WhatsApp gateway, Phase 08 §C/D plan 03) read the
     // urgency without parsing free text — `high` bypasses owner-side dedup.
-    // Format: `🎩 [{urgency}] {reason}: {summary}`.
-    let owner_payload = format!("🎩 [{urgency_str}] {reason}: {summary}");
+    // Format: `[{urgency}] {reason}: {summary}`. Anti-ad-agentum: no persona
+    // signature in kernel — agents may add their own prefix at deployment time.
+    let owner_payload = format!("[{urgency_str}] {reason}: {summary}");
 
     // Structured log per OBS-01 — dispatch decision is recorded even before
     // the gateway fans it out. Target JID(s) are resolved downstream.
@@ -10036,7 +10037,7 @@ description = "test"
     }
 
     /// Phase 08 §A (renamed from `notify_owner_tool_sets_owner_notice_and_opaque_ack`):
-    /// default urgency is `normal`, owner_notice carries the `🎩 [normal] `
+    /// default urgency is `normal`, owner_notice carries the `[normal] `
     /// prefix, content is JSON-parseable.
     #[test]
     fn notify_owner_tool_sets_owner_notice_with_urgency_marker() {
@@ -10052,8 +10053,8 @@ description = "test"
         // can route on it without parsing free text.
         let payload = r.owner_notice.as_deref().expect("owner_notice set");
         assert!(
-            payload.starts_with("🎩 [normal] "),
-            "owner_notice must start with `🎩 [normal] `, got: {payload}"
+            payload.starts_with("[normal] "),
+            "owner_notice must start with `[normal] `, got: {payload}"
         );
         assert!(payload.contains("confirmation_needed"));
         assert!(payload.contains("Caterina"));
@@ -10103,7 +10104,7 @@ description = "test"
 
         let payload = r.owner_notice.as_deref().expect("owner_notice set");
         assert!(
-            payload.starts_with("🎩 [high] "),
+            payload.starts_with("[high] "),
             "expected [high] prefix, got: {payload}"
         );
 
@@ -10124,7 +10125,7 @@ description = "test"
         assert!(!r.is_error);
         let payload = r.owner_notice.as_deref().unwrap();
         assert!(
-            payload.starts_with("🎩 [low] "),
+            payload.starts_with("[low] "),
             "expected [low] prefix, got: {payload}"
         );
         let parsed: serde_json::Value = serde_json::from_str(&r.content).unwrap();
@@ -10151,7 +10152,7 @@ description = "test"
             let payload = r.owner_notice.as_deref().unwrap();
             // case-insensitive: "Normal" -> "normal", others fall back too.
             assert!(
-                payload.starts_with("🎩 [normal] "),
+                payload.starts_with("[normal] "),
                 "expected fallback to [normal], input={input:?}, got: {payload}"
             );
             let parsed: serde_json::Value = serde_json::from_str(&r.content).unwrap();
@@ -10172,7 +10173,7 @@ description = "test"
         let r = tool_notify_owner("t", &input);
         assert!(!r.is_error);
         let payload = r.owner_notice.as_deref().unwrap();
-        assert_eq!(payload, "🎩 [normal] r: s");
+        assert_eq!(payload, "[normal] r: s");
         let parsed: serde_json::Value = serde_json::from_str(&r.content).unwrap();
         assert_eq!(
             parsed["urgency"],
