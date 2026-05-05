@@ -948,6 +948,28 @@ impl LlmDriver for ClaudeCodeDriver {
                             || (l.contains("resets") && l.contains("utc"))
                             || t.trim() == "NO_REPLY"
                             || t.trim().ends_with("NO_REPLY")
+                            // Suppress Claude Code progress placeholders that
+                            // leak into channel text when the model emits a
+                            // status preamble before (or instead of) a real
+                            // reply. Live observed 2026-05-05 on WhatsApp
+                            // group: literal "[Reading the conversation
+                            // context]" delivered to a recipient. Match a
+                            // bracket-only line containing one of the canonical
+                            // progress verbs — narrow enough not to swallow
+                            // legitimate user content that happens to start
+                            // with a bracket (e.g. "[1] First..." lists).
+                            || {
+                                let trimmed = t.trim();
+                                trimmed.starts_with('[')
+                                    && trimmed.ends_with(']')
+                                    && (l.contains("reading")
+                                        || l.contains("thinking")
+                                        || l.contains("loading")
+                                        || l.contains("processing")
+                                        || l.contains("analyzing")
+                                        || l.contains("conversation context")
+                                        || l.contains("still working"))
+                            }
                     };
 
                     match serde_json::from_str::<ClaudeStreamEvent>(&line) {
