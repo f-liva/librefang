@@ -5513,27 +5513,15 @@ pub async fn run_agent_loop_streaming(
 /// Detect when the LLM claims to have performed an action in text without
 /// actually calling any tools — a common hallucination pattern.
 ///
-/// Covers three claim families:
-/// * **English present-perfect** (`i've|i have` + verb). Dev-flavor (created,
-///   written, modified) plus transactional verbs (sent, scheduled, booked,
-///   ordered, registered, recorded, transferred, logged, notified,
-///   cancelled, reserved) so domain agents that talk to YNAB / channels /
-///   calendars get the same retry treatment.
-/// * **Italian present-perfect** (`ho` + past participle). Mirrors the EN
-///   set so italian-speaking agents (Ambrogio et al.) trigger the same
-///   one-shot retry when they claim "ho registrato la spesa" without
-///   invoking `ynab_create_transaction`.
-/// * **Impersonal completion claims** (passive "is/was completed",
-///   italian "è stato/stata", "successfully X", "messaggio inviato"). Many
-///   models prefer this voice when narrating tool outcomes.
-///
-/// Caller already requires `!any_tools_executed && !hallucination_retried`,
-/// so a stray substring match (e.g. "i've sent" buried in user-quoted text)
-/// at worst burns one corrective retry — benign.
+/// Covers three claim families: English present-perfect (`i've|i have` +
+/// verb), Italian present-perfect (`ho` + past participle), and impersonal
+/// completion claims in either language (`successfully X`, `è stato/stata`,
+/// `messaggio inviato`). Bare "fatto" is intentionally absent — too noisy
+/// as a substring (matches "non ho fatto in tempo").
 fn looks_like_hallucinated_action(text: &str) -> bool {
     let lower = text.to_lowercase();
     let action_phrases = [
-        // English present-perfect — dev/file flavor (regression-preserved).
+        // English present-perfect — dev/file flavor.
         "i've created",
         "i've written",
         "i've updated",

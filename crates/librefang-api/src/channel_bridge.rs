@@ -2247,6 +2247,20 @@ async fn redispatch_journal_entry(
         },
     };
 
+    // Claim the entry by flipping it to Processing before the slow LLM
+    // call. Without this, a second ticker tick that fires while
+    // send_message is still in flight would observe the original Deferred
+    // status and dispatch the same entry concurrently — double LLM bill,
+    // double user-facing reply.
+    if let Some(j) = journal {
+        j.update_status(
+            &entry.message_id,
+            librefang_channels::message_journal::JournalStatus::Processing,
+            None,
+        )
+        .await;
+    }
+
     // Prefix tells the agent why this message is arriving late so it can
     // adjust its response (e.g., not re-do work it already completed).
     let prefix = if is_deferred_retry {
@@ -3566,17 +3580,16 @@ pub async fn start_channel_bridge_with_config(
     }
 
     // Periodic ticker: every 60s, re-dispatch any Deferred entries whose
-    // retry deadline has passed since the last sweep. This is what makes the
-    // journal recover from rate-limit windows that elapse WHILE the daemon
-    // is running (the initial-recovery pass above only catches entries that
-    // were already due at startup).
+    // retry deadline has passed since the last sweep. This is what makes
+    // the journal recover from rate-limit windows that elapse WHILE the
+    // daemon is running.
     if let Some(j) = manager.journal().cloned() {
         let handle = bridge_handle.clone();
         let kernel_for_retry = kernel.clone();
         tokio::spawn(async move {
             let mut interval = tokio::time::interval(std::time::Duration::from_secs(60));
-            // Skip the first immediate tick — initial-recovery already covers
-            // anything due at boot. We don't want a double-fire 60s in.
+            // Skip the first immediate tick — initial-recovery already
+            // covers anything due at boot.
             interval.tick().await;
             loop {
                 interval.tick().await;
