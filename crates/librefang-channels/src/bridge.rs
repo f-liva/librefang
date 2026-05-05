@@ -2292,21 +2292,6 @@ async fn resolve_or_fallback(
 }
 
 /// Dispatch a single incoming message — handles bot commands or routes to an agent.
-/// Thin wrapper around [`crate::message_journal::MessageJournal::record_outcome`]
-/// that no-ops when the journal is disabled. The dispatch paths call this
-/// at every terminal branch (success / failure / rate-limit) so the
-/// rate-limit-vs-hard-failure decision lives in one place.
-async fn record_dispatch_outcome(
-    journal: Option<&crate::message_journal::MessageJournal>,
-    message_id: &str,
-    success: bool,
-    err_str: Option<String>,
-) {
-    if let Some(j) = journal {
-        j.record_outcome(message_id, success, err_str).await;
-    }
-}
-
 ///
 /// Applies per-channel policies (DM/group filtering, rate limiting, formatting, threading).
 /// Input sanitization runs early — before any command parsing or agent dispatch.
@@ -3502,13 +3487,14 @@ async fn dispatch_message(
                                 thread_id,
                             )
                             .await;
-                        record_dispatch_outcome(
-                            journal,
-                            &message.platform_message_id,
-                            kernel_ok,
-                            kernel_err_str.clone(),
-                        )
-                        .await;
+                        if let Some(j) = journal {
+                            j.record_outcome(
+                                &message.platform_message_id,
+                                kernel_ok,
+                                kernel_err_str.clone(),
+                            )
+                            .await;
+                        }
                         return;
                     }
                     Err(e) => {
@@ -3571,13 +3557,10 @@ async fn dispatch_message(
                                     thread_id,
                                 )
                                 .await;
-                            record_dispatch_outcome(
-                                journal,
-                                &message.platform_message_id,
-                                kernel_ok,
-                                err_str,
-                            )
-                            .await;
+                            if let Some(j) = journal {
+                                j.record_outcome(&message.platform_message_id, kernel_ok, err_str)
+                                    .await;
+                            }
                             return;
                         }
                         // Buffer was empty OR kernel errored on a
@@ -3600,13 +3583,10 @@ async fn dispatch_message(
                                 thread_id,
                             )
                             .await;
-                        record_dispatch_outcome(
-                            journal,
-                            &message.platform_message_id,
-                            false,
-                            Some(err_str),
-                        )
-                        .await;
+                        if let Some(j) = journal {
+                            j.record_outcome(&message.platform_message_id, false, Some(err_str))
+                                .await;
+                        }
                         return;
                     }
                 }
@@ -3681,7 +3661,10 @@ async fn dispatch_message(
                 thread_id,
             )
             .await;
-        record_dispatch_outcome(journal, &message.platform_message_id, success, err_str).await;
+        if let Some(j) = journal {
+            j.record_outcome(&message.platform_message_id, success, err_str)
+                .await;
+        }
         return;
     }
 
@@ -3707,7 +3690,10 @@ async fn dispatch_message(
                     thread_id,
                 )
                 .await;
-            record_dispatch_outcome(journal, &message.platform_message_id, true, None).await;
+            if let Some(j) = journal {
+                j.record_outcome(&message.platform_message_id, true, None)
+                    .await;
+            }
         }
         Err(e) => {
             let sender_ctx_retry = sender_ctx.clone();
@@ -3734,13 +3720,10 @@ async fn dispatch_message(
                 },
             )
             .await;
-            record_dispatch_outcome(
-                journal,
-                &message.platform_message_id,
-                false,
-                Some(e.to_string()),
-            )
-            .await;
+            if let Some(j) = journal {
+                j.record_outcome(&message.platform_message_id, false, Some(e.to_string()))
+                    .await;
+            }
         }
     }
 }
@@ -4431,7 +4414,10 @@ async fn dispatch_with_blocks(
                 let response = maybe_prefix_response(handle, overrides, agent_id, response).await;
                 send_response(adapter, &message.sender, response, thread_id, output_format).await;
             }
-            record_dispatch_outcome(journal, &message.platform_message_id, true, None).await;
+            if let Some(j) = journal {
+                j.record_outcome(&message.platform_message_id, true, None)
+                    .await;
+            }
             handle
                 .record_delivery(
                     agent_id,
@@ -4467,13 +4453,10 @@ async fn dispatch_with_blocks(
                 },
             )
             .await;
-            record_dispatch_outcome(
-                journal,
-                &message.platform_message_id,
-                false,
-                Some(e.to_string()),
-            )
-            .await;
+            if let Some(j) = journal {
+                j.record_outcome(&message.platform_message_id, false, Some(e.to_string()))
+                    .await;
+            }
         }
     }
 }
