@@ -2292,6 +2292,21 @@ async fn resolve_or_fallback(
 }
 
 /// Dispatch a single incoming message — handles bot commands or routes to an agent.
+/// Thin wrapper around [`crate::message_journal::MessageJournal::record_outcome`]
+/// that no-ops when the journal is disabled. The dispatch paths call this
+/// at every terminal branch (success / failure / rate-limit) so the
+/// rate-limit-vs-hard-failure decision lives in one place.
+async fn record_dispatch_outcome(
+    journal: Option<&crate::message_journal::MessageJournal>,
+    message_id: &str,
+    success: bool,
+    err_str: Option<String>,
+) {
+    if let Some(j) = journal {
+        j.record_outcome(message_id, success, err_str).await;
+    }
+}
+
 ///
 /// Applies per-channel policies (DM/group filtering, rate limiting, formatting, threading).
 /// Input sanitization runs early — before any command parsing or agent dispatch.
@@ -3372,6 +3387,7 @@ async fn dispatch_message(
             is_group: message.is_group,
             thread_id: thread_id.map(|s| s.to_string()),
             metadata: std::collections::HashMap::new(),
+            next_retry_after: None,
         };
         j.record(entry).await;
     }
@@ -3486,19 +3502,13 @@ async fn dispatch_message(
                                 thread_id,
                             )
                             .await;
-                        if let Some(j) = journal {
-                            let jstatus = if kernel_ok {
-                                crate::message_journal::JournalStatus::Completed
-                            } else {
-                                crate::message_journal::JournalStatus::Failed
-                            };
-                            j.update_status(
-                                &message.platform_message_id,
-                                jstatus,
-                                kernel_err_str.clone(),
-                            )
-                            .await;
-                        }
+                        record_dispatch_outcome(
+                            journal,
+                            &message.platform_message_id,
+                            kernel_ok,
+                            kernel_err_str.clone(),
+                        )
+                        .await;
                         return;
                     }
                     Err(e) => {
@@ -3561,15 +3571,13 @@ async fn dispatch_message(
                                     thread_id,
                                 )
                                 .await;
-                            if let Some(j) = journal {
-                                let jstatus = if kernel_ok {
-                                    crate::message_journal::JournalStatus::Completed
-                                } else {
-                                    crate::message_journal::JournalStatus::Failed
-                                };
-                                j.update_status(&message.platform_message_id, jstatus, err_str)
-                                    .await;
-                            }
+                            record_dispatch_outcome(
+                                journal,
+                                &message.platform_message_id,
+                                kernel_ok,
+                                err_str,
+                            )
+                            .await;
                             return;
                         }
                         // Buffer was empty OR kernel errored on a
@@ -3592,14 +3600,13 @@ async fn dispatch_message(
                                 thread_id,
                             )
                             .await;
-                        if let Some(j) = journal {
-                            j.update_status(
-                                &message.platform_message_id,
-                                crate::message_journal::JournalStatus::Failed,
-                                Some(err_str),
-                            )
-                            .await;
-                        }
+                        record_dispatch_outcome(
+                            journal,
+                            &message.platform_message_id,
+                            false,
+                            Some(err_str),
+                        )
+                        .await;
                         return;
                     }
                 }
@@ -3674,15 +3681,7 @@ async fn dispatch_message(
                 thread_id,
             )
             .await;
-        if let Some(j) = journal {
-            let jstatus = if success {
-                crate::message_journal::JournalStatus::Completed
-            } else {
-                crate::message_journal::JournalStatus::Failed
-            };
-            j.update_status(&message.platform_message_id, jstatus, err_str)
-                .await;
-        }
+        record_dispatch_outcome(journal, &message.platform_message_id, success, err_str).await;
         return;
     }
 
@@ -3708,14 +3707,7 @@ async fn dispatch_message(
                     thread_id,
                 )
                 .await;
-            if let Some(j) = journal {
-                j.update_status(
-                    &message.platform_message_id,
-                    crate::message_journal::JournalStatus::Completed,
-                    None,
-                )
-                .await;
-            }
+            record_dispatch_outcome(journal, &message.platform_message_id, true, None).await;
         }
         Err(e) => {
             let sender_ctx_retry = sender_ctx.clone();
@@ -3742,14 +3734,13 @@ async fn dispatch_message(
                 },
             )
             .await;
-            if let Some(j) = journal {
-                j.update_status(
-                    &message.platform_message_id,
-                    crate::message_journal::JournalStatus::Failed,
-                    Some(e.to_string()),
-                )
-                .await;
-            }
+            record_dispatch_outcome(
+                journal,
+                &message.platform_message_id,
+                false,
+                Some(e.to_string()),
+            )
+            .await;
         }
     }
 }
@@ -4413,6 +4404,7 @@ async fn dispatch_with_blocks(
             is_group: message.is_group,
             thread_id: thread_id.map(|s| s.to_string()),
             metadata: std::collections::HashMap::new(),
+            next_retry_after: None,
         };
         j.record(entry).await;
     }
@@ -4439,14 +4431,7 @@ async fn dispatch_with_blocks(
                 let response = maybe_prefix_response(handle, overrides, agent_id, response).await;
                 send_response(adapter, &message.sender, response, thread_id, output_format).await;
             }
-            if let Some(j) = journal {
-                j.update_status(
-                    &message.platform_message_id,
-                    crate::message_journal::JournalStatus::Completed,
-                    None,
-                )
-                .await;
-            }
+            record_dispatch_outcome(journal, &message.platform_message_id, true, None).await;
             handle
                 .record_delivery(
                     agent_id,
@@ -4482,14 +4467,13 @@ async fn dispatch_with_blocks(
                 },
             )
             .await;
-            if let Some(j) = journal {
-                j.update_status(
-                    &message.platform_message_id,
-                    crate::message_journal::JournalStatus::Failed,
-                    Some(e.to_string()),
-                )
-                .await;
-            }
+            record_dispatch_outcome(
+                journal,
+                &message.platform_message_id,
+                false,
+                Some(e.to_string()),
+            )
+            .await;
         }
     }
 }

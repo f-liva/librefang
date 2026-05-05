@@ -4099,6 +4099,14 @@ fn record_retry_failure(
     }
 }
 
+/// Conservative defer window when a provider exhausts in-loop retries
+/// without giving us a structured `retry_after_ms` hint. 5 minutes is short
+/// enough that quota-clearing windows (claude.ai 5h hard caps, OpenAI 1m
+/// per-token windows) usually open well before this re-fires, and long
+/// enough that a tight ticker doesn't burn a fresh quota the moment it
+/// resets.
+const DEFAULT_DEFER_MS: u64 = 5 * 60 * 1000;
+
 async fn handle_retryable_llm_error(
     attempt: u32,
     retry_after_ms: u64,
@@ -4110,7 +4118,16 @@ async fn handle_retryable_llm_error(
 ) -> Result<String, LibreFangError> {
     if attempt == MAX_RETRIES {
         record_retry_failure(provider, cooldown, false);
-        return Err(LibreFangError::LlmDriver(exhausted_message));
+        // Append the defer marker so the channel bridge can route this
+        // entry to `JournalStatus::Deferred` (re-dispatched on a ticker
+        // once the quota window resets) instead of `Failed` (one-shot).
+        // Floor the hint at DEFAULT_DEFER_MS — providers that returned no
+        // structured retry-after still need a usable delay.
+        let defer_ms = retry_after_ms.max(DEFAULT_DEFER_MS);
+        return Err(LibreFangError::LlmDriver(format!(
+            "{exhausted_message} {marker}={defer_ms}",
+            marker = librefang_channels::message_journal::RATE_LIMIT_DEFER_MARKER,
+        )));
     }
 
     let delay = std::cmp::max(retry_after_ms, BASE_RETRY_DELAY_MS * 2u64.pow(attempt));
