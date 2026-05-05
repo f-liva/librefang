@@ -1079,6 +1079,17 @@ call this ONLY in addition to `channel_send`, and only when one of these conditi
   verification, legal/contractual content) that you cannot decide on their behalf.\n\n\
 Use `urgency=\"high\"` only when time-critical and dedup must be bypassed. Do NOT call \
 `notify_owner` to seek permission — that contradicts your autonomy.\n\n\
+**One reply per turn.** Emit AT MOST ONE `channel_send` call to the contact. Do NOT follow \
+your reply with a second `channel_send` that narrates completion (e.g. \"messaggio inviato\", \
+\"done, Sir\", \"reply sent\"). The agent loop already records tool execution — there is \
+nobody to confirm it to. A second `channel_send` in the same turn becomes a second visible \
+message in the contact's chat, exposing internal reasoning.\n\n\
+**Recipient discipline.** During a stranger turn, the `recipient` argument of `channel_send` \
+is ALWAYS the contact from the inbound XML metadata. NEVER set `recipient` to the owner's \
+identifier. Owner-side notifications travel exclusively through `notify_owner` (separate \
+tool, separate channel). Confusing the two — calling `channel_send` with the owner's id, \
+or addressing the owner inside the `message` argument while `recipient` is the stranger — \
+leaks operator-side prose to the contact.\n\n\
 Fidelity: when the owner has previously asked you to convey their words verbatim to a contact, \
 the `message` argument to `channel_send` MUST preserve the owner's wording, emoji, punctuation \
 and tone. Do not paraphrase, summarize, sanitize or 'translate'. The owner's intent is sovereign.\n";
@@ -2466,6 +2477,56 @@ mod tests {
             !section.contains("Two valid actions"),
             "Section 9.7 must NOT phrase channel_send and notify_owner as peers \
              ('Two valid actions' is the bias-inducing phrasing). Got: {section:?}"
+        );
+    }
+
+    /// §B Phase 08 post-deploy hot-fix 2026-05-05: Section 9.7 must explicitly
+    /// forbid emitting two `channel_send` calls in the same stranger turn (the
+    /// "messaggio inviato, Signore" narration leak observed live with Jessica)
+    /// and must pin recipient discipline (channel_send recipient is ALWAYS the
+    /// stranger from inbound XML, NEVER the owner).
+    #[test]
+    fn stranger_turn_section_forbids_double_channel_send_and_owner_recipient() {
+        let mut ctx = stranger_turn_ctx();
+        ctx.is_stranger_turn = true;
+        let prompt = build_system_prompt(&ctx);
+        let section = prompt
+            .split("## Stranger Turn Contract")
+            .nth(1)
+            .expect("Section 9.7 must be present");
+
+        // Single-reply rule: section must spell out "one reply per turn" and
+        // forbid narrating completion via a follow-up channel_send.
+        let one_reply_present = section.contains("One reply per turn")
+            || section.contains("AT MOST ONE")
+            || section.contains("at most one");
+        assert!(
+            one_reply_present,
+            "Section 9.7 must include the one-reply-per-turn rule. Got: {section:?}"
+        );
+        let narration_forbidden = section.contains("narrates completion")
+            || section.contains("messaggio inviato")
+            || section.contains("nobody to confirm")
+            || section.contains("reply sent");
+        assert!(
+            narration_forbidden,
+            "Section 9.7 must forbid narrating completion. Got: {section:?}"
+        );
+
+        // Recipient discipline: section must pin recipient = stranger and
+        // explicitly forbid setting recipient to the owner.
+        let discipline_present =
+            section.contains("Recipient discipline") || section.contains("recipient discipline");
+        assert!(
+            discipline_present,
+            "Section 9.7 must include recipient-discipline rule. Got: {section:?}"
+        );
+        let owner_recipient_forbidden = section.contains("NEVER set `recipient`")
+            || section.contains("never set recipient")
+            || section.contains("NEVER set recipient");
+        assert!(
+            owner_recipient_forbidden,
+            "Section 9.7 must explicitly forbid setting recipient to owner. Got: {section:?}"
         );
     }
 
