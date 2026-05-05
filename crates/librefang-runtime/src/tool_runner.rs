@@ -2426,6 +2426,27 @@ fn resolve_file_path_ext(
     crate::workspace_sandbox::resolve_sandbox_path_ext(raw_path, root, additional_roots)
 }
 
+/// Canonical path of the channel-bridge media uploads dir
+/// (`<temp>/librefang_uploads/`).
+///
+/// Channel adapters (Telegram bridge, WhatsApp gateway) drop inbound media
+/// (voice notes, images, documents) into this directory and pass the
+/// absolute path to the agent in the inbound message. Media-read tools
+/// (`image_analyze`, `media_describe`, `media_transcribe`) must honour this
+/// path as a sandbox additional root, otherwise every voice note from a
+/// real chat is rejected with `ERR_SANDBOX_ESCAPE`.
+///
+/// Returns `None` when the directory does not exist yet (fresh install,
+/// no inbound media seen). Callers treat the empty case as "no extra
+/// root" — the read will fail with the normal sandbox error and the
+/// agent surfaces it to the user.
+fn media_uploads_root_canonical() -> Option<PathBuf> {
+    std::env::temp_dir()
+        .join("librefang_uploads")
+        .canonicalize()
+        .ok()
+}
+
 /// Fetch the named-workspace prefixes (all modes) for the calling agent.
 /// Returns an empty vec when either kernel or agent id is missing.
 fn named_ws_prefixes(
@@ -4585,8 +4606,13 @@ async fn tool_image_analyze(
     let raw_path = input["path"].as_str().ok_or("Missing 'path' parameter")?;
     let prompt = input["prompt"].as_str().unwrap_or("");
     // Route through the workspace sandbox so user-supplied paths cannot
-    // escape to arbitrary filesystem locations (e.g. /etc/passwd).
-    let resolved = resolve_file_path(raw_path, workspace_root)?;
+    // escape to arbitrary filesystem locations (e.g. /etc/passwd). Honour
+    // the channel-bridge media uploads dir as an additional sandbox root
+    // so inbound photos delivered by Telegram / WhatsApp gateways can be
+    // read directly from `/tmp/librefang_uploads/`.
+    let uploads_root = media_uploads_root_canonical();
+    let extra_roots: Vec<&Path> = uploads_root.as_deref().into_iter().collect();
+    let resolved = resolve_file_path_ext(raw_path, workspace_root, &extra_roots)?;
 
     let data = tokio::fs::read(&resolved)
         .await
@@ -4822,8 +4848,11 @@ async fn tool_media_describe(
     let raw_path = input["path"].as_str().ok_or("Missing 'path' parameter")?;
     // Route through the workspace sandbox so all media reads stay inside
     // the agent's dir — a plain `..` check would miss absolute paths like
-    // `/etc/passwd`.
-    let resolved = resolve_file_path(raw_path, workspace_root)?;
+    // `/etc/passwd`. Allow the channel-bridge uploads dir as additional
+    // root so inbound media from Telegram / WhatsApp can be described.
+    let uploads_root = media_uploads_root_canonical();
+    let extra_roots: Vec<&Path> = uploads_root.as_deref().into_iter().collect();
+    let resolved = resolve_file_path_ext(raw_path, workspace_root, &extra_roots)?;
 
     // Read image file
     let data = tokio::fs::read(&resolved)
@@ -4871,8 +4900,11 @@ async fn tool_media_transcribe(
     let raw_path = input["path"].as_str().ok_or("Missing 'path' parameter")?;
     // Route through the workspace sandbox so all media reads stay inside
     // the agent's dir — a plain `..` check would miss absolute paths like
-    // `/etc/passwd`.
-    let resolved = resolve_file_path(raw_path, workspace_root)?;
+    // `/etc/passwd`. Allow the channel-bridge uploads dir as additional
+    // root so voice notes from Telegram / WhatsApp can be transcribed.
+    let uploads_root = media_uploads_root_canonical();
+    let extra_roots: Vec<&Path> = uploads_root.as_deref().into_iter().collect();
+    let resolved = resolve_file_path_ext(raw_path, workspace_root, &extra_roots)?;
 
     // Read audio file
     let data = tokio::fs::read(&resolved)
@@ -10513,4 +10545,72 @@ async fn test_evolve_tools_rejected_when_registry_frozen() {
     .await
     .expect_err("write_file must reject under freeze");
     assert!(err.contains("frozen") || err.contains("Stable"));
+}
+
+// ─── media uploads sandbox additional-root regression guard ──────────────
+//
+// Phase 08 post-deploy bug 2026-05-05: tool_media_transcribe (and the two
+// adjacent media-read tools tool_media_describe + tool_image_analyze)
+// passed `additional_roots = []` to the workspace sandbox, so absolute
+// paths under `<temp>/librefang_uploads/` (the canonical drop site of
+// channel-bridge inbound media) were rejected with `ERR_SANDBOX_ESCAPE`.
+//
+// The fix threads `media_uploads_root_canonical()` as an additional
+// sandbox root. These tests pin that contract:
+//
+//   - the helper resolves the temp-dir uploads path when the directory exists
+//   - resolve_file_path_ext accepts an absolute path under that root when
+//     the helper is supplied as additional_root
+//   - resolve_file_path_ext still rejects the same path when no
+//     additional_root is supplied (proves the helper is what unblocks it,
+//     not some unrelated sandbox change)
+#[test]
+fn media_uploads_root_resolves_when_directory_exists() {
+    let dir = std::env::temp_dir().join("librefang_uploads");
+    std::fs::create_dir_all(&dir).unwrap();
+
+    let resolved =
+        media_uploads_root_canonical().expect("uploads root must canonicalize when the dir exists");
+    let canon_dir = dir.canonicalize().unwrap();
+    assert_eq!(
+        resolved, canon_dir,
+        "helper must return canonical path of the uploads dir"
+    );
+}
+
+#[test]
+fn media_uploads_root_unblocks_absolute_path_in_sandbox_resolver() {
+    let dir = std::env::temp_dir().join("librefang_uploads");
+    std::fs::create_dir_all(&dir).unwrap();
+
+    // Synthesize a fake voice note dropped by a channel bridge.
+    let fake_audio = dir.join("file_phase08_test.oga");
+    std::fs::write(&fake_audio, b"fake-ogg-bytes").unwrap();
+
+    // A workspace dir distinct from the uploads dir — the file is NOT
+    // inside it. Without the additional_root, the sandbox must reject.
+    let workspace = tempfile::TempDir::new().unwrap();
+
+    let raw_path = fake_audio.to_str().unwrap();
+
+    // Without uploads_root in additional_roots → rejected.
+    let err_no_extra = resolve_file_path_ext(raw_path, Some(workspace.path()), &[])
+        .expect_err("path outside workspace must be blocked when no extra roots");
+    assert!(
+        err_no_extra.contains("Access denied")
+            || err_no_extra.contains("resolves outside workspace"),
+        "blocked-error must indicate sandbox escape, got: {err_no_extra}"
+    );
+
+    // With uploads_root in additional_roots → accepted.
+    let uploads_root = media_uploads_root_canonical().expect("uploads dir must canonicalize");
+    let extras: Vec<&Path> = vec![uploads_root.as_path()];
+    let resolved = resolve_file_path_ext(raw_path, Some(workspace.path()), &extras)
+        .expect("path under uploads_root must resolve when extra root supplied");
+    assert!(
+        resolved.starts_with(&uploads_root),
+        "resolved path must live under uploads_root, got: {resolved:?}"
+    );
+
+    let _ = std::fs::remove_file(&fake_audio);
 }
