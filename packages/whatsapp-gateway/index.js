@@ -433,8 +433,42 @@ function computeBackoffDelay(attempts, rng = Math.random) {
   return Math.round(base * jitter);
 }
 
-// Cached agent UUID — resolved from DEFAULT_AGENT name on first use
+// Cached agent UUID — resolved from DEFAULT_AGENT name on first use.
+// Issue #19 — persisted to disk so a gateway restart doesn't force a fresh
+// resolveAgentId() round-trip, which fails when LibreFang is still booting.
+// On boot we read the file (if any); on every successful resolve we write
+// it back. The file is small (UUID + name) and lives next to messages.db.
+const AGENT_ID_CACHE_PATH = path.join(path.dirname(DB_PATH), 'agent_id.json');
+
 let cachedAgentId = null;
+try {
+  if (fs.existsSync(AGENT_ID_CACHE_PATH)) {
+    const raw = fs.readFileSync(AGENT_ID_CACHE_PATH, 'utf8');
+    const parsed = JSON.parse(raw);
+    if (
+      parsed &&
+      typeof parsed.id === 'string' &&
+      /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(parsed.id)
+    ) {
+      cachedAgentId = parsed.id;
+      console.log(`[gateway] Restored cached agent id from disk: ${cachedAgentId}`);
+    }
+  }
+} catch (err) {
+  console.warn(`[gateway] Could not read agent id cache: ${err.message} — will resolve on first message`);
+}
+
+function persistCachedAgentId(id) {
+  try {
+    fs.writeFileSync(
+      AGENT_ID_CACHE_PATH,
+      JSON.stringify({ id, name: DEFAULT_AGENT, ts: Date.now() }),
+      { mode: 0o600 },
+    );
+  } catch (err) {
+    console.warn(`[gateway] Could not persist agent id: ${err.message}`);
+  }
+}
 
 // The user's own JID (set after connection opens) for self-chat detection
 let ownJid = null;
@@ -1193,6 +1227,7 @@ function resolveAgentId() {
     // If DEFAULT_AGENT is already a UUID, use it directly
     if (/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(DEFAULT_AGENT)) {
       cachedAgentId = DEFAULT_AGENT;
+      persistCachedAgentId(cachedAgentId);
       return resolve(DEFAULT_AGENT);
     }
 
@@ -1223,11 +1258,13 @@ function resolveAgentId() {
             );
             if (match && match.id) {
               cachedAgentId = match.id;
+              persistCachedAgentId(cachedAgentId);
               console.log(`[gateway] Resolved agent "${DEFAULT_AGENT}" → ${cachedAgentId}`);
               resolve(cachedAgentId);
             } else if (agents.length > 0) {
               // Fallback: use first available agent
               cachedAgentId = agents[0].id;
+              persistCachedAgentId(cachedAgentId);
               console.log(`[gateway] Agent "${DEFAULT_AGENT}" not found, using first agent: ${cachedAgentId}`);
               resolve(cachedAgentId);
             } else {
