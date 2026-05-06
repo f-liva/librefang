@@ -100,11 +100,48 @@ pub fn is_silent_response(text: &str) -> bool {
         return true;
     }
 
+    // Defensive: catch placeholder tags the model invents when it
+    // misreads "no response" as "respond with a placeholder". Any
+    // single short angle-bracket tag with no whitespace inside
+    // (e.g. <empty>, <response>, <silent>, <no_reply>) is treated as
+    // silent so it never reaches the user. Real reply content with
+    // HTML/XML survives because it either contains attributes
+    // (whitespace), inner content with `>`, or runs longer than 32
+    // chars.
+    if matches_placeholder_tag(stripped) {
+        return true;
+    }
+
     // Trailing-suffix tolerance: legacy prompts sometimes put context BEFORE
     // the sentinel ("all good. NO_REPLY"). The sentinel must follow a
     // non-word boundary (whitespace, punctuation, newline, or emoji), and
     // it must be the LAST token (after the same trailing-noise strip).
     ends_with_canonical(stripped)
+}
+
+/// Recognise short `<placeholder>` strings the model emits when it
+/// misinterprets "respond with no message" as "respond with the
+/// placeholder for nothing". Whole-message only — embedded tags inside
+/// real prose stay live. The 32-char ceiling and the no-whitespace
+/// constraint together protect real HTML / XML payloads (attributes,
+/// nested content, longer tag names).
+fn matches_placeholder_tag(s: &str) -> bool {
+    let bytes = s.as_bytes();
+    if bytes.len() < 3 || bytes.len() > 32 {
+        return false;
+    }
+    if bytes[0] != b'<' || bytes[bytes.len() - 1] != b'>' {
+        return false;
+    }
+    let inner = &s[1..s.len() - 1];
+    if inner.is_empty() {
+        return false;
+    }
+    // Reject anything resembling a real HTML/XML tag: attributes
+    // (whitespace), closing slashes, nested brackets.
+    inner
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
 }
 
 /// Strip trailing characters that don't belong to a sentinel token: ASCII
@@ -267,6 +304,52 @@ mod tests {
         assert!(!is_silent_response(
             "Ok NO_REPLY received but here is your real answer"
         ));
+    }
+
+    // --- Placeholder-tag defensive guard ---
+    #[test]
+    fn empty_placeholder_tag_is_silent() {
+        // Production leak: model emits `<empty>` when prompt says
+        // "return an empty message"; without this guard the literal
+        // string reaches the user.
+        assert!(is_silent_response("<empty>"));
+        assert!(is_silent_response("<response>"));
+        assert!(is_silent_response("<silent>"));
+        assert!(is_silent_response("<no_reply>"));
+        assert!(is_silent_response("<NO_REPLY>"));
+        // Trailing punctuation / whitespace tolerated by the upstream
+        // strip_trailing_noise pass.
+        assert!(is_silent_response("<empty>."));
+        assert!(is_silent_response("  <response>  "));
+        assert!(is_silent_response("<silent>\n"));
+    }
+
+    #[test]
+    fn real_html_xml_payload_is_not_silent() {
+        // Tags with attributes, inner content, or closing markers must
+        // stay deliverable — the user actually wrote HTML/XML.
+        assert!(!is_silent_response("<a href=\"x\">link</a>"));
+        assert!(!is_silent_response("<p>Hello</p>"));
+        assert!(!is_silent_response("<br/>"));
+        assert!(!is_silent_response("<img src=\"x\">"));
+        // A bare-but-long tag name is still a payload, not a sentinel.
+        assert!(!is_silent_response(
+            "<reallyLongTagNameThatIsForRealUseFortyChars>"
+        ));
+        // Nested brackets, multiple tags, or surrounding text are real
+        // content.
+        assert!(!is_silent_response("Result: <empty>."));
+        assert!(!is_silent_response("<a><b>"));
+    }
+
+    #[test]
+    fn malformed_placeholder_is_not_silent() {
+        // Half-tags and inner whitespace must not match.
+        assert!(!is_silent_response("<empty"));
+        assert!(!is_silent_response("empty>"));
+        assert!(!is_silent_response("<<empty>>"));
+        assert!(!is_silent_response("<empty response>"));
+        assert!(!is_silent_response("<>"));
     }
 
     // --- SilentReason serialization ---
