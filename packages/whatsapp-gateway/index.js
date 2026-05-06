@@ -1758,11 +1758,36 @@ async function startConnection() {
 
       if (contextInfo?.quotedMessage) {
         const quoted = contextInfo.quotedMessage;
-        const quotedText = quoted.conversation
+        // Issue #48 — the prefix only fires on text/extendedText/image+caption/
+        // video+caption. Replies to voice notes, stickers, plain images,
+        // documents, locations, contacts came through nudo without the
+        // `[In risposta a: ...]` marker, breaking conversational reference.
+        // Fall back to a typed placeholder so the agent still knows a
+        // reply happened and what kind of message was quoted.
+        let quotedText =
+          quoted.conversation
           || quoted.extendedTextMessage?.text
           || quoted.imageMessage?.caption
           || quoted.videoMessage?.caption
-          || '';
+          || quoted.documentMessage?.caption;
+        if (!quotedText) {
+          if (quoted.audioMessage) {
+            quotedText = quoted.audioMessage.ptt ? '[voice note]' : '[audio]';
+          } else if (quoted.imageMessage) {
+            quotedText = '[image]';
+          } else if (quoted.videoMessage) {
+            quotedText = '[video]';
+          } else if (quoted.stickerMessage) {
+            quotedText = '[sticker]';
+          } else if (quoted.documentMessage) {
+            const fname = quoted.documentMessage.fileName || 'file';
+            quotedText = `[document: ${fname}]`;
+          } else if (quoted.locationMessage || quoted.liveLocationMessage) {
+            quotedText = '[location]';
+          } else if (quoted.contactMessage || quoted.contactsArrayMessage) {
+            quotedText = '[contact]';
+          }
+        }
         if (quotedText) {
           messageText = `[In risposta a: "${quotedText.substring(0, 200)}"]\n${messageText}`;
         }
