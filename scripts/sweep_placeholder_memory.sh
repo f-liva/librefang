@@ -44,16 +44,33 @@ set -euo pipefail
 DB="/data/librefang.db"
 APPLY=0
 
+usage() {
+    cat <<'USAGE'
+sweep_placeholder_memory.sh — soft-delete placeholder-leak rows from the
+LibreFang episodic memory bank.
+
+Usage:
+  sweep_placeholder_memory.sh [--apply] [--db <path>]
+
+  --apply       Commit the soft-delete (memories.deleted = 1). Default is
+                dry-run: report counts only.
+  --db <path>   Database path. Defaults to /data/librefang.db (Lazycat NAS).
+  -h, --help    Show this help.
+
+The default mode is dry-run; --apply takes a timestamped backup of the
+database file before mutating it, then runs the UPDATE inside a
+transaction so a partial failure never leaves the bank inconsistent.
+USAGE
+}
+
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --apply)  APPLY=1; shift ;;
         --db)     DB="$2"; shift 2 ;;
-        -h|--help)
-            sed -n '2,40p' "$0" | sed 's/^# \{0,1\}//'
-            exit 0
-            ;;
+        -h|--help) usage; exit 0 ;;
         *)
             echo "unknown arg: $1" >&2
+            usage >&2
             exit 2
             ;;
     esac
@@ -68,8 +85,8 @@ if [[ ! -f "$DB" ]]; then
     exit 4
 fi
 
-# Predicate is one-line: easier to inspect, no SQL injection surface
-# (no user-supplied input ever interpolated).
+# No user input is ever interpolated into the SQL so the only risk
+# is operator typo in this file — keep the predicate one place.
 PREDICATE="
     scope = 'episodic'
     AND deleted = 0
@@ -84,8 +101,14 @@ PREDICATE="
     )
 "
 
-MATCH_COUNT=$(sqlite3 "$DB" "SELECT COUNT(*) FROM memories WHERE ${PREDICATE};")
-TOTAL_EPISODIC=$(sqlite3 "$DB" "SELECT COUNT(*) FROM memories WHERE scope = 'episodic' AND deleted = 0;")
+# Single sqlite invocation for both counts — saves a process spawn.
+read -r TOTAL_EPISODIC MATCH_COUNT < <(
+    sqlite3 -separator ' ' "$DB" "
+        SELECT
+          (SELECT COUNT(*) FROM memories WHERE scope = 'episodic' AND deleted = 0),
+          (SELECT COUNT(*) FROM memories WHERE ${PREDICATE});
+    "
+)
 
 echo "Database:           $DB"
 echo "Episodic memories:  $TOTAL_EPISODIC"
@@ -102,13 +125,22 @@ if [[ "$MATCH_COUNT" -eq 0 ]]; then
     exit 0
 fi
 
+BACKUP="${DB}.bak.$(date +%Y%m%d-%H%M%S)"
 echo
-echo "Applying soft-delete to $MATCH_COUNT rows..."
-sqlite3 "$DB" "UPDATE memories SET deleted = 1 WHERE ${PREDICATE};"
+echo "Backing up database to $BACKUP ..."
+cp -p "$DB" "$BACKUP"
+
+echo "Applying soft-delete to $MATCH_COUNT rows (transactional)..."
+sqlite3 "$DB" <<SQL
+BEGIN IMMEDIATE;
+UPDATE memories SET deleted = 1 WHERE ${PREDICATE};
+COMMIT;
+SQL
+
 REMAINING=$(sqlite3 "$DB" "SELECT COUNT(*) FROM memories WHERE ${PREDICATE};")
 echo "Remaining matching rows: $REMAINING (expected: 0)"
 if [[ "$REMAINING" -ne 0 ]]; then
-    echo "WARN: some rows still match — re-inspect predicate." >&2
+    echo "WARN: some rows still match — re-inspect predicate. Backup: $BACKUP" >&2
     exit 5
 fi
-echo "Done."
+echo "Done. Backup retained at $BACKUP — delete it once the agent has run cleanly."

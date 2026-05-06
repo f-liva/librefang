@@ -310,55 +310,57 @@ fn is_progress_text_leak(text: &str) -> bool {
     t.ends_with("...") || t.ends_with("…")
 }
 
+/// Whole-message template-wrap pairs the model occasionally emits when it
+/// "answers" by reciting its own context. No legitimate prompt instruction
+/// asks for that wrapping.
+const PROMPT_LEAK_TAG_PAIRS: &[(&str, &str)] = &[
+    ("<answer>", "</answer>"),
+    ("<response>", "</response>"),
+    ("<reply>", "</reply>"),
+];
+
+/// Minimum number of `## ` Markdown H2 headers in a response that triggers
+/// the regurgitation guard. Real replies almost never carry this many; system
+/// prompts always do. Three is high enough that a short reply with one or
+/// two genuine sub-headings slips through.
+const PROMPT_LEAK_HEADER_THRESHOLD: usize = 3;
+
 /// Classify a response as a system-prompt leak: the model regurgitated
 /// chunks of its own context (memory bullets, dynamic sections, persona
-/// blocks) wrapped in a pseudo-template tag like `<answer>...</answer>`.
+/// blocks) wrapped in a pseudo-template tag like `<answer>...</answer>`,
+/// or dumped a long sequence of Markdown H2 headers that only ever appear
+/// in the system prompt itself.
 ///
-/// Production incident 2026-05-06: an Ambrogio reply to a WhatsApp group
-/// message dumped the agent's recent memory items (`User asked: ...
-/// I responded: <empty>` rows) followed by the system-prompt section
-/// headers (`## Sender`, `## Today`, `## Calendar`, `## Tasks`, `## Goals`,
-/// `## Notification Settings`) and a fresh `[GROUP_CONTEXT]` block, all
-/// wrapped in `<answer>...`. The user saw the entire system prompt
-/// verbatim in the chat.
-///
-/// Two structural shapes catch the leak without false-positiving on
-/// real replies:
-///
-/// * **Template wrap** — the trimmed response begins with `<answer>` (or
-///   `<response>`, `<reply>`) AND ends with the matching closing tag.
-///   No legitimate prompt instruction asks the model for that wrapping.
-/// * **Markdown-header dump** — the response contains 3+ lines that
-///   start with `## ` (Markdown H2). Real replies almost never carry
-///   that many H2 headers; system prompts always do. The threshold is
-///   high enough that a short reply with one or two genuine sub-headings
-///   slips through.
-///
-/// On match the runtime swallows the response (silent completion),
-/// logs `event=system_prompt_regurgitated`, and lets the operator
-/// inspect the original text via the structured log.
+/// On match the runtime swallows the response (silent completion), logs
+/// `event=system_prompt_regurgitated`, and lets the operator inspect the
+/// original text via the structured log.
 fn is_prompt_leak(text: &str) -> bool {
     let t = text.trim();
     if t.is_empty() {
         return false;
     }
-    // Template-wrap shape.
-    for tag in ["answer", "response", "reply"] {
-        let open = format!("<{tag}>");
-        let close = format!("</{tag}>");
-        if t.starts_with(&open) && t.ends_with(&close) {
-            return true;
+    // Template-wrap shape — bail before scanning the tag pairs when the
+    // response can't possibly be a wrap (no leading `<`).
+    if t.starts_with('<') {
+        for (open, close) in PROMPT_LEAK_TAG_PAIRS {
+            if t.starts_with(open) && t.ends_with(close) {
+                return true;
+            }
         }
     }
-    // Markdown-header-dump shape.
-    let header_count = t
-        .lines()
+    // Markdown-header-dump shape — short-circuit the moment the threshold
+    // is hit. Long unrelated replies never finish the walk.
+    if !t.contains("## ") {
+        return false;
+    }
+    t.lines()
         .filter(|line| {
             let s = line.trim_start();
             s.starts_with("## ") && s.len() > 3
         })
-        .count();
-    header_count >= 3
+        .take(PROMPT_LEAK_HEADER_THRESHOLD)
+        .count()
+        == PROMPT_LEAK_HEADER_THRESHOLD
 }
 
 /// Returns true if this tool-error content is a "soft" error — one the LLM is
@@ -2895,10 +2897,14 @@ async fn finalize_successful_end_turn(
             // user/assistant turn — older `User asked: ... I
             // responded: ...` wording mirrored conversation closely
             // enough that the model occasionally regurgitated
-            // bullet-list memory items as if they were the live
-            // turn (#prompt-leak-incident-2026-05-06).
+            // bullet-list memory items as if they were the live turn.
+            // The `[recall:turn]` / `[/recall]` markers anchor the
+            // block as a memory record; raw `Display` formatting
+            // preserves accents and emoji unchanged for embeddings
+            // (`Debug` previously escaped `è` to `\u{e8}` and broke
+            // similarity search on Italian / non-ASCII content).
             let interaction_text = format!(
-                "[recall:turn] user: {:?} | agent: {:?}",
+                "[recall:turn]\nuser: {}\n---\nagent: {}\n[/recall]",
                 ctx.user_message, end_turn.final_response,
             );
             remember_interaction_best_effort(
@@ -3716,10 +3722,12 @@ pub async fn run_agent_loop(
                     session
                         .messages
                         .push(Message::assistant("[no reply needed]".to_string()));
-                    memory
-                        .save_session_async(session)
-                        .await
-                        .map_err(|e| LibreFangError::Memory(e.to_string()))?;
+                    if !opts.is_fork {
+                        memory
+                            .save_session_async(session)
+                            .await
+                            .map_err(|e| LibreFangError::Memory(e.to_string()))?;
+                    }
                     return Ok(build_silent_agent_loop_result(
                         total_usage,
                         iteration + 1,
@@ -5175,10 +5183,12 @@ pub async fn run_agent_loop_streaming(
                     session
                         .messages
                         .push(Message::assistant("[no reply needed]".to_string()));
-                    memory
-                        .save_session_async(session)
-                        .await
-                        .map_err(|e| LibreFangError::Memory(e.to_string()))?;
+                    if !opts.is_fork {
+                        memory
+                            .save_session_async(session)
+                            .await
+                            .map_err(|e| LibreFangError::Memory(e.to_string()))?;
+                    }
                     return Ok(build_silent_agent_loop_result(
                         total_usage,
                         iteration + 1,
@@ -6708,9 +6718,10 @@ mod tests {
     }
 
     #[test]
-    fn prompt_leak_detects_template_wrap() {
-        // Production incident shape: <answer>...</answer> wrap around
-        // a memory dump. Real responses never use this wrapping.
+    fn template_wrapped_response_is_dropped() {
+        // Whole-message <answer>/<response>/<reply> wrap is a model
+        // artifact when it gets confused about output format — never a
+        // legitimate reply shape.
         assert!(is_prompt_leak(
             "<answer>\nUser asked: foo\nI responded: bar\n</answer>"
         ));
@@ -6721,26 +6732,30 @@ mod tests {
     }
 
     #[test]
-    fn prompt_leak_detects_markdown_header_dump() {
-        // Production incident: regurgitation of system prompt sections.
+    fn three_or_more_h2_headers_are_dropped() {
+        // System prompts contain many `## ` headers; real replies do
+        // not. Three is the minimum trigger to keep one or two genuine
+        // subheadings deliverable.
         let dump = "## Sender\nMessage from: X\n## Today\nWednesday\n## Calendar\nNo events.\n## Tasks\npending\n";
         assert!(is_prompt_leak(dump));
-        // Three headers is the minimum trigger.
         assert!(is_prompt_leak("## A\nfoo\n## B\nbar\n## C\nbaz"));
     }
 
     #[test]
-    fn prompt_leak_does_not_fire_on_normal_replies() {
-        // Plain replies must never trip the guard.
+    fn plain_reply_with_at_most_two_h2_headers_is_delivered() {
+        // Short replies with one or two genuine subheadings must stay
+        // deliverable.
         assert!(!is_prompt_leak(""));
         assert!(!is_prompt_leak("Subito, Signore."));
         assert!(!is_prompt_leak("Ho registrato la spesa."));
-        // A short reply with one or two genuine subheadings stays
-        // deliverable — only 3+ headers are flagged.
         assert!(!is_prompt_leak("## Update\nFatto."));
         assert!(!is_prompt_leak("## Update\nFatto.\n## Next\nProseguo."));
-        // Single tag without matching close (`<answer>` only) is real
-        // content (escaped or quoted), not a wrap — must not trigger.
+    }
+
+    #[test]
+    fn unwrapped_angle_bracket_tag_is_delivered() {
+        // A `<answer>` mention without a matching close tag is real
+        // content (the model is explaining or quoting), not a wrap.
         assert!(!is_prompt_leak("<answer> is a literal tag I'm explaining"));
         assert!(!is_prompt_leak("Use the <answer> element here"));
     }
