@@ -101,14 +101,18 @@ PREDICATE="
     )
 "
 
-# `read || true` because `read` exits non-zero when stdin lacks a
-# trailing newline, which would trip `set -e`.
+# Initialise BEFORE the read so a sqlite3 error that produces empty
+# stdout doesn't leave the variables unset under `set -u`.
+TOTAL_EPISODIC=0
+MATCH_COUNT=0
 COUNTS=$(sqlite3 -separator ' ' "$DB" "
     SELECT
       (SELECT COUNT(*) FROM memories WHERE scope = 'episodic' AND deleted = 0),
       (SELECT COUNT(*) FROM memories WHERE ${PREDICATE});
 ")
-read -r TOTAL_EPISODIC MATCH_COUNT <<<"$COUNTS" || true
+# Pin IFS instead of inheriting; `|| :` because read exits non-zero on
+# missing trailing newline, which would otherwise trip `set -e`.
+IFS=' ' read -r TOTAL_EPISODIC MATCH_COUNT <<<"$COUNTS" || :
 
 echo "Database:           $DB"
 echo "Episodic memories:  $TOTAL_EPISODIC"
@@ -128,10 +132,12 @@ fi
 BACKUP="${DB}.bak.$(date +%Y%m%d-%H%M%S)"
 echo
 echo "Backing up database to $BACKUP via online .backup ..."
-# `.backup` is WAL-aware and produces a consistent snapshot even if the
-# daemon is still running; `cp` of just the main file would lose any
-# committed pages still in the -wal sidecar.
-sqlite3 "$DB" ".backup '${BACKUP}'"
+# `.backup` is WAL-aware: a `cp` of just the main file would lose any
+# committed pages still in the -wal sidecar. Single-quote escape the
+# backup path against the surrounding SQL string in case --db ever
+# resolves to a path containing apostrophes.
+BACKUP_SQL="${BACKUP//\'/\'\'}"
+sqlite3 "$DB" ".backup '${BACKUP_SQL}'"
 
 echo "Applying soft-delete to $MATCH_COUNT rows (transactional)..."
 # `-bail` aborts the script (and the transaction) on the first sqlite3
