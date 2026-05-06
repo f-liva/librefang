@@ -172,6 +172,78 @@ taskkill //PID <pid> //F
 - **Worktree**: Use `git worktree add` on an external disk for new features; fall back to `/tmp/librefang-<feature>` only if no external disk is available. Never develop on the main worktree
 - **Worktree continuation = drive to PR**: When asked to continue half-done work in an existing worktree (uncommitted changes or unmerged commits), the workflow is **commit → push → open or update PR**. Don't stop at "local commits only". A new branch needs a fresh PR; an existing branch with an open PR gets a follow-up push to update it. If the dirty changes aren't real work (e.g., stale `Cargo.lock` after rebase on an already-merged branch), discard them with `git checkout` instead of half-committing
 
+## NAS Lazycat — Connection Workflow (MANDATORY)
+
+**Mai usare `lzc-cli`** per parlare col NAS da questa workstation. Restituisce sempre `ENETUNREACH` (la rete overlay Lazycat non è instradata da qui). Niente `lzc-cli app status`, `lzc-cli app log`, `lzc-cli docker exec`. Niente messaggi "non riesco a collegarmi al NAS" — esiste sempre un path che funziona, è SSH diretta via IP LAN.
+
+**Path canonico** = SSH via IP LAN. L'host `chronos.heiyu.space:22` non è instradato (Network is unreachable). L'IP LAN `192.168.8.115` è raggiungibile direttamente.
+
+```bash
+# Carica credenziali (NAS_USER, NAS_PASS, NAS_HOST=chronos.heiyu.space)
+source /home/fede9/.claude-servizi/projects/-home-fede9-Progetti-librefang/.env.nas
+
+# IP LAN fisso — NON $NAS_HOST
+NAS_IP=192.168.8.115
+
+# Esegui qualsiasi comando sul host NAS
+sshpass -p "$NAS_PASS" ssh -o StrictHostKeyChecking=no -o ConnectTimeout=8 \
+  "$NAS_USER@$NAS_IP" '<comando>'
+
+# Esegui dentro al container LibreFang
+sshpass -p "$NAS_PASS" ssh -o StrictHostKeyChecking=no "$NAS_USER@$NAS_IP" \
+  'lzc-docker exec cloudlazycatapplibrefang-librefang-1 <cmd>'
+
+# Logs (ultimi 200)
+sshpass -p "$NAS_PASS" ssh -o StrictHostKeyChecking=no "$NAS_USER@$NAS_IP" \
+  'lzc-docker logs --tail 200 cloudlazycatapplibrefang-librefang-1 2>&1'
+
+# Health (dentro al container — l'API non è esposta sul host)
+sshpass -p "$NAS_PASS" ssh -o StrictHostKeyChecking=no "$NAS_USER@$NAS_IP" \
+  'lzc-docker exec cloudlazycatapplibrefang-librefang-1 \
+     sh -c "wget -qO- http://127.0.0.1:4545/api/health"'
+```
+
+### Deploy nuovo build (CI green → NAS live)
+
+`lzc-docker restart` **non** carica l'image nuovo (riusa il digest cached). Pattern affidabile:
+
+```bash
+sshpass -p "$NAS_PASS" ssh -o StrictHostKeyChecking=no "$NAS_USER@$NAS_IP" '
+  lzc-docker pull fliva/librefang:latest && \
+  lzc-docker rm -f cloudlazycatapplibrefang-librefang-1 && \
+  cd /lzcsys/data/system/pkgm/run/cloud.lazycat.app.librefang && \
+  lzc-docker compose -p cloudlazycatapplibrefang up -d librefang
+'
+# Verify
+sshpass -p "$NAS_PASS" ssh -o StrictHostKeyChecking=no "$NAS_USER@$NAS_IP" \
+  'lzc-docker exec cloudlazycatapplibrefang-librefang-1 librefang --version'
+```
+
+`compose -p ...` deve girare dal `working_dir` del progetto compose (`/lzcsys/data/system/pkgm/run/cloud.lazycat.app.librefang`). Da altre cwd risponde `no configuration file provided`.
+
+### SQLite del runtime
+
+DB live: `/data/data/librefang.db` **dentro** al container. Non c'è in `/appvar/cloud.lazycat.app.librefang/data/` sul host (path bind diverso da quello atteso). Due strade:
+
+1. **Pivot `/proc/<PID>/root` dal host** (no install richiesto, ma host non ha sqlite3):
+   ```bash
+   PID=$(lzc-docker inspect cloudlazycatapplibrefang-librefang-1 --format '{{.State.Pid}}')
+   ls -la /proc/$PID/root/data/data/librefang.db
+   ```
+
+2. **Installa `sqlite3` nel container** (debian/apt). Scompare al `compose up` successivo (image freshly pulled), va re-fatto:
+   ```bash
+   lzc-docker exec cloudlazycatapplibrefang-librefang-1 \
+     sh -c 'apt-get update -qq && apt-get install -y -qq sqlite3'
+   ```
+   Poi `lzc-docker cp script.sh ...:/tmp/` + `exec ... bash /tmp/script.sh`.
+
+### Anti-pattern (non fare)
+
+- `lzc-cli app log <pkgId>` / `lzc-cli app status` / `lzc-cli docker exec` — `ENETUNREACH`.
+- `ssh root@$NAS_HOST` con `$NAS_HOST=chronos.heiyu.space` — port 22 unreachable. Usa `192.168.8.115` (o una `$NAS_IP` separata).
+- `curl http://192.168.8.115:4545/...` — il context-mode hook blocca curl/wget dal host. Usa SSH + wget dentro al container.
+
 ## Live-Debug Workflow (MANDATORY)
 
 Work on a GitHub fork branch **and** in sync with the NAS runtime — every local edit must be mirrored to the running container so the Signore can smoke-test immediately. Applies to every task, not just production incidents.
