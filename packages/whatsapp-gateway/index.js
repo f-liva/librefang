@@ -412,6 +412,12 @@ const HEARTBEAT_CHECK_INTERVAL_MS = parseInt(process.env.WA_HEARTBEAT_CHECK_MS |
 const HEALTH_STALE_THRESHOLD_MS = parseInt(process.env.WA_HEALTH_STALE_MS || '300000', 10);
 let lastInboundAt = Date.now();
 let heartbeatInterval = null;
+// Issue #15 — lifted to module scope so `cleanupSocket()` can clear it
+// alongside `heartbeatInterval`, instead of relying on a second
+// `sock.ev.on('connection.update', ...)` listener (which doubled the
+// fire count for every connection event). Set inside `startConnection`,
+// cleared on every teardown path.
+let gapDetectionTimer = null;
 
 // Pure predicate — true when we've been silent longer than thresholdMs.
 function checkHeartbeat(now, lastInboundAt, thresholdMs) {
@@ -1253,6 +1259,14 @@ async function cleanupSocket() {
     clearInterval(heartbeatInterval);
     heartbeatInterval = null;
   }
+  // Issue #15 / #17 — gapDetectionTimer is also per-connection. Clear it
+  // alongside heartbeat so the reconnect path doesn't leave a leftover
+  // closure scanning a stale `stmtGetLastSeen` while the new sock is
+  // booting.
+  if (gapDetectionTimer) {
+    clearInterval(gapDetectionTimer);
+    gapDetectionTimer = null;
+  }
   if (!sock) return;
   const previousSock = sock;
   sock = null;
@@ -1269,6 +1283,14 @@ async function startConnection() {
   }
   isConnecting = true;
   try {
+
+  // Issue #17 — defensive teardown of any leftover sock + per-connection
+  // timers from a previous invocation. The normal teardown path runs in
+  // the `connection.update` close branch, but a sock that was abandoned
+  // without emitting close (e.g. process killed mid-init last cycle and
+  // PM2 respawned us) would leak its listeners and timers. The
+  // `cleanupSocket()` is a no-op when sock is already null.
+  await cleanupSocket();
 
   // Dynamic imports — Baileys is ESM-only in v6+
   const { default: makeWASocket, useMultiFileAuthState, DisconnectReason, fetchLatestBaileysVersion } =
@@ -2202,7 +2224,14 @@ async function startConnection() {
   const GAP_DETECTION_INTERVAL_MS = 10 * 60 * 1000;  // check every 10 min
   const GAP_THRESHOLD_MS = 30 * 60 * 1000;            // 30 min silence = warning
 
-  const gapDetectionTimer = setInterval(() => {
+  // Issue #15 — gapDetectionTimer is module-scoped so `cleanupSocket()`
+  // tears it down on every reconnect path (loggedOut, forbidden, normal
+  // reconnect, shutdown). Previously we registered a second
+  // `connection.update` listener just to clear it on close — that
+  // duplicated firing for every connection event. Module-scope + cleanup
+  // in cleanupSocket is single-source-of-truth.
+  if (gapDetectionTimer) clearInterval(gapDetectionTimer);
+  gapDetectionTimer = setInterval(() => {
     if (connStatus !== 'connected') return;
     const allLastSeen = stmtGetLastSeen.all();
     const now = Date.now();
@@ -2216,13 +2245,6 @@ async function startConnection() {
       }
     }
   }, GAP_DETECTION_INTERVAL_MS);
-
-  // Clean up interval on socket close to prevent leaks on reconnect
-  sock.ev.on('connection.update', (update) => {
-    if (update.connection === 'close') {
-      clearInterval(gapDetectionTimer);
-    }
-  });
 
   } catch (err) {
     // Issue #13 — `startConnection()` previously had only try/finally so any
