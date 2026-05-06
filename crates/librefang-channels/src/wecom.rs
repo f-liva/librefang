@@ -381,8 +381,23 @@ enum Mode {
         encoding_aes_key: Option<String>,
         /// Bot webhook key for proactive messages (extracted from first response_url).
         webhook_key: Arc<RwLock<Option<String>>>,
+        /// Issue #27 — per-user `response_url` cache so reply paths can quote
+        /// the exact one-time URL the platform delivered with the inbound
+        /// message instead of falling back to the webhook key for every
+        /// outbound. WeCom invalidates the URL after ~5 min, so we evict on
+        /// read using `RESPONSE_URL_TTL`. Keyed by `ChannelUser.platform_id`
+        /// (= the WeCom `from.userid`) so the lookup at send time has the
+        /// info `ChannelUser` actually carries.
+        response_urls: Arc<RwLock<std::collections::HashMap<String, (String, std::time::Instant)>>>,
     },
 }
+
+/// Issue #27 — TTL for cached `response_url` entries. WeCom documents the
+/// URL as one-shot per inbound; in practice the platform tolerates the
+/// reply for a few minutes. Five minutes is conservative — outside that
+/// window we drop back to the webhook key (which always works for proactive
+/// messages and is what the code did before the cache existed).
+const RESPONSE_URL_TTL: std::time::Duration = std::time::Duration::from_secs(5 * 60);
 
 /// WeCom intelligent bot adapter.
 pub struct WeComAdapter {
@@ -431,6 +446,7 @@ impl WeComAdapter {
                 token,
                 encoding_aes_key,
                 webhook_key: Arc::new(RwLock::new(None)),
+                response_urls: Arc::new(RwLock::new(std::collections::HashMap::new())),
             },
         }
     }
@@ -1059,6 +1075,7 @@ impl ChannelAdapter for WeComAdapter {
             token,
             encoding_aes_key,
             webhook_key,
+            response_urls,
             ..
         } = &self.mode
         else {
@@ -1070,6 +1087,7 @@ impl ChannelAdapter for WeComAdapter {
 
         let token = Arc::new(token.clone());
         let encoding_aes_key = Arc::new(encoding_aes_key.clone());
+        let response_urls_for_route = Arc::clone(response_urls);
         let tx = Arc::new(tx);
         let webhook_key = Arc::clone(webhook_key);
 
@@ -1145,6 +1163,7 @@ impl ChannelAdapter for WeComAdapter {
                 let encoding_aes_key = Arc::clone(&encoding_aes_key);
                 let tx = Arc::clone(&tx);
                 let webhook_key = Arc::clone(&webhook_key);
+                let response_urls = Arc::clone(&response_urls_for_route);
                 move |axum::extract::Query(params): axum::extract::Query<HashMap<String, String>>,
                       body: String| {
                     let token = Arc::clone(&token);
@@ -1152,6 +1171,7 @@ impl ChannelAdapter for WeComAdapter {
                     let tx = Arc::clone(&tx);
                     let account_id = Arc::clone(&account_id);
                     let webhook_key = Arc::clone(&webhook_key);
+                    let response_urls = Arc::clone(&response_urls);
                     async move {
                         // Parse JSON body: {"encrypt": "BASE64_ENCRYPTED"}
                         let body_json: serde_json::Value = match serde_json::from_str(&body) {
@@ -1277,6 +1297,15 @@ impl ChannelAdapter for WeComAdapter {
                                     channel_msg.metadata.insert(
                                         "wecom_response_url".to_string(),
                                         serde_json::json!(response_url),
+                                    );
+                                    // Issue #27 — cache the per-user response_url so
+                                    // the `send()` path (which only sees `&ChannelUser`,
+                                    // not the originating `ChannelMessage`) can quote
+                                    // the exact one-time URL the platform delivered.
+                                    let mut guard = response_urls.write().await;
+                                    guard.insert(
+                                        user_id.clone(),
+                                        (response_url.clone(), std::time::Instant::now()),
                                     );
                                 }
 
@@ -1420,10 +1449,31 @@ impl ChannelAdapter for WeComAdapter {
             Mode::Callback {
                 client,
                 webhook_key,
+                response_urls,
                 ..
             } => {
-                // Try response_url from user metadata first, fall back to webhook key
-                let response_url: Option<String> = None; // TODO: response_url is per-message, not available on ChannelUser
+                // Issue #27 — look up the cached `response_url` for this
+                // user. The cache is populated by the inbound POST handler
+                // when the platform delivers a `response_url` alongside the
+                // message. Entries older than `RESPONSE_URL_TTL` are evicted
+                // here (read-side eviction keeps the map size bounded
+                // without a separate sweep).
+                let response_url: Option<String> = {
+                    let mut guard = response_urls.write().await;
+                    match guard.get(&user.platform_id).cloned() {
+                        Some((url, captured_at)) if captured_at.elapsed() < RESPONSE_URL_TTL => {
+                            // One-shot: remove on use so a stale URL isn't
+                            // tried twice for two consecutive replies.
+                            guard.remove(&user.platform_id);
+                            Some(url)
+                        }
+                        Some(_) => {
+                            guard.remove(&user.platform_id);
+                            None
+                        }
+                        None => None,
+                    }
+                };
 
                 if let Some(url) = response_url {
                     info!(url = %url, "WeCom bot replying via response_url");
