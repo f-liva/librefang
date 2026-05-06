@@ -2710,12 +2710,17 @@ fn build_silent_agent_loop_result(
 /// Push the synthetic `[no reply needed]` assistant marker, persist the
 /// session unless this is a fork, and build the silent `AgentLoopResult`.
 ///
-/// Six call sites in the agent loop drop a turn for various reasons
-/// (canonical NO_REPLY sentinel, progress-text leak, system-prompt
-/// regurgitation — each in both the streaming and non-streaming
-/// finalize paths) and used to inline the same 11-line tail. Centralising
-/// here keeps the marker text, the fork-vs-real-session save policy,
-/// and the result construction in one place.
+/// Six call sites drop a turn for various reasons (canonical NO_REPLY
+/// sentinel, progress-text leak, system-prompt regurgitation — each in
+/// the streaming and non-streaming finalize paths) and previously
+/// inlined the same 11-line tail.
+///
+/// `is_fork` controls whether the synthetic marker is persisted. Pass
+/// `opts.is_fork` for guards that should skip persistence on fork
+/// turns (NO_REPLY, system-prompt regurgitation). Pass `false` for
+/// the progress-text-leak guard — it must persist the `[no reply needed]`
+/// marker on every path so the next turn's session repair sees a
+/// well-formed transcript even if the previous turn was forked.
 #[allow(clippy::too_many_arguments)]
 async fn silent_drop(
     session: &mut Session,
@@ -3678,7 +3683,7 @@ pub async fn run_agent_loop(
                     return silent_drop(
                         session,
                         memory,
-                        false, // progress-text leak: always persist regardless of fork
+                        false,
                         total_usage,
                         iteration,
                         parsed_directives,
@@ -5125,7 +5130,7 @@ pub async fn run_agent_loop_streaming(
                     return silent_drop(
                         session,
                         memory,
-                        false, // progress-text leak: always persist regardless of fork
+                        false,
                         total_usage,
                         iteration,
                         parsed_directives_s,
