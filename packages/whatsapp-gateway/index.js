@@ -22,6 +22,34 @@ const {
 const { buildSessionKey, channelTypeForChat } = require('./lib/session-key');
 
 // ---------------------------------------------------------------------------
+// Process-level error handlers (issue #14)
+// ---------------------------------------------------------------------------
+// Without these, an unhandled rejection from a setTimeout/setInterval
+// callback (e.g. the reconnect timer, the catch-up sweep, the dedup-store
+// eviction) terminates the process under Node 15+ default behaviour. PM2
+// would restart but the auth state could be left in an indeterminate
+// shape and the operator gets no signal. We log explicitly so the
+// post-mortem doesn't require diff'ing PM2 restart counts against
+// ambient cron noise.
+process.on('unhandledRejection', (reason, promise) => {
+  const detail =
+    reason && (reason.stack || reason.message)
+      ? reason.stack || reason.message
+      : String(reason);
+  console.error('[gateway][CRITICAL] unhandledRejection:', detail);
+  // Don't exit — PM2 would restart on the next signal anyway and most
+  // unhandled rejections in this codebase are recoverable (network blips
+  // in setInterval cleanups). Logging gives us the visibility we need.
+});
+process.on('uncaughtException', (err) => {
+  const detail = err && (err.stack || err.message) ? err.stack || err.message : String(err);
+  console.error('[gateway][CRITICAL] uncaughtException:', detail);
+  // Uncaught synchronous throws indicate truly broken state — exit and
+  // let PM2 restart.
+  process.exit(1);
+});
+
+// ---------------------------------------------------------------------------
 // Persisted LID cache (ID-02, Phase 4 §B)
 // ---------------------------------------------------------------------------
 // The in-memory `lidToPnJid` Map is populated on every senderPn observation
@@ -1274,7 +1302,18 @@ async function startConnection() {
         );
         connStatus = 'disconnected';
         statusMessage = `Reconnecting (attempt ${reconnectAttempts})...`;
-        setTimeout(() => startConnection(), delay);
+        // Issue #13 / #14 — startConnection now throws on failure (was
+        // try/finally only); a setTimeout-fired rejection would otherwise
+        // become an unhandled rejection. The catch keeps the next reconnect
+        // tick scheduled (we'll retry on the next connection.update close).
+        setTimeout(() => {
+          startConnection().catch((err) => {
+            console.warn(
+              '[gateway] reconnect attempt failed:',
+              err && err.message ? err.message : err,
+            );
+          });
+        }, delay);
       }
     }
 
@@ -1676,8 +1715,20 @@ async function startConnection() {
       });
       dbUpdateLastSeen(sender, msgTimestamp);
 
-      // Send read receipt (blue ticks) immediately
-      await sock.readMessages([msg.key]);
+      // Send read receipt (blue ticks) immediately. Issue #16 — guard
+      // against `sock` being nulled out by a concurrent reconnect (the
+      // upsert handler is async, sock is a global). A failed read receipt
+      // is cosmetic; do not let it crash the message handler.
+      if (sock) {
+        try {
+          await sock.readMessages([msg.key]);
+        } catch (err) {
+          console.warn(
+            '[gateway] readMessages failed:',
+            err && err.message ? err.message : err,
+          );
+        }
+      }
 
       // Forward to LibreFang agent
       try {
@@ -1738,8 +1789,20 @@ async function startConnection() {
 
         // --- Streaming: progressive message edits while LLM generates ---
         let streamMsgKey = null; // key of the initial WhatsApp message we'll edit
+        // Issue #23 — bound consecutive sendMessage failures so a flaky
+        // connection mid-stream doesn't produce 10+ warn logs and a
+        // truncated message. After STREAM_EDIT_MAX_FAILURES consecutive
+        // misses, give up streaming edits and let the final delivery
+        // (forwardToLibreFangStreaming → sendMessage) handle the full text.
+        const STREAM_EDIT_MAX_FAILURES = 3;
+        let streamEditFailures = 0;
         const onProgress = async (partialText) => {
-          if (!sock) return;
+          if (streamEditFailures >= STREAM_EDIT_MAX_FAILURES) return;
+          // Issue #16 — snapshot the sock at callback entry. The global
+          // `sock` can be nulled out by a concurrent reconnect between
+          // the existence check and the actual sendMessage await.
+          const localSock = sock;
+          if (!localSock) return;
           // Phase 08 §E: removed `if (isStranger) return;` early-return
           // (issue #41 hot-fix from commit 11adcd8a). Now redundant: the
           // §B Section 9.7 kernel contract forces tool-only output during a
@@ -1785,13 +1848,22 @@ async function startConnection() {
           cleaned = cleaned.trim();
           if (!cleaned) return;
           const formatted = markdownToWhatsApp(cleaned);
-          if (!streamMsgKey) {
-            const sent = await sock.sendMessage(sender, { text: formatted });
-            streamMsgKey = sent?.key;
-          } else {
-            await sock.sendMessage(sender, { text: formatted, edit: streamMsgKey });
+          try {
+            if (!streamMsgKey) {
+              const sent = await localSock.sendMessage(sender, { text: formatted });
+              streamMsgKey = sent?.key;
+            } else {
+              await localSock.sendMessage(sender, { text: formatted, edit: streamMsgKey });
+            }
+            streamEditFailures = 0;
+            if (ECHO_TRACKER_ENABLED) echoTracker.track(cleaned);
+          } catch (err) {
+            streamEditFailures += 1;
+            console.warn(
+              `[gateway] streaming sendMessage failure ${streamEditFailures}/${STREAM_EDIT_MAX_FAILURES}:`,
+              err && err.message ? err.message : err,
+            );
           }
-          if (ECHO_TRACKER_ENABLED) echoTracker.track(cleaned);
         };
 
         // Phase 2 §C — fetch participant roster for groups (cached 5min).
@@ -2034,6 +2106,18 @@ async function startConnection() {
     }
   });
 
+  } catch (err) {
+    // Issue #13 — `startConnection()` previously had only try/finally so any
+    // error in dynamic import / makeWASocket / auth load was swallowed and
+    // the operator saw a bot stuck on `connStatus = 'disconnected'` with no
+    // diagnostic. Surface it: log + status update + re-throw so callers
+    // (the `await startConnection()` sites in /login/start, /reset, etc)
+    // can surface it to the HTTP response instead of returning success.
+    console.error('[gateway] startConnection failed:', err && err.message ? err.message : err);
+    if (err && err.stack) console.error(err.stack);
+    connStatus = 'disconnected';
+    statusMessage = `Connection failed: ${err && err.message ? err.message : 'unknown'}`;
+    throw err;
   } finally {
     isConnecting = false;
   }
