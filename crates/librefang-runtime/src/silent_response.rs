@@ -96,10 +96,9 @@ pub fn is_silent_response(text: &str) -> bool {
     // (anything that is not alphanumeric, underscore, bracket, or space).
     let stripped = strip_trailing_noise(trimmed);
 
-    // Order is hot-path-first: real replies almost never start with `<`,
-    // so `matches_placeholder_tag` rejects in two byte loads. The other
-    // two checks each lowercase-allocate the trimmed string, which is
-    // wasteful on the >99% non-silent path.
+    // Order is hot-path-first: `matches_placeholder_tag` rejects in two
+    // byte loads when the trimmed text lacks a leading `<`; the other
+    // two predicates lowercase-allocate the input.
     if matches_placeholder_tag(stripped) {
         return true;
     }
@@ -138,6 +137,55 @@ fn matches_placeholder_tag(s: &str) -> bool {
     inner
         .chars()
         .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+}
+
+/// Whole-message template-wrap pairs the model occasionally emits when it
+/// "answers" by reciting its own context. No legitimate prompt instruction
+/// asks for that wrapping.
+const PROMPT_LEAK_TAG_PAIRS: &[(&str, &str)] = &[
+    ("<answer>", "</answer>"),
+    ("<response>", "</response>"),
+    ("<reply>", "</reply>"),
+];
+
+/// Minimum number of `## ` Markdown H2 headers in a response that triggers
+/// the regurgitation guard. Real replies almost never carry this many; system
+/// prompts always do. Three is high enough that a short reply with one or
+/// two genuine sub-headings slips through.
+pub const PROMPT_LEAK_HEADER_THRESHOLD: usize = 3;
+
+/// Classify a response as a system-prompt leak: the model regurgitated
+/// chunks of its own context (memory bullets, dynamic sections, persona
+/// blocks) wrapped in a pseudo-template tag like `<answer>...</answer>`,
+/// or dumped a long sequence of Markdown H2 headers that only ever appear
+/// in the system prompt itself.
+///
+/// On match the runtime swallows the response (silent completion), logs
+/// `event=system_prompt_regurgitated`, and lets the operator inspect the
+/// original text via the structured log.
+pub fn is_prompt_leak(text: &str) -> bool {
+    let t = text.trim();
+    if t.is_empty() {
+        return false;
+    }
+    if t.starts_with('<') {
+        for (open, close) in PROMPT_LEAK_TAG_PAIRS {
+            if t.starts_with(open) && t.ends_with(close) {
+                return true;
+            }
+        }
+    }
+    if !t.contains("## ") {
+        return false;
+    }
+    t.lines()
+        .filter(|line| {
+            let s = line.trim_start();
+            s.starts_with("## ") && s.len() > 3
+        })
+        .take(PROMPT_LEAK_HEADER_THRESHOLD)
+        .count()
+        == PROMPT_LEAK_HEADER_THRESHOLD
 }
 
 /// Strip trailing characters that don't belong to a sentinel token: ASCII
@@ -346,6 +394,51 @@ mod tests {
         assert!(!is_silent_response("<<empty>>"));
         assert!(!is_silent_response("<empty response>"));
         assert!(!is_silent_response("<>"));
+    }
+
+    // --- is_prompt_leak — output guard ---
+    #[test]
+    fn is_prompt_leak_template_wrapped_response_is_dropped() {
+        assert!(is_prompt_leak(
+            "<answer>\nUser asked: foo\nI responded: bar\n</answer>"
+        ));
+        assert!(is_prompt_leak("<response>some content</response>"));
+        assert!(is_prompt_leak("<reply>x</reply>"));
+        // Whitespace tolerance.
+        assert!(is_prompt_leak("  <answer>x</answer>  "));
+    }
+
+    #[test]
+    fn is_prompt_leak_threshold_h2_headers_are_dropped() {
+        // Build the dump dynamically from the threshold so changing
+        // the constant cannot silently break the test intent.
+        let dump = (0..PROMPT_LEAK_HEADER_THRESHOLD)
+            .map(|i| format!("## H{i}\nbody {i}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(is_prompt_leak(&dump));
+        // One below threshold must still be deliverable.
+        let under = (0..PROMPT_LEAK_HEADER_THRESHOLD - 1)
+            .map(|i| format!("## H{i}\nbody {i}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(!is_prompt_leak(&under));
+    }
+
+    #[test]
+    fn is_prompt_leak_plain_reply_is_delivered() {
+        assert!(!is_prompt_leak(""));
+        assert!(!is_prompt_leak("Subito, Signore."));
+        assert!(!is_prompt_leak("Ho registrato la spesa."));
+        assert!(!is_prompt_leak("## Update\nFatto."));
+    }
+
+    #[test]
+    fn is_prompt_leak_unwrapped_angle_bracket_tag_is_delivered() {
+        // A `<answer>` mention without a matching close tag is real
+        // content (the model is explaining or quoting), not a wrap.
+        assert!(!is_prompt_leak("<answer> is a literal tag I'm explaining"));
+        assert!(!is_prompt_leak("Use the <answer> element here"));
     }
 
     // --- SilentReason serialization ---

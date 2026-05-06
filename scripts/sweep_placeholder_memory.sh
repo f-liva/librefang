@@ -101,14 +101,14 @@ PREDICATE="
     )
 "
 
-# Single sqlite invocation for both counts — saves a process spawn.
-read -r TOTAL_EPISODIC MATCH_COUNT < <(
-    sqlite3 -separator ' ' "$DB" "
-        SELECT
-          (SELECT COUNT(*) FROM memories WHERE scope = 'episodic' AND deleted = 0),
-          (SELECT COUNT(*) FROM memories WHERE ${PREDICATE});
-    "
-)
+# `read || true` because `read` exits non-zero when stdin lacks a
+# trailing newline, which would trip `set -e`.
+COUNTS=$(sqlite3 -separator ' ' "$DB" "
+    SELECT
+      (SELECT COUNT(*) FROM memories WHERE scope = 'episodic' AND deleted = 0),
+      (SELECT COUNT(*) FROM memories WHERE ${PREDICATE});
+")
+read -r TOTAL_EPISODIC MATCH_COUNT <<<"$COUNTS" || true
 
 echo "Database:           $DB"
 echo "Episodic memories:  $TOTAL_EPISODIC"
@@ -127,11 +127,17 @@ fi
 
 BACKUP="${DB}.bak.$(date +%Y%m%d-%H%M%S)"
 echo
-echo "Backing up database to $BACKUP ..."
-cp -p "$DB" "$BACKUP"
+echo "Backing up database to $BACKUP via online .backup ..."
+# `.backup` is WAL-aware and produces a consistent snapshot even if the
+# daemon is still running; `cp` of just the main file would lose any
+# committed pages still in the -wal sidecar.
+sqlite3 "$DB" ".backup '${BACKUP}'"
 
 echo "Applying soft-delete to $MATCH_COUNT rows (transactional)..."
-sqlite3 "$DB" <<SQL
+# `-bail` aborts the script (and the transaction) on the first sqlite3
+# error so a failing UPDATE never reaches `COMMIT`. Without it the
+# heredoc would commit a partial mutation.
+sqlite3 -bail "$DB" <<SQL
 BEGIN IMMEDIATE;
 UPDATE memories SET deleted = 1 WHERE ${PREDICATE};
 COMMIT;
