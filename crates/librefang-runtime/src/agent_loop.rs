@@ -310,6 +310,57 @@ fn is_progress_text_leak(text: &str) -> bool {
     t.ends_with("...") || t.ends_with("…")
 }
 
+/// Classify a response as a system-prompt leak: the model regurgitated
+/// chunks of its own context (memory bullets, dynamic sections, persona
+/// blocks) wrapped in a pseudo-template tag like `<answer>...</answer>`.
+///
+/// Production incident 2026-05-06: an Ambrogio reply to a WhatsApp group
+/// message dumped the agent's recent memory items (`User asked: ...
+/// I responded: <empty>` rows) followed by the system-prompt section
+/// headers (`## Sender`, `## Today`, `## Calendar`, `## Tasks`, `## Goals`,
+/// `## Notification Settings`) and a fresh `[GROUP_CONTEXT]` block, all
+/// wrapped in `<answer>...`. The user saw the entire system prompt
+/// verbatim in the chat.
+///
+/// Two structural shapes catch the leak without false-positiving on
+/// real replies:
+///
+/// * **Template wrap** — the trimmed response begins with `<answer>` (or
+///   `<response>`, `<reply>`) AND ends with the matching closing tag.
+///   No legitimate prompt instruction asks the model for that wrapping.
+/// * **Markdown-header dump** — the response contains 3+ lines that
+///   start with `## ` (Markdown H2). Real replies almost never carry
+///   that many H2 headers; system prompts always do. The threshold is
+///   high enough that a short reply with one or two genuine sub-headings
+///   slips through.
+///
+/// On match the runtime swallows the response (silent completion),
+/// logs `event=system_prompt_regurgitated`, and lets the operator
+/// inspect the original text via the structured log.
+fn is_prompt_leak(text: &str) -> bool {
+    let t = text.trim();
+    if t.is_empty() {
+        return false;
+    }
+    // Template-wrap shape.
+    for tag in ["answer", "response", "reply"] {
+        let open = format!("<{tag}>");
+        let close = format!("</{tag}>");
+        if t.starts_with(&open) && t.ends_with(&close) {
+            return true;
+        }
+    }
+    // Markdown-header-dump shape.
+    let header_count = t
+        .lines()
+        .filter(|line| {
+            let s = line.trim_start();
+            s.starts_with("## ") && s.len() > 3
+        })
+        .count();
+    header_count >= 3
+}
+
 /// Returns true if this tool-error content is a "soft" error — one the LLM is
 /// expected to recover from cheaply on the next iteration (approval denials,
 /// sandbox rejections, modify-and-retry hints, argument-truncation nudges).
@@ -2830,18 +2881,35 @@ async fn finalize_successful_end_turn(
     // recursing into another fork, ad infinitum. Gating here is what
     // stops that cycle.
     if !ctx.opts.is_fork {
-        let interaction_text = format!(
-            "User asked: {}\nI responded: {}",
-            ctx.user_message, end_turn.final_response
-        );
-        remember_interaction_best_effort(
-            ctx.memory,
-            ctx.embedding_driver,
-            ctx.session.agent_id,
-            &interaction_text,
-            ctx.streaming,
-        )
-        .await;
+        // Skip storing the interaction when the agent produced no
+        // meaningful response (silent turn, empty string, sentinel
+        // placeholder). Without this gate the memory bank slowly
+        // fills with `[recall:turn] user: "..." | agent: ""` rows
+        // — model retrieves them as past interactions and learns
+        // an "empty reply" pattern, which then leaks back as visible
+        // text on the next turn (`<empty>`, `<response>`, etc.).
+        let response_meaningful = !end_turn.final_response.trim().is_empty()
+            && !crate::silent_response::is_silent_response(&end_turn.final_response);
+        if response_meaningful {
+            // Memory format is intentionally NOT shaped like a
+            // user/assistant turn — older `User asked: ... I
+            // responded: ...` wording mirrored conversation closely
+            // enough that the model occasionally regurgitated
+            // bullet-list memory items as if they were the live
+            // turn (#prompt-leak-incident-2026-05-06).
+            let interaction_text = format!(
+                "[recall:turn] user: {:?} | agent: {:?}",
+                ctx.user_message, end_turn.final_response,
+            );
+            remember_interaction_best_effort(
+                ctx.memory,
+                ctx.embedding_driver,
+                ctx.session.agent_id,
+                &interaction_text,
+                ctx.streaming,
+            )
+            .await;
+        }
 
         if let Some(engine) = ctx.context_engine {
             if let Err(e) = engine.after_turn(ctx.session.agent_id, ctx.messages).await {
@@ -3618,6 +3686,32 @@ pub async fn run_agent_loop(
                         agent = %manifest.name,
                         text_excerpt = %text.chars().take(80).collect::<String>(),
                         "Progress-text leak detected (ellipsis-terminated short reply without tool_use) — dropping as silent"
+                    );
+                    session
+                        .messages
+                        .push(Message::assistant("[no reply needed]".to_string()));
+                    memory
+                        .save_session_async(session)
+                        .await
+                        .map_err(|e| LibreFangError::Memory(e.to_string()))?;
+                    return Ok(build_silent_agent_loop_result(
+                        total_usage,
+                        iteration + 1,
+                        parsed_directives,
+                        decision_traces,
+                        memories_used.clone(),
+                        experiment_context.clone(),
+                        new_messages_start,
+                    ));
+                }
+
+                if is_prompt_leak(&text) {
+                    warn!(
+                        event = "system_prompt_regurgitated",
+                        agent = %manifest.name,
+                        text_len = text.len(),
+                        text_excerpt = %text.chars().take(120).collect::<String>(),
+                        "System-prompt regurgitation detected — dropping as silent"
                     );
                     session
                         .messages
@@ -5050,6 +5144,33 @@ pub async fn run_agent_loop_streaming(
                         agent = %manifest.name,
                         text_excerpt = %text.chars().take(80).collect::<String>(),
                         "Progress-text leak detected (streaming, ellipsis-terminated short reply without tool_use) — dropping as silent"
+                    );
+                    session
+                        .messages
+                        .push(Message::assistant("[no reply needed]".to_string()));
+                    memory
+                        .save_session_async(session)
+                        .await
+                        .map_err(|e| LibreFangError::Memory(e.to_string()))?;
+                    return Ok(build_silent_agent_loop_result(
+                        total_usage,
+                        iteration + 1,
+                        parsed_directives_s,
+                        decision_traces,
+                        memories_used.clone(),
+                        experiment_context.clone(),
+                        new_messages_start,
+                    ));
+                }
+
+                if is_prompt_leak(&text) {
+                    warn!(
+                        event = "system_prompt_regurgitated",
+                        agent = %manifest.name,
+                        source = "agent_loop.streaming",
+                        text_len = text.len(),
+                        text_excerpt = %text.chars().take(120).collect::<String>(),
+                        "System-prompt regurgitation detected (streaming) — dropping as silent"
                     );
                     session
                         .messages
@@ -6584,6 +6705,44 @@ mod tests {
             "This is a much longer response where the model actually produced a full explanation of what it did and the ellipsis at the end is just stylistic...";
         assert!(long.chars().count() > 120);
         assert!(!is_progress_text_leak(long));
+    }
+
+    #[test]
+    fn prompt_leak_detects_template_wrap() {
+        // Production incident shape: <answer>...</answer> wrap around
+        // a memory dump. Real responses never use this wrapping.
+        assert!(is_prompt_leak(
+            "<answer>\nUser asked: foo\nI responded: bar\n</answer>"
+        ));
+        assert!(is_prompt_leak("<response>some content</response>"));
+        assert!(is_prompt_leak("<reply>x</reply>"));
+        // Whitespace tolerance.
+        assert!(is_prompt_leak("  <answer>x</answer>  "));
+    }
+
+    #[test]
+    fn prompt_leak_detects_markdown_header_dump() {
+        // Production incident: regurgitation of system prompt sections.
+        let dump = "## Sender\nMessage from: X\n## Today\nWednesday\n## Calendar\nNo events.\n## Tasks\npending\n";
+        assert!(is_prompt_leak(dump));
+        // Three headers is the minimum trigger.
+        assert!(is_prompt_leak("## A\nfoo\n## B\nbar\n## C\nbaz"));
+    }
+
+    #[test]
+    fn prompt_leak_does_not_fire_on_normal_replies() {
+        // Plain replies must never trip the guard.
+        assert!(!is_prompt_leak(""));
+        assert!(!is_prompt_leak("Subito, Signore."));
+        assert!(!is_prompt_leak("Ho registrato la spesa."));
+        // A short reply with one or two genuine subheadings stays
+        // deliverable — only 3+ headers are flagged.
+        assert!(!is_prompt_leak("## Update\nFatto."));
+        assert!(!is_prompt_leak("## Update\nFatto.\n## Next\nProseguo."));
+        // Single tag without matching close (`<answer>` only) is real
+        // content (escaped or quoted), not a wrap — must not trigger.
+        assert!(!is_prompt_leak("<answer> is a literal tag I'm explaining"));
+        assert!(!is_prompt_leak("Use the <answer> element here"));
     }
 
     #[test]
