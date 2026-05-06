@@ -123,6 +123,18 @@ db.exec(`
   CREATE INDEX IF NOT EXISTS idx_messages_processed ON messages(processed);
 `);
 
+// Issue #18 — `processing_since` column lets the catch-up sweep skip
+// rows that the main handler is currently working on (e.g. slow media
+// download). Without it the sweep can re-forward a message before the
+// main handler finishes, producing duplicate agent turns. SQLite has no
+// `ADD COLUMN IF NOT EXISTS`; the try/catch turns the second-boot
+// "duplicate column" error into a no-op.
+try {
+  db.exec(`ALTER TABLE messages ADD COLUMN processing_since INTEGER DEFAULT NULL`);
+} catch (err) {
+  if (!/duplicate column/i.test(err && err.message)) throw err;
+}
+
 // Track last-seen timestamp per JID (for gap detection — Fase 3.2 Option C)
 db.exec(`
   CREATE TABLE IF NOT EXISTS jid_last_seen (
@@ -169,9 +181,26 @@ const stmtGetByJid = db.prepare(`
   FROM messages WHERE jid = ? AND timestamp >= ? ORDER BY timestamp DESC LIMIT ?
 `);
 
+// Issue #18 — `(processing_since IS NULL OR processing_since < ?)` skips
+// rows the main handler claimed less than PROCESSING_LEASE_MS ago. The
+// caller passes `Date.now() - PROCESSING_LEASE_MS` as the second
+// parameter so a stale lease (handler crashed without releasing) still
+// becomes eligible for the sweep — the lease expires, the sweep picks it
+// up. The `processed = 0` clause is unchanged.
 const stmtGetUnprocessed = db.prepare(`
   SELECT id, jid, sender_jid, push_name, phone, text, direction, timestamp, retry_count, raw_type
-  FROM messages WHERE processed = 0 AND timestamp < ? ORDER BY timestamp ASC
+  FROM messages
+  WHERE processed = 0
+    AND timestamp < ?
+    AND (processing_since IS NULL OR processing_since < ?)
+  ORDER BY timestamp ASC
+`);
+
+const stmtMarkProcessing = db.prepare(`
+  UPDATE messages SET processing_since = ? WHERE id = ? AND processed = 0
+`);
+const stmtClearProcessing = db.prepare(`
+  UPDATE messages SET processing_since = NULL WHERE id = ?
 `);
 
 const stmtCleanupOld = db.prepare(`
@@ -225,10 +254,40 @@ function dbGetMessagesByJid(jid, limit = 20, since = 0) {
 }
 
 /**
- * Get all unprocessed messages older than a threshold (epoch ms).
+ * Get all unprocessed messages older than a threshold (epoch ms),
+ * skipping rows currently being processed by another handler.
+ *
+ * Issue #18 — `processingLeaseExpiredBefore` is the cutoff such that any
+ * row with `processing_since >= processingLeaseExpiredBefore` is treated
+ * as actively in-flight and excluded. Pass `Date.now() - PROCESSING_LEASE_MS`
+ * to drain only rows whose claim is older than the lease (covers the
+ * crashed-handler case).
  */
-function dbGetUnprocessed(olderThan) {
-  return stmtGetUnprocessed.all(olderThan);
+function dbGetUnprocessed(olderThan, processingLeaseExpiredBefore = Date.now()) {
+  return stmtGetUnprocessed.all(olderThan, processingLeaseExpiredBefore);
+}
+
+/**
+ * Issue #18 — claim a row for processing by stamping `processing_since`.
+ * The main inbound handler calls this just before async media processing
+ * + forward, and `dbClearProcessing` on completion (regardless of success).
+ * The lease is bounded by PROCESSING_LEASE_MS so a crashed handler's
+ * claim eventually expires and the sweep can recover the message.
+ */
+function dbMarkProcessing(msgId) {
+  try {
+    stmtMarkProcessing.run(Date.now(), msgId);
+  } catch (err) {
+    console.warn(`[gateway][db] Failed to mark message ${msgId} as processing: ${err.message}`);
+  }
+}
+
+function dbClearProcessing(msgId) {
+  try {
+    stmtClearProcessing.run(msgId);
+  } catch (err) {
+    console.warn(`[gateway][db] Failed to clear processing flag for ${msgId}: ${err.message}`);
+  }
 }
 
 /**
@@ -346,6 +405,11 @@ let isConnecting = false;
 // over. The 180s default matches the openclaw reference.
 const HEARTBEAT_MS = parseInt(process.env.WA_HEARTBEAT_MS || '180000', 10);
 const HEARTBEAT_CHECK_INTERVAL_MS = parseInt(process.env.WA_HEARTBEAT_CHECK_MS || '30000', 10);
+// Issue #24 — separate threshold for the /health endpoint so external
+// monitoring degrades earlier than the watchdog's force-reconnect
+// trigger. 5 minutes is enough to filter out brief WhatsApp server
+// pauses without false-flagging a dead socket.
+const HEALTH_STALE_THRESHOLD_MS = parseInt(process.env.WA_HEALTH_STALE_MS || '300000', 10);
 let lastInboundAt = Date.now();
 let heartbeatInterval = null;
 
@@ -1610,7 +1674,29 @@ async function startConnection() {
       let transcriptionText = '';
 
       if (downloadableMedia) {
-        const result = await processMediaMessage(msg, innerMsg, cachedAgentId);
+        // Issue #21 — overall pipeline timeout. The internal stages
+        // (download 30s + retry, upload 60s) can stack to ~120s and block
+        // every other inbound message behind this single one. Cap the
+        // total at MEDIA_PIPELINE_TIMEOUT_MS so a slow giant-video upload
+        // can't choke the handler. On timeout the message is forwarded
+        // without attachment — the agent sees text but no media; better
+        // than no response at all.
+        let result = null;
+        try {
+          result = await Promise.race([
+            processMediaMessage(msg, innerMsg, cachedAgentId),
+            new Promise((_, reject) =>
+              setTimeout(
+                () => reject(new Error('media_pipeline_timeout')),
+                MEDIA_PIPELINE_TIMEOUT_MS,
+              ),
+            ),
+          ]);
+        } catch (err) {
+          console.warn(
+            `[gateway] media pipeline failed (${err && err.message ? err.message : err}) — forwarding without attachment`,
+          );
+        }
         if (result && result.attachment) {
           attachments.push(result.attachment);
           if (result.transcription) {
@@ -1713,6 +1799,10 @@ async function startConnection() {
         processed: 0,
         rawType,
       });
+      // Issue #18 — claim the row before the slow media + forward path so
+      // the catch-up sweep can't race and re-deliver the same message
+      // while we're still processing it.
+      dbMarkProcessing(msg.key.id);
       dbUpdateLastSeen(sender, msgTimestamp);
 
       // Send read receipt (blue ticks) immediately. Issue #16 — guard
@@ -1998,7 +2088,10 @@ async function startConnection() {
 
       } catch (err) {
         console.error(`[gateway] Forward/reply failed:`, err.message);
-        // Message stays processed=0 in DB — catch-up sweep will retry later
+        // Issue #18 — release the processing lease so the next sweep
+        // cycle can retry this row immediately, instead of waiting for
+        // PROCESSING_LEASE_MS to expire. Message stays processed=0.
+        dbClearProcessing(msg.key.id);
       }
     }
   });
@@ -2159,6 +2252,9 @@ function getMediaDescriptor(innerMsg, senderName) {
 // ---------------------------------------------------------------------------
 const MAX_MEDIA_SIZE = 50 * 1024 * 1024; // 50MB limit
 const MEDIA_DOWNLOAD_TIMEOUT = 30_000;   // 30 seconds
+// Issue #21 — pipeline-level cap so download retries + upload + transcript
+// can't stack to ~120s and block other inbound messages.
+const MEDIA_PIPELINE_TIMEOUT_MS = 90_000;
 
 // Cached Baileys downloadMediaMessage function (loaded on first use)
 let _downloadMediaMessage = null;
@@ -2719,15 +2815,31 @@ async function forwardToLibreFangStreaming(text, systemPrefix, phone, pushName, 
 const CATCHUP_INTERVAL_MS = 5 * 60 * 1000;  // 5 minutes
 const CATCHUP_AGE_MS = 30_000;               // only messages older than 30s
 const CATCHUP_MAX_RETRIES = 3;
+// Issue #25 — bound how many messages a single sweep cycle drains. With
+// the per-agent serializing mutex inside LibreFang, a 50-message backlog
+// previously took ~25 minutes of sequential LLM calls and starved live
+// traffic. The remainder is picked up by the next sweep tick.
+const CATCHUP_BATCH_SIZE = 8;
+// Issue #25 — small inter-iteration delay so a backlog doesn't hammer
+// LibreFang at line-rate. 750ms is below human-perceptible reply latency
+// for the catch-up case (which is already late by definition) and gives
+// the kernel breathing room.
+const CATCHUP_INTER_DELAY_MS = 750;
+// Issue #18 — how long the main handler can hold a `processing_since`
+// claim before the sweep treats it as expired (handler crashed without
+// releasing). 5 min covers a worst-case media-pipeline timeout (#21 cap
+// 90s) plus a comfortable margin for slow LLM forward.
+const PROCESSING_LEASE_MS = 5 * 60 * 1000;
 
 async function runCatchUpSweep() {
   if (connStatus !== 'connected' || !sock) return;
 
   const cutoff = Date.now() - CATCHUP_AGE_MS;
-  const unprocessed = dbGetUnprocessed(cutoff);
+  const leaseCutoff = Date.now() - PROCESSING_LEASE_MS;
+  const unprocessed = dbGetUnprocessed(cutoff, leaseCutoff).slice(0, CATCHUP_BATCH_SIZE);
   if (unprocessed.length === 0) return;
 
-  console.log(`[gateway][catchup] Found ${unprocessed.length} unprocessed message(s), attempting re-forward...`);
+  console.log(`[gateway][catchup] Found ${unprocessed.length} unprocessed message(s) (batch cap ${CATCHUP_BATCH_SIZE}), attempting re-forward...`);
 
   for (const msg of unprocessed) {
     // Skip messages already at max retries (they'll be marked failed by dbIncrRetryOrFail)
@@ -2794,6 +2906,11 @@ async function runCatchUpSweep() {
     } catch (err) {
       console.warn(`[gateway][catchup] Failed to re-forward message ${msg.id}: ${err.message}`);
       dbIncrRetryOrFail(msg.id, CATCHUP_MAX_RETRIES);
+    }
+    // Issue #25 — pace the sweep so the kernel's per-agent mutex isn't
+    // hammered at line-rate.
+    if (CATCHUP_INTER_DELAY_MS > 0) {
+      await new Promise((r) => setTimeout(r, CATCHUP_INTER_DELAY_MS));
     }
   }
 }
@@ -3136,11 +3253,24 @@ const server = http.createServer(async (req, res) => {
       return jsonResponse(req, res, 200, { jid, messages });
     }
 
-    // GET /health — health check
+    // GET /health — health check. Issue #24 — `connStatus` alone reports
+    // a dead-socket scenario as healthy (TCP RST never delivered, ISP
+    // drops connection silently). Augment with a freshness check:
+    // `lastInboundAt` is touched on every received message + every
+    // heartbeat tick when the socket actually flushes events. If we
+    // haven't observed inbound activity for HEALTH_STALE_THRESHOLD_MS,
+    // we report `degraded` (HTTP 503) so external monitoring sees the
+    // problem before the watchdog forces a reconnect.
     if (req.method === 'GET' && path === '/health') {
-      return jsonResponse(req, res, 200, {
-        status: 'ok',
+      const stale =
+        connStatus === 'connected' &&
+        checkHeartbeat(Date.now(), lastInboundAt, HEALTH_STALE_THRESHOLD_MS);
+      const httpStatus = stale ? 503 : 200;
+      return jsonResponse(req, res, httpStatus, {
+        status: stale ? 'degraded' : 'ok',
         connected: connStatus === 'connected',
+        stale,
+        last_inbound_age_ms: connStatus === 'connected' ? Date.now() - lastInboundAt : null,
         session_id: sessionId || null,
       });
     }
