@@ -2707,6 +2707,48 @@ fn build_silent_agent_loop_result(
     }
 }
 
+/// Push the synthetic `[no reply needed]` assistant marker, persist the
+/// session unless this is a fork, and build the silent `AgentLoopResult`.
+///
+/// Six call sites in the agent loop drop a turn for various reasons
+/// (canonical NO_REPLY sentinel, progress-text leak, system-prompt
+/// regurgitation — each in both the streaming and non-streaming
+/// finalize paths) and used to inline the same 11-line tail. Centralising
+/// here keeps the marker text, the fork-vs-real-session save policy,
+/// and the result construction in one place.
+#[allow(clippy::too_many_arguments)]
+async fn silent_drop(
+    session: &mut Session,
+    memory: &MemorySubstrate,
+    is_fork: bool,
+    total_usage: TokenUsage,
+    iteration: u32,
+    parsed_directives: crate::reply_directives::DirectiveSet,
+    decision_traces: Vec<DecisionTrace>,
+    memories_used: Vec<String>,
+    experiment_context: Option<ExperimentContext>,
+    new_messages_start: usize,
+) -> LibreFangResult<AgentLoopResult> {
+    session
+        .messages
+        .push(Message::assistant("[no reply needed]".to_string()));
+    if !is_fork {
+        memory
+            .save_session_async(session)
+            .await
+            .map_err(|e| LibreFangError::Memory(e.to_string()))?;
+    }
+    Ok(build_silent_agent_loop_result(
+        total_usage,
+        iteration + 1,
+        parsed_directives,
+        decision_traces,
+        memories_used,
+        experiment_context,
+        new_messages_start,
+    ))
+}
+
 enum EndTurnRetry {
     EmptyResponse { is_silent_failure: bool },
     HallucinatedAction,
@@ -2842,9 +2884,12 @@ async fn finalize_successful_end_turn(
         if response_meaningful {
             // The `[recall:turn]` / `[/recall]` markers anchor the
             // block as a memory record so the model does not confuse
-            // retrieved bullets with a live user/assistant turn. Use
-            // `Display` (not `Debug`) so accents and emoji reach the
-            // embedding driver as raw UTF-8.
+            // retrieved bullets with a live user/assistant turn. Do
+            // NOT reshape this back into a `User asked: / I responded:`
+            // wording — the conversational form caused the model to
+            // recite past memory bullets as if they were the live turn.
+            // Use `Display` (not `Debug`) so accents and emoji reach
+            // the embedding driver as raw UTF-8.
             let interaction_text = format!(
                 "[recall:turn]\nuser: {}\n---\nagent: {}\n[/recall]",
                 ctx.user_message, end_turn.final_response,
@@ -3600,24 +3645,19 @@ pub async fn run_agent_loop(
                         "Agent chose silent completion"
                     );
                     debug!(agent = %manifest.name, "Agent chose NO_REPLY/silent — silent completion");
-                    session
-                        .messages
-                        .push(Message::assistant("[no reply needed]".to_string()));
-                    if !opts.is_fork {
-                        memory
-                            .save_session_async(session)
-                            .await
-                            .map_err(|e| LibreFangError::Memory(e.to_string()))?;
-                    }
-                    return Ok(build_silent_agent_loop_result(
+                    return silent_drop(
+                        session,
+                        memory,
+                        opts.is_fork,
                         total_usage,
-                        iteration + 1,
+                        iteration,
                         parsed_directives,
                         decision_traces,
                         memories_used.clone(),
                         experiment_context.clone(),
                         new_messages_start,
-                    ));
+                    )
+                    .await;
                 }
 
                 // Progress-text-leak guard: model emitted a short ellipsis-
@@ -3635,22 +3675,19 @@ pub async fn run_agent_loop(
                         text_excerpt = %text.chars().take(80).collect::<String>(),
                         "Progress-text leak detected (ellipsis-terminated short reply without tool_use) — dropping as silent"
                     );
-                    session
-                        .messages
-                        .push(Message::assistant("[no reply needed]".to_string()));
-                    memory
-                        .save_session_async(session)
-                        .await
-                        .map_err(|e| LibreFangError::Memory(e.to_string()))?;
-                    return Ok(build_silent_agent_loop_result(
+                    return silent_drop(
+                        session,
+                        memory,
+                        false, // progress-text leak: always persist regardless of fork
                         total_usage,
-                        iteration + 1,
+                        iteration,
                         parsed_directives,
                         decision_traces,
                         memories_used.clone(),
                         experiment_context.clone(),
                         new_messages_start,
-                    ));
+                    )
+                    .await;
                 }
 
                 if crate::silent_response::is_prompt_leak(&text) {
@@ -3661,24 +3698,19 @@ pub async fn run_agent_loop(
                         text_excerpt = %text.chars().take(120).collect::<String>(),
                         "System-prompt regurgitation detected — dropping as silent"
                     );
-                    session
-                        .messages
-                        .push(Message::assistant("[no reply needed]".to_string()));
-                    if !opts.is_fork {
-                        memory
-                            .save_session_async(session)
-                            .await
-                            .map_err(|e| LibreFangError::Memory(e.to_string()))?;
-                    }
-                    return Ok(build_silent_agent_loop_result(
+                    return silent_drop(
+                        session,
+                        memory,
+                        opts.is_fork,
                         total_usage,
-                        iteration + 1,
+                        iteration,
                         parsed_directives,
                         decision_traces,
                         memories_used.clone(),
                         experiment_context.clone(),
                         new_messages_start,
-                    ));
+                    )
+                    .await;
                 }
 
                 match classify_end_turn_retry(EndTurnRetryContext {
@@ -5063,24 +5095,19 @@ pub async fn run_agent_loop_streaming(
                         "Agent chose silent completion"
                     );
                     debug!(agent = %manifest.name, "Agent chose NO_REPLY/silent (streaming) — silent completion");
-                    session
-                        .messages
-                        .push(Message::assistant("[no reply needed]".to_string()));
-                    if !opts.is_fork {
-                        memory
-                            .save_session_async(session)
-                            .await
-                            .map_err(|e| LibreFangError::Memory(e.to_string()))?;
-                    }
-                    return Ok(build_silent_agent_loop_result(
+                    return silent_drop(
+                        session,
+                        memory,
+                        opts.is_fork,
                         total_usage,
-                        iteration + 1,
+                        iteration,
                         parsed_directives_s,
                         decision_traces,
                         memories_used.clone(),
                         experiment_context.clone(),
                         new_messages_start,
-                    ));
+                    )
+                    .await;
                 }
 
                 // Progress-text-leak guard (streaming path) — see non-stream
@@ -5095,22 +5122,19 @@ pub async fn run_agent_loop_streaming(
                         text_excerpt = %text.chars().take(80).collect::<String>(),
                         "Progress-text leak detected (streaming, ellipsis-terminated short reply without tool_use) — dropping as silent"
                     );
-                    session
-                        .messages
-                        .push(Message::assistant("[no reply needed]".to_string()));
-                    memory
-                        .save_session_async(session)
-                        .await
-                        .map_err(|e| LibreFangError::Memory(e.to_string()))?;
-                    return Ok(build_silent_agent_loop_result(
+                    return silent_drop(
+                        session,
+                        memory,
+                        false, // progress-text leak: always persist regardless of fork
                         total_usage,
-                        iteration + 1,
+                        iteration,
                         parsed_directives_s,
                         decision_traces,
                         memories_used.clone(),
                         experiment_context.clone(),
                         new_messages_start,
-                    ));
+                    )
+                    .await;
                 }
 
                 if crate::silent_response::is_prompt_leak(&text) {
@@ -5122,24 +5146,19 @@ pub async fn run_agent_loop_streaming(
                         text_excerpt = %text.chars().take(120).collect::<String>(),
                         "System-prompt regurgitation detected (streaming) — dropping as silent"
                     );
-                    session
-                        .messages
-                        .push(Message::assistant("[no reply needed]".to_string()));
-                    if !opts.is_fork {
-                        memory
-                            .save_session_async(session)
-                            .await
-                            .map_err(|e| LibreFangError::Memory(e.to_string()))?;
-                    }
-                    return Ok(build_silent_agent_loop_result(
+                    return silent_drop(
+                        session,
+                        memory,
+                        opts.is_fork,
                         total_usage,
-                        iteration + 1,
+                        iteration,
                         parsed_directives_s,
                         decision_traces,
                         memories_used.clone(),
                         experiment_context.clone(),
                         new_messages_start,
-                    ));
+                    )
+                    .await;
                 }
 
                 match classify_end_turn_retry(EndTurnRetryContext {

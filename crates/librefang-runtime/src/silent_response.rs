@@ -152,7 +152,7 @@ const PROMPT_LEAK_TAG_PAIRS: &[(&str, &str)] = &[
 /// the regurgitation guard. Real replies almost never carry this many; system
 /// prompts always do. Three is high enough that a short reply with one or
 /// two genuine sub-headings slips through.
-pub const PROMPT_LEAK_HEADER_THRESHOLD: usize = 3;
+const PROMPT_LEAK_HEADER_THRESHOLD: usize = 3;
 
 /// Classify a response as a system-prompt leak: the model regurgitated
 /// chunks of its own context (memory bullets, dynamic sections, persona
@@ -397,36 +397,36 @@ mod tests {
     }
 
     // --- is_prompt_leak — output guard ---
+    fn h2_dump(n: usize) -> String {
+        (0..n)
+            .map(|i| format!("## H{i}\nbody {i}"))
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
     #[test]
-    fn is_prompt_leak_template_wrapped_response_is_dropped() {
+    fn template_wrapped_response_is_dropped() {
         assert!(is_prompt_leak(
             "<answer>\nUser asked: foo\nI responded: bar\n</answer>"
         ));
         assert!(is_prompt_leak("<response>some content</response>"));
         assert!(is_prompt_leak("<reply>x</reply>"));
-        // Whitespace tolerance.
         assert!(is_prompt_leak("  <answer>x</answer>  "));
     }
 
     #[test]
-    fn is_prompt_leak_threshold_h2_headers_are_dropped() {
-        // Build the dump dynamically from the threshold so changing
-        // the constant cannot silently break the test intent.
-        let dump = (0..PROMPT_LEAK_HEADER_THRESHOLD)
-            .map(|i| format!("## H{i}\nbody {i}"))
-            .collect::<Vec<_>>()
-            .join("\n");
-        assert!(is_prompt_leak(&dump));
-        // One below threshold must still be deliverable.
-        let under = (0..PROMPT_LEAK_HEADER_THRESHOLD - 1)
-            .map(|i| format!("## H{i}\nbody {i}"))
-            .collect::<Vec<_>>()
-            .join("\n");
-        assert!(!is_prompt_leak(&under));
+    fn threshold_h2_headers_are_dropped() {
+        // Build dynamically so changing the threshold cannot silently
+        // break the test intent. `saturating_sub` handles the
+        // (nonsensical) zero-threshold edge without panicking.
+        assert!(is_prompt_leak(&h2_dump(PROMPT_LEAK_HEADER_THRESHOLD)));
+        assert!(!is_prompt_leak(&h2_dump(
+            PROMPT_LEAK_HEADER_THRESHOLD.saturating_sub(1)
+        )));
     }
 
     #[test]
-    fn is_prompt_leak_plain_reply_is_delivered() {
+    fn plain_reply_is_delivered() {
         assert!(!is_prompt_leak(""));
         assert!(!is_prompt_leak("Subito, Signore."));
         assert!(!is_prompt_leak("Ho registrato la spesa."));
@@ -434,7 +434,7 @@ mod tests {
     }
 
     #[test]
-    fn is_prompt_leak_unwrapped_angle_bracket_tag_is_delivered() {
+    fn unwrapped_angle_bracket_tag_is_delivered() {
         // A `<answer>` mention without a matching close tag is real
         // content (the model is explaining or quoting), not a wrap.
         assert!(!is_prompt_leak("<answer> is a literal tag I'm explaining"));
