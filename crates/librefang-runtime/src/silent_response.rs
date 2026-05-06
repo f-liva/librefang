@@ -96,19 +96,15 @@ pub fn is_silent_response(text: &str) -> bool {
     // (anything that is not alphanumeric, underscore, bracket, or space).
     let stripped = strip_trailing_noise(trimmed);
 
-    if matches_canonical(stripped) {
+    // Order is hot-path-first: real replies almost never start with `<`,
+    // so `matches_placeholder_tag` rejects in two byte loads. The other
+    // two checks each lowercase-allocate the trimmed string, which is
+    // wasteful on the >99% non-silent path.
+    if matches_placeholder_tag(stripped) {
         return true;
     }
 
-    // Defensive: catch placeholder tags the model invents when it
-    // misreads "no response" as "respond with a placeholder". Any
-    // single short angle-bracket tag with no whitespace inside
-    // (e.g. <empty>, <response>, <silent>, <no_reply>) is treated as
-    // silent so it never reaches the user. Real reply content with
-    // HTML/XML survives because it either contains attributes
-    // (whitespace), inner content with `>`, or runs longer than 32
-    // chars.
-    if matches_placeholder_tag(stripped) {
+    if matches_canonical(stripped) {
         return true;
     }
 
