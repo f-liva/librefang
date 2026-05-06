@@ -3443,6 +3443,17 @@ function gracefulShutdown(signal) {
   }
   server.close(() => {
     clearTimeout(forceExitTimer);
+    // Issue #20 — checkpoint + close the SQLite handle so the WAL sidecar
+    // is flushed back into the main DB file before we exit. better-sqlite3
+    // in WAL mode is durable across SIGKILL, but a clean checkpoint avoids
+    // a stale .wal sitting around for the next boot to replay (and removes
+    // the small risk of WAL bloat under repeated kill/restart cycles).
+    try {
+      db.pragma('wal_checkpoint(TRUNCATE)');
+      db.close();
+    } catch (err) {
+      console.warn('[gateway] db close failed:', err && err.message ? err.message : err);
+    }
     console.log('[gateway] Shutdown complete');
     process.exit(0);
   });
