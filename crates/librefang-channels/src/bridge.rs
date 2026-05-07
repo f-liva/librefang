@@ -2496,14 +2496,10 @@ async fn dispatch_message(
                 }
                 return;
             }
-            // Gating pass: drain the buffer for this group so the
-            // accumulated context is consumed exactly once. The drained
-            // entries are logged structurally (tracing) so downstream
-            // observability can correlate the agent's response to the
-            // prior context, even though the kernel-side prompt
-            // enrichment is not yet wired here (see follow-up
-            // — needs `&mut ChannelMessage` plumbing through dispatch
-            // or equivalent).
+            // Gating pass: drain the buffer so the accumulated context
+            // is consumed exactly once. Drained entries are logged for
+            // observability; kernel-side prompt enrichment is a TODO
+            // pending `&mut ChannelMessage` plumbing through dispatch.
             if let Some(buffer) = crate::group_history::global() {
                 let key = crate::group_history::group_key(ct_str, &group_id);
                 if let Some(drained) = buffer.drain(&key).await {

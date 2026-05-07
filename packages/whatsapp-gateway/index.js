@@ -22,30 +22,21 @@ const {
 const { buildSessionKey, channelTypeForChat } = require('./lib/session-key');
 
 // ---------------------------------------------------------------------------
-// Process-level error handlers 
+// Process-level error handlers
 // ---------------------------------------------------------------------------
-// Without these, an unhandled rejection from a setTimeout/setInterval
-// callback (e.g. the reconnect timer, the catch-up sweep, the dedup-store
-// eviction) terminates the process under Node 15+ default behaviour. PM2
-// would restart but the auth state could be left in an indeterminate
-// shape and the operator gets no signal. We log explicitly so the
-// post-mortem doesn't require diff'ing PM2 restart counts against
-// ambient cron noise.
+// Surface unhandled rejections explicitly (Node 15+ would otherwise kill
+// the process on the next tick) and let PM2 restart on truly synchronous
+// faults via uncaughtException + exit(1).
 process.on('unhandledRejection', (reason, promise) => {
   const detail =
     reason && (reason.stack || reason.message)
       ? reason.stack || reason.message
       : String(reason);
   console.error('[gateway][CRITICAL] unhandledRejection:', detail);
-  // Don't exit — PM2 would restart on the next signal anyway and most
-  // unhandled rejections in this codebase are recoverable (network blips
-  // in setInterval cleanups). Logging gives us the visibility we need.
 });
 process.on('uncaughtException', (err) => {
   const detail = err && (err.stack || err.message) ? err.stack || err.message : String(err);
   console.error('[gateway][CRITICAL] uncaughtException:', detail);
-  // Uncaught synchronous throws indicate truly broken state — exit and
-  // let PM2 restart.
   process.exit(1);
 });
 
@@ -407,18 +398,13 @@ let isConnecting = false;
 // forces reconnect before auth stabilizes and the loop never settles.
 const HEARTBEAT_MS = parseInt(process.env.WA_HEARTBEAT_MS || '300000', 10);
 const HEARTBEAT_CHECK_INTERVAL_MS = parseInt(process.env.WA_HEARTBEAT_CHECK_MS || '30000', 10);
-// separate threshold for the /health endpoint so external
-// monitoring degrades earlier than the watchdog's force-reconnect
-// trigger. 5 minutes is enough to filter out brief WhatsApp server
-// pauses without false-flagging a dead socket.
+// `/health` reports `degraded` past this; kept under HEARTBEAT_MS so
+// external monitoring sees trouble before the watchdog reconnect fires.
 const HEALTH_STALE_THRESHOLD_MS = parseInt(process.env.WA_HEALTH_STALE_MS || '300000', 10);
 let lastInboundAt = Date.now();
 let heartbeatInterval = null;
-// lifted to module scope so `cleanupSocket()` can clear it
-// alongside `heartbeatInterval`, instead of relying on a second
-// `sock.ev.on('connection.update', ...)` listener (which doubled the
-// fire count for every connection event). Set inside `startConnection`,
-// cleared on every teardown path.
+// Module-scoped so `cleanupSocket()` can clear it alongside
+// `heartbeatInterval` without a second `connection.update` listener.
 let gapDetectionTimer = null;
 
 // Pure predicate — true when we've been silent longer than thresholdMs.
@@ -1302,10 +1288,8 @@ async function cleanupSocket() {
     clearInterval(heartbeatInterval);
     heartbeatInterval = null;
   }
-  // gapDetectionTimer is also per-connection. Clear it
-  // alongside heartbeat so the reconnect path doesn't leave a leftover
-  // closure scanning a stale `stmtGetLastSeen` while the new sock is
-  // booting.
+  // gapDetectionTimer is per-connection too — drop it alongside the
+  // heartbeat so reconnect doesn't leak a closure on stale state.
   if (gapDetectionTimer) {
     clearInterval(gapDetectionTimer);
     gapDetectionTimer = null;
@@ -1327,12 +1311,9 @@ async function startConnection() {
   isConnecting = true;
   try {
 
-  // defensive teardown of any leftover sock + per-connection
-  // timers from a previous invocation. The normal teardown path runs in
-  // the `connection.update` close branch, but a sock that was abandoned
-  // without emitting close (e.g. process killed mid-init last cycle and
-  // PM2 respawned us) would leak its listeners and timers. The
-  // `cleanupSocket()` is a no-op when sock is already null.
+  // Defensive cleanup before re-init: covers a sock orphaned by a
+  // crash mid-init that never emitted `close` (PM2 respawn case).
+  // No-op when sock is already null.
   await cleanupSocket();
 
   // Dynamic imports — Baileys is ESM-only in v6+
@@ -2329,12 +2310,8 @@ async function startConnection() {
   }, GAP_DETECTION_INTERVAL_MS);
 
   } catch (err) {
-    // `startConnection()` previously had only try/finally so any
-    // error in dynamic import / makeWASocket / auth load was swallowed and
-    // the operator saw a bot stuck on `connStatus = 'disconnected'` with no
-    // diagnostic. Surface it: log + status update + re-throw so callers
-    // (the `await startConnection()` sites in /login/start, /reset, etc)
-    // can surface it to the HTTP response instead of returning success.
+    // Re-throw so HTTP callers and the reconnect setTimeout can react
+    // instead of seeing a silently bricked socket.
     console.error('[gateway] startConnection failed:', err && err.message ? err.message : err);
     if (err && err.stack) console.error(err.stack);
     connStatus = 'disconnected';
@@ -2944,20 +2921,15 @@ async function forwardToLibreFangStreaming(text, systemPrefix, phone, pushName, 
 const CATCHUP_INTERVAL_MS = 5 * 60 * 1000;  // 5 minutes
 const CATCHUP_AGE_MS = 30_000;               // only messages older than 30s
 const CATCHUP_MAX_RETRIES = 3;
-// bound how many messages a single sweep cycle drains. With
-// the per-agent serializing mutex inside LibreFang, a 50-message backlog
-// previously took ~25 minutes of sequential LLM calls and starved live
-// traffic. The remainder is picked up by the next sweep tick.
+// Cap per-cycle drain so a backlog doesn't hold the per-agent kernel
+// mutex for tens of minutes; the rest gets picked up next tick.
 const CATCHUP_BATCH_SIZE = 8;
-// small inter-iteration delay so a backlog doesn't hammer
-// LibreFang at line-rate. 750ms is below human-perceptible reply latency
-// for the catch-up case (which is already late by definition) and gives
-// the kernel breathing room.
+// Small pacing between iterations so back-to-back forwards don't hammer
+// the kernel at line-rate.
 const CATCHUP_INTER_DELAY_MS = 750;
-// how long the main handler can hold a `processing_since`
-// claim before the sweep treats it as expired (handler crashed without
-// releasing). 5 min covers a worst-case media-pipeline timeout (#21 cap
-// 90s) plus a comfortable margin for slow LLM forward.
+// Stale-claim cutoff: covers a worst-case media-pipeline timeout (~90s)
+// plus margin for slow LLM forward; beyond that the sweep treats the
+// row as orphaned and retries.
 const PROCESSING_LEASE_MS = 5 * 60 * 1000;
 
 async function runCatchUpSweep() {
