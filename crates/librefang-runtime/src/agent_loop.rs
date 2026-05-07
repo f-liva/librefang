@@ -1820,7 +1820,7 @@ fn sanitize_sender_label(name: &str) -> String {
 /// Returns `None` when no prefix should be applied (1:1 chat, or no sender info available).
 /// The prefix is applied AFTER PII filtering to prevent display names that look like emails
 /// or phone numbers from being redacted into the message content.
-/// Issue #3 — when the kernel synthesises a SenderContext for a system-fire
+/// when the kernel synthesises a SenderContext for a system-fire
 /// (`channel = "cron"` or `channel = "autonomous"`), the user message that
 /// reaches the LLM is otherwise indistinguishable from a real human turn.
 /// The model has been observed answering a scheduled trigger as if a human
@@ -3195,7 +3195,7 @@ pub async fn run_agent_loop(
     // (see push_filtered_user_message) so display names that look like emails/phones do not
     // get redacted into the stored content.
     let sender_prefix = build_group_sender_prefix(manifest, sender_user_id.as_deref());
-    // Issue #3 — automation marker for cron / autonomous-loop fires so the
+    // automation marker for cron / autonomous-loop fires so the
     // model can tell a scheduled trigger from a real human turn. Mutually
     // exclusive with `sender_prefix` in practice (cron fires aren't groups).
     let automation_marker = build_automation_marker_prefix(sender_channel.as_deref());
@@ -3961,7 +3961,7 @@ pub async fn run_agent_loop(
                     // Stop executing remaining tool calls on failure (#948)
                     // but not for approval denials or sandbox security rejections —
                     // those should let the LLM recover and retry with a valid path (#1861)
-                    // Issue #2381: emit stub tool_results for the remaining unexecuted
+                    // emit stub tool_results for the remaining unexecuted
                     // calls so OpenAI / Anthropic see a response for every tool_call_id.
                     // Without this the next API request returns 400 with
                     // "tool_call_ids ... did not have response messages" and the agent
@@ -4617,7 +4617,7 @@ pub async fn run_agent_loop_streaming(
     // (see push_filtered_user_message) so display names that look like emails/phones do not
     // get redacted into the stored content.
     let sender_prefix = build_group_sender_prefix(manifest, sender_user_id.as_deref());
-    // Issue #3 — automation marker for cron / autonomous-loop fires so the
+    // automation marker for cron / autonomous-loop fires so the
     // model can tell a scheduled trigger from a real human turn. Mutually
     // exclusive with `sender_prefix` in practice (cron fires aren't groups).
     let automation_marker = build_automation_marker_prefix(sender_channel.as_deref());
@@ -5465,7 +5465,7 @@ pub async fn run_agent_loop_streaming(
                     // Stop executing remaining tool calls on failure (#948)
                     // but not for approval denials or sandbox security rejections —
                     // those should let the LLM recover and retry with a valid path (#1861)
-                    // Issue #2381: stub the remaining tool_calls so every tool_call_id
+                    // stub the remaining tool_calls so every tool_call_id
                     // has a matching tool_result. See the non-streaming branch above for
                     // the full explanation of why this matters.
                     let is_soft_error = executed.result.status.is_soft_error()

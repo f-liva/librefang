@@ -1,6 +1,6 @@
 //! Group-message retention buffer for messages skipped by gating.
 //!
-//! Issue #39: in `mention_required` group mode, messages that don't address
+//! in `mention_required` group mode, messages that don't address
 //! the agent are dropped at gating time. If they carry attachments (PDF,
 //! image, voice) those attachments are lost — when the agent is finally
 //! addressed and asked about prior context ("look at the attachment mum
@@ -53,7 +53,7 @@ pub fn group_key(channel_type_str: &str, group_jid: &str) -> String {
 /// Default retention window for buffered group messages.
 ///
 /// 24h matches the WhatsApp gateway's own `pending_group_history` TTL
-/// from the pre-Phase-07 design (issue #39 history); long enough to
+/// from the pre-Phase-07 design; long enough to
 /// cover a "this morning's bolletta arrived, agent re-engaged this
 /// evening" gap, short enough that the buffer doesn't grow without
 /// bound on noisy groups.

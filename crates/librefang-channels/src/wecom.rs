@@ -381,7 +381,7 @@ enum Mode {
         encoding_aes_key: Option<String>,
         /// Bot webhook key for proactive messages (extracted from first response_url).
         webhook_key: Arc<RwLock<Option<String>>>,
-        /// Issue #27 — per-user `response_url` cache so reply paths can quote
+        /// per-user `response_url` cache so reply paths can quote
         /// the exact one-time URL the platform delivered with the inbound
         /// message instead of falling back to the webhook key for every
         /// outbound. WeCom invalidates the URL after ~5 min, so we evict on
@@ -392,7 +392,7 @@ enum Mode {
     },
 }
 
-/// Issue #27 — TTL for cached `response_url` entries. WeCom documents the
+/// TTL for cached `response_url` entries. WeCom documents the
 /// URL as one-shot per inbound; in practice the platform tolerates the
 /// reply for a few minutes. Five minutes is conservative — outside that
 /// window we drop back to the webhook key (which always works for proactive
@@ -1298,7 +1298,7 @@ impl ChannelAdapter for WeComAdapter {
                                         "wecom_response_url".to_string(),
                                         serde_json::json!(response_url),
                                     );
-                                    // Issue #27 — cache the per-user response_url so
+                                    // cache the per-user response_url so
                                     // the `send()` path (which only sees `&ChannelUser`,
                                     // not the originating `ChannelMessage`) can quote
                                     // the exact one-time URL the platform delivered.
@@ -1452,7 +1452,7 @@ impl ChannelAdapter for WeComAdapter {
                 response_urls,
                 ..
             } => {
-                // Issue #27 — look up the cached `response_url` for this
+                // look up the cached `response_url` for this
                 // user. The cache is populated by the inbound POST handler
                 // when the platform delivers a `response_url` alongside the
                 // message. Entries older than `RESPONSE_URL_TTL` are evicted

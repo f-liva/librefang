@@ -957,7 +957,7 @@ pub struct BridgeManager {
     /// Single-process thread-ownership claims. Suppresses multi-agent
     /// duplicate replies in shared group threads (#3334).
     thread_ownership: Arc<crate::thread_ownership::ThreadOwnershipRegistry>,
-    /// Issue #39 — buffer of group messages skipped by gating, drained
+    /// buffer of group messages skipped by gating, drained
     /// when the agent is next addressed in the same group so it doesn't
     /// lose the attachments and context other participants posted while
     /// it was silent.
@@ -980,7 +980,7 @@ impl BridgeManager {
             webhook_routes: Vec::new(),
             journal: None,
             thread_ownership: Arc::new(crate::thread_ownership::ThreadOwnershipRegistry::new()),
-            // Issue #39 — install process-wide buffer on first construct so
+            // install process-wide buffer on first construct so
             // dispatch helpers can reach it without signature churn.
             group_history: crate::group_history::install_global(Arc::new(
                 crate::group_history::GroupHistoryBuffer::with_default_retention(),
@@ -1007,7 +1007,7 @@ impl BridgeManager {
             webhook_routes: Vec::new(),
             journal: None,
             thread_ownership: Arc::new(crate::thread_ownership::ThreadOwnershipRegistry::new()),
-            // Issue #39 — install process-wide buffer on first construct so
+            // install process-wide buffer on first construct so
             // dispatch helpers can reach it without signature churn.
             group_history: crate::group_history::install_global(Arc::new(
                 crate::group_history::GroupHistoryBuffer::with_default_retention(),
@@ -1026,7 +1026,7 @@ impl BridgeManager {
         self.journal.as_ref()
     }
 
-    /// Issue #39 — accessor for the group-history buffer. Lets the
+    /// accessor for the group-history buffer. Lets the
     /// dispatch path record skipped group messages and drain them on
     /// the next gating-pass for the same group. Returned as `Arc` so
     /// the per-adapter spawn task can capture it independently of the
@@ -2463,7 +2463,7 @@ async fn dispatch_message(
     // --- DM/Group policy check ---
     if let Some(ref ov) = overrides {
         if message.is_group {
-            // Issue #39 — capture the group_jid before the gating call so
+            // capture the group_jid before the gating call so
             // both branches (record-on-skip, drain-on-pass) can use the
             // same key without re-deriving it. The bridge keys group
             // messages by `sender.platform_id` (= chat JID for groups).
@@ -2501,7 +2501,7 @@ async fn dispatch_message(
             // entries are logged structurally (tracing) so downstream
             // observability can correlate the agent's response to the
             // prior context, even though the kernel-side prompt
-            // enrichment is not yet wired here (see issue #39 follow-up
+            // enrichment is not yet wired here (see follow-up
             // — needs `&mut ChannelMessage` plumbing through dispatch
             // or equivalent).
             if let Some(buffer) = crate::group_history::global() {
