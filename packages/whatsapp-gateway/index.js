@@ -22,7 +22,7 @@ const {
 const { buildSessionKey, channelTypeForChat } = require('./lib/session-key');
 
 // ---------------------------------------------------------------------------
-// Process-level error handlers (issue #14)
+// Process-level error handlers 
 // ---------------------------------------------------------------------------
 // Without these, an unhandled rejection from a setTimeout/setInterval
 // callback (e.g. the reconnect timer, the catch-up sweep, the dedup-store
@@ -123,7 +123,7 @@ db.exec(`
   CREATE INDEX IF NOT EXISTS idx_messages_processed ON messages(processed);
 `);
 
-// Issue #18 — `processing_since` column lets the catch-up sweep skip
+// `processing_since` column lets the catch-up sweep skip
 // rows that the main handler is currently working on (e.g. slow media
 // download). Without it the sweep can re-forward a message before the
 // main handler finishes, producing duplicate agent turns. SQLite has no
@@ -181,7 +181,7 @@ const stmtGetByJid = db.prepare(`
   FROM messages WHERE jid = ? AND timestamp >= ? ORDER BY timestamp DESC LIMIT ?
 `);
 
-// Issue #18 — `(processing_since IS NULL OR processing_since < ?)` skips
+// `(processing_since IS NULL OR processing_since < ?)` skips
 // rows the main handler claimed less than PROCESSING_LEASE_MS ago. The
 // caller passes `Date.now() - PROCESSING_LEASE_MS` as the second
 // parameter so a stale lease (handler crashed without releasing) still
@@ -257,7 +257,7 @@ function dbGetMessagesByJid(jid, limit = 20, since = 0) {
  * Get all unprocessed messages older than a threshold (epoch ms),
  * skipping rows currently being processed by another handler.
  *
- * Issue #18 — `processingLeaseExpiredBefore` is the cutoff such that any
+ * `processingLeaseExpiredBefore` is the cutoff such that any
  * row with `processing_since >= processingLeaseExpiredBefore` is treated
  * as actively in-flight and excluded. Pass `Date.now() - PROCESSING_LEASE_MS`
  * to drain only rows whose claim is older than the lease (covers the
@@ -268,7 +268,7 @@ function dbGetUnprocessed(olderThan, processingLeaseExpiredBefore = Date.now()) 
 }
 
 /**
- * Issue #18 — claim a row for processing by stamping `processing_since`.
+ * claim a row for processing by stamping `processing_since`.
  * The main inbound handler calls this just before async media processing
  * + forward, and `dbClearProcessing` on completion (regardless of success).
  * The lease is bounded by PROCESSING_LEASE_MS so a crashed handler's
@@ -405,14 +405,14 @@ let isConnecting = false;
 // over. The 180s default matches the openclaw reference.
 const HEARTBEAT_MS = parseInt(process.env.WA_HEARTBEAT_MS || '180000', 10);
 const HEARTBEAT_CHECK_INTERVAL_MS = parseInt(process.env.WA_HEARTBEAT_CHECK_MS || '30000', 10);
-// Issue #24 — separate threshold for the /health endpoint so external
+// separate threshold for the /health endpoint so external
 // monitoring degrades earlier than the watchdog's force-reconnect
 // trigger. 5 minutes is enough to filter out brief WhatsApp server
 // pauses without false-flagging a dead socket.
 const HEALTH_STALE_THRESHOLD_MS = parseInt(process.env.WA_HEALTH_STALE_MS || '300000', 10);
 let lastInboundAt = Date.now();
 let heartbeatInterval = null;
-// Issue #15 — lifted to module scope so `cleanupSocket()` can clear it
+// lifted to module scope so `cleanupSocket()` can clear it
 // alongside `heartbeatInterval`, instead of relying on a second
 // `sock.ev.on('connection.update', ...)` listener (which doubled the
 // fire count for every connection event). Set inside `startConnection`,
@@ -434,7 +434,7 @@ function computeBackoffDelay(attempts, rng = Math.random) {
 }
 
 // Cached agent UUID — resolved from DEFAULT_AGENT name on first use.
-// Issue #19 — persisted to disk so a gateway restart doesn't force a fresh
+// persisted to disk so a gateway restart doesn't force a fresh
 // resolveAgentId() round-trip, which fails when LibreFang is still booting.
 // On boot we read the file (if any); on every successful resolve we write
 // it back. The file is small (UUID + name) and lives next to messages.db.
@@ -624,7 +624,7 @@ async function resolveLidProactively(sock, lid, cache, timeoutMs = 5000) {
 // (key + message + timestamp + participant — what `sock.sendMessage` needs
 // for the `quoted` option to render a reply-thread bubble on the WA UI).
 //
-// Issue #40: agent-side `reply_to_msg_id` was being POSTed to the gateway
+// agent-side `reply_to_msg_id` was being POSTed to the gateway
 // but silently dropped. The fix wires the body field through here so the
 // outbound send can quote the original message.
 const MESSAGE_STORE_MAX = 500;
@@ -1035,7 +1035,7 @@ function wrapStrangerInbound(jid, pushName, isoTimestamp, text, opts = {}) {
 // PLAN-02) structurally enforces tool-only output during a stranger turn:
 // the model emits `channel_send` / `notify_owner` tool calls, no free
 // prose ever reaches the stranger dispatch site. The regex bandage from
-// issue #42 hot-fix (commit 18d9e3c5) is therefore redundant and removed.
+// hot-fix (commit 18d9e3c5) is therefore redundant and removed.
 //
 // Bonus: eliminates false-positive risk on legitimate stranger replies
 // containing the literals "Signore", "/message/send", or `{"success":true}`
@@ -1296,7 +1296,7 @@ async function cleanupSocket() {
     clearInterval(heartbeatInterval);
     heartbeatInterval = null;
   }
-  // Issue #15 / #17 — gapDetectionTimer is also per-connection. Clear it
+  // gapDetectionTimer is also per-connection. Clear it
   // alongside heartbeat so the reconnect path doesn't leave a leftover
   // closure scanning a stale `stmtGetLastSeen` while the new sock is
   // booting.
@@ -1321,7 +1321,7 @@ async function startConnection() {
   isConnecting = true;
   try {
 
-  // Issue #17 — defensive teardown of any leftover sock + per-connection
+  // defensive teardown of any leftover sock + per-connection
   // timers from a previous invocation. The normal teardown path runs in
   // the `connection.update` close branch, but a sock that was abandoned
   // without emitting close (e.g. process killed mid-init last cycle and
@@ -1425,7 +1425,7 @@ async function startConnection() {
         );
         connStatus = 'disconnected';
         statusMessage = `Reconnecting (attempt ${reconnectAttempts})...`;
-        // Issue #13 / #14 — startConnection now throws on failure (was
+        // startConnection now throws on failure (was
         // try/finally only); a setTimeout-fired rejection would otherwise
         // become an unhandled rejection. The catch keeps the next reconnect
         // tick scheduled (we'll retry on the next connection.update close).
@@ -1733,7 +1733,7 @@ async function startConnection() {
       let transcriptionText = '';
 
       if (downloadableMedia) {
-        // Issue #21 — overall pipeline timeout. The internal stages
+        // overall pipeline timeout. The internal stages
         // (download 30s + retry, upload 60s) can stack to ~120s and block
         // every other inbound message behind this single one. Cap the
         // total at MEDIA_PIPELINE_TIMEOUT_MS so a slow giant-video upload
@@ -1817,7 +1817,7 @@ async function startConnection() {
 
       if (contextInfo?.quotedMessage) {
         const quoted = contextInfo.quotedMessage;
-        // Issue #48 — the prefix only fires on text/extendedText/image+caption/
+        // the prefix only fires on text/extendedText/image+caption/
         // video+caption. Replies to voice notes, stickers, plain images,
         // documents, locations, contacts came through nudo without the
         // `[In risposta a: ...]` marker, breaking conversational reference.
@@ -1883,13 +1883,13 @@ async function startConnection() {
         processed: 0,
         rawType,
       });
-      // Issue #18 — claim the row before the slow media + forward path so
+      // claim the row before the slow media + forward path so
       // the catch-up sweep can't race and re-deliver the same message
       // while we're still processing it.
       dbMarkProcessing(msg.key.id);
       dbUpdateLastSeen(sender, msgTimestamp);
 
-      // Send read receipt (blue ticks) immediately. Issue #16 — guard
+      // Send read receipt (blue ticks) immediately. guard
       // against `sock` being nulled out by a concurrent reconnect (the
       // upsert handler is async, sock is a global). A failed read receipt
       // is cosmetic; do not let it crash the message handler.
@@ -1963,7 +1963,7 @@ async function startConnection() {
 
         // --- Streaming: progressive message edits while LLM generates ---
         let streamMsgKey = null; // key of the initial WhatsApp message we'll edit
-        // Issue #23 — bound consecutive sendMessage failures so a flaky
+        // bound consecutive sendMessage failures so a flaky
         // connection mid-stream doesn't produce 10+ warn logs and a
         // truncated message. After STREAM_EDIT_MAX_FAILURES consecutive
         // misses, give up streaming edits and let the final delivery
@@ -1972,13 +1972,13 @@ async function startConnection() {
         let streamEditFailures = 0;
         const onProgress = async (partialText) => {
           if (streamEditFailures >= STREAM_EDIT_MAX_FAILURES) return;
-          // Issue #16 — snapshot the sock at callback entry. The global
+          // snapshot the sock at callback entry. The global
           // `sock` can be nulled out by a concurrent reconnect between
           // the existence check and the actual sendMessage await.
           const localSock = sock;
           if (!localSock) return;
           // Phase 08 §E: removed `if (isStranger) return;` early-return
-          // (issue #41 hot-fix from commit 11adcd8a). Now redundant: the
+          // (hot-fix 11adcd8a). Now redundant: the
           // §B Section 9.7 kernel contract forces tool-only output during a
           // stranger turn, so no prose ever reaches this onProgress callback
           // for a stranger anyway. Removing the early-return restores
@@ -2172,7 +2172,7 @@ async function startConnection() {
 
       } catch (err) {
         console.error(`[gateway] Forward/reply failed:`, err.message);
-        // Issue #18 — release the processing lease so the next sweep
+        // release the processing lease so the next sweep
         // cycle can retry this row immediately, instead of waiting for
         // PROCESSING_LEASE_MS to expire. Message stays processed=0.
         dbClearProcessing(msg.key.id);
@@ -2261,7 +2261,7 @@ async function startConnection() {
   const GAP_DETECTION_INTERVAL_MS = 10 * 60 * 1000;  // check every 10 min
   const GAP_THRESHOLD_MS = 30 * 60 * 1000;            // 30 min silence = warning
 
-  // Issue #15 — gapDetectionTimer is module-scoped so `cleanupSocket()`
+  // gapDetectionTimer is module-scoped so `cleanupSocket()`
   // tears it down on every reconnect path (loggedOut, forbidden, normal
   // reconnect, shutdown). Previously we registered a second
   // `connection.update` listener just to clear it on close — that
@@ -2284,7 +2284,7 @@ async function startConnection() {
   }, GAP_DETECTION_INTERVAL_MS);
 
   } catch (err) {
-    // Issue #13 — `startConnection()` previously had only try/finally so any
+    // `startConnection()` previously had only try/finally so any
     // error in dynamic import / makeWASocket / auth load was swallowed and
     // the operator saw a bot stuck on `connStatus = 'disconnected'` with no
     // diagnostic. Surface it: log + status update + re-throw so callers
@@ -2336,7 +2336,7 @@ function getMediaDescriptor(innerMsg, senderName) {
 // ---------------------------------------------------------------------------
 const MAX_MEDIA_SIZE = 50 * 1024 * 1024; // 50MB limit
 const MEDIA_DOWNLOAD_TIMEOUT = 30_000;   // 30 seconds
-// Issue #21 — pipeline-level cap so download retries + upload + transcript
+// pipeline-level cap so download retries + upload + transcript
 // can't stack to ~120s and block other inbound messages.
 const MEDIA_PIPELINE_TIMEOUT_MS = 90_000;
 
@@ -2899,17 +2899,17 @@ async function forwardToLibreFangStreaming(text, systemPrefix, phone, pushName, 
 const CATCHUP_INTERVAL_MS = 5 * 60 * 1000;  // 5 minutes
 const CATCHUP_AGE_MS = 30_000;               // only messages older than 30s
 const CATCHUP_MAX_RETRIES = 3;
-// Issue #25 — bound how many messages a single sweep cycle drains. With
+// bound how many messages a single sweep cycle drains. With
 // the per-agent serializing mutex inside LibreFang, a 50-message backlog
 // previously took ~25 minutes of sequential LLM calls and starved live
 // traffic. The remainder is picked up by the next sweep tick.
 const CATCHUP_BATCH_SIZE = 8;
-// Issue #25 — small inter-iteration delay so a backlog doesn't hammer
+// small inter-iteration delay so a backlog doesn't hammer
 // LibreFang at line-rate. 750ms is below human-perceptible reply latency
 // for the catch-up case (which is already late by definition) and gives
 // the kernel breathing room.
 const CATCHUP_INTER_DELAY_MS = 750;
-// Issue #18 — how long the main handler can hold a `processing_since`
+// how long the main handler can hold a `processing_since`
 // claim before the sweep treats it as expired (handler crashed without
 // releasing). 5 min covers a worst-case media-pipeline timeout (#21 cap
 // 90s) plus a comfortable margin for slow LLM forward.
@@ -2991,7 +2991,7 @@ async function runCatchUpSweep() {
       console.warn(`[gateway][catchup] Failed to re-forward message ${msg.id}: ${err.message}`);
       dbIncrRetryOrFail(msg.id, CATCHUP_MAX_RETRIES);
     }
-    // Issue #25 — pace the sweep so the kernel's per-agent mutex isn't
+    // pace the sweep so the kernel's per-agent mutex isn't
     // hammered at line-rate.
     if (CATCHUP_INTER_DELAY_MS > 0) {
       await new Promise((r) => setTimeout(r, CATCHUP_INTER_DELAY_MS));
@@ -3337,7 +3337,7 @@ const server = http.createServer(async (req, res) => {
       return jsonResponse(req, res, 200, { jid, messages });
     }
 
-    // GET /health — health check. Issue #24 — `connStatus` alone reports
+    // GET /health — health check. `connStatus` alone reports
     // a dead-socket scenario as healthy (TCP RST never delivered, ISP
     // drops connection silently). Augment with a freshness check:
     // `lastInboundAt` is touched on every received message + every
@@ -3443,7 +3443,7 @@ function gracefulShutdown(signal) {
   }
   server.close(() => {
     clearTimeout(forceExitTimer);
-    // Issue #20 — checkpoint + close the SQLite handle so the WAL sidecar
+    // checkpoint + close the SQLite handle so the WAL sidecar
     // is flushed back into the main DB file before we exit. better-sqlite3
     // in WAL mode is durable across SIGKILL, but a clean checkpoint avoids
     // a stale .wal sitting around for the next boot to replay (and removes
@@ -3507,7 +3507,7 @@ module.exports = {
   runDispatchSelfTest,
   channelTypeForChat,
   buildSessionKey,
-  // Issue #40 — reply_to → quoted bubble
+  // reply_to → quoted bubble
   stripWaidPrefix,
   resolveQuotedFromReplyTo,
   messageStoreSet,
