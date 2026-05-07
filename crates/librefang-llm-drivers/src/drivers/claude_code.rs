@@ -960,8 +960,11 @@ impl LlmDriver for ClaudeCodeDriver {
                             // with a bracket (e.g. "[1] First..." lists).
                             || {
                                 let trimmed = t.trim();
-                                trimmed.starts_with('[')
-                                    && trimmed.ends_with(']')
+                                let bracket_wrapped = (trimmed.starts_with('[')
+                                    && trimmed.ends_with(']'))
+                                    || (trimmed.starts_with('(')
+                                        && trimmed.ends_with(')'));
+                                bracket_wrapped
                                     && (l.contains("reading")
                                         || l.contains("thinking")
                                         || l.contains("loading")

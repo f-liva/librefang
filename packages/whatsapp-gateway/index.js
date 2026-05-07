@@ -323,6 +323,7 @@ function readWhatsAppConfig(configPath) {
   const defaults = {
     default_agent: 'assistant',
     owner_numbers: [],
+    stream_to_channel: true,
   };
   try {
     const content = fs.readFileSync(configPath, 'utf8');
@@ -331,8 +332,9 @@ function readWhatsAppConfig(configPath) {
     const cfg = {
       default_agent: wa.default_agent || defaults.default_agent,
       owner_numbers: Array.isArray(wa.owner_numbers) ? wa.owner_numbers : defaults.owner_numbers,
+      stream_to_channel: typeof wa.stream_to_channel === 'boolean' ? wa.stream_to_channel : defaults.stream_to_channel,
     };
-    console.log(`[gateway] Read config from ${configPath}: default_agent="${cfg.default_agent}", owner_numbers=${JSON.stringify(cfg.owner_numbers)}`);
+    console.log(`[gateway] Read config from ${configPath}: default_agent="${cfg.default_agent}", owner_numbers=${JSON.stringify(cfg.owner_numbers)}, stream_to_channel=${cfg.stream_to_channel}`);
     return cfg;
   } catch (err) {
     console.warn(`[gateway] Could not read ${configPath}: ${err.message} — using defaults/env vars`);
@@ -356,6 +358,14 @@ const OWNER_NUMBERS = ownerNumbersFromEnv.length > 0 ? ownerNumbersFromEnv : tom
 const OWNER_JIDS = deriveOwnerJids(OWNER_NUMBERS);
 // Primary owner JID for unsolicited/scheduled messages only
 const OWNER_JID = OWNER_JIDS.size > 0 ? [...OWNER_JIDS][0] : '';
+
+// When false, the gateway suppresses streaming `sendMessage(..., {edit})`
+// updates to WhatsApp/Telegram and only sends the final accumulated text
+// once the agent loop completes. Trades real-time feedback for a clean
+// chat UX (no "edited" tag flicker on every chunk). Default true (preserve
+// pre-2026-05-07 behaviour). Override via `[channels.whatsapp]
+// stream_to_channel = false` in config.toml.
+const STREAM_TO_CHANNEL = tomlConfig.stream_to_channel !== false;
 
 // §A — Feature flag: when set to "off" the gateway ignores the typed
 // owner_notice channel introduced by the notify_owner LLM tool and falls
@@ -1126,6 +1136,18 @@ function isSilentResponse(text) {
     }
   }
   return false;
+}
+
+// CLI progress placeholders the model occasionally emits as a whole reply
+// (e.g. only `(thinking)` or `[Reading the conversation context]`).
+// Matches both `(parens)` and `[brackets]` shapes wrapping a single
+// progress verb. Narrow on purpose so legitimate user content that
+// happens to start with a paren or bracket is not blocked.
+const PROGRESS_PLACEHOLDER_RE = /^[\s ]*[\(\[][^\(\[\)\]]{0,80}(thinking|reading|loading|processing|analyzing|still working|conversation context)[^\(\[\)\]]{0,80}[\)\]][\s ]*$/i;
+
+function isProgressTextLeak(text) {
+  if (typeof text !== 'string' || !text) return false;
+  return PROGRESS_PLACEHOLDER_RE.test(text.trim());
 }
 
 // Legacy entry point preserved for the non-streaming and final-response
@@ -1958,6 +1980,12 @@ async function startConnection() {
         const STREAM_EDIT_MAX_FAILURES = 3;
         let streamEditFailures = 0;
         const onProgress = async (partialText) => {
+          // Streaming-to-channel disabled via `[channels.whatsapp]
+          // stream_to_channel = false` — let the final delivery path
+          // (forwardToLibreFangStreaming → sendOrEdit) handle the full
+          // text in one send so WhatsApp/Telegram don't show the
+          // "edited" tag on every chunk.
+          if (!STREAM_TO_CHANNEL) return;
           if (streamEditFailures >= STREAM_EDIT_MAX_FAILURES) return;
           // snapshot the sock at callback entry. The global
           // `sock` can be nulled out by a concurrent reconnect between
@@ -2162,13 +2190,15 @@ async function startConnection() {
             // fan-out at the `collectedOwnerNotices` block above.
             const strangerSafeText = response;
 
-            if (strangerSafeText && strangerSafeText.trim()) {
+            if (strangerSafeText && strangerSafeText.trim() && !isProgressTextLeak(strangerSafeText)) {
               const formattedText = markdownToWhatsApp(strangerSafeText);
               const sentKey = await sendOrEdit(sender, formattedText);
               console.log(`[gateway] Replied to stranger ${pushName} (${phone})${streamMsgKey ? ' (streamed)' : ''}`);
 
               // Save outbound to DB
               dbSaveMessage({ id: sentKey?.id || randomUUID(), jid: sender, senderJid: ownJid, pushName: null, phone, text: strangerSafeText, direction: 'outbound', timestamp: Date.now(), processed: 1, rawType: 'text' });
+            } else if (isProgressTextLeak(strangerSafeText)) {
+              try { console.log(JSON.stringify({ event: 'progress_placeholder_leak', branch: 'stranger', preview: strangerSafeText.slice(0, 40) })); } catch { /* noop */ }
             }
 
           } else if (isOwner && !isGroup) {
@@ -2177,19 +2207,23 @@ async function startConnection() {
             // will introduce LLM-routed delivery to strangers via tool calls.
             let ownerReply = response;
 
-            if (ownerReply) {
+            if (ownerReply && !isProgressTextLeak(ownerReply)) {
               ownerReply = markdownToWhatsApp(ownerReply);
               const sentKey = await sendOrEdit(sender, ownerReply);
               console.log(`[gateway] Replied to owner (${sender})${streamMsgKey ? ' (streamed)' : ''}`);
               dbSaveMessage({ id: sentKey?.id || randomUUID(), jid: sender, senderJid: ownJid, pushName: null, phone, text: ownerReply, direction: 'outbound', timestamp: Date.now(), processed: 1, rawType: 'text' });
+            } else if (isProgressTextLeak(ownerReply)) {
+              try { console.log(JSON.stringify({ event: 'progress_placeholder_leak', branch: 'owner', preview: ownerReply.slice(0, 40) })); } catch { /* noop */ }
             }
 
-          } else {
+          } else if (!isProgressTextLeak(response)) {
             // Groups or no owner routing — reply directly
             const finalText = markdownToWhatsApp(response);
             const sentKey = await sendOrEdit(sender, finalText);
             console.log(`[gateway] Replied to ${pushName}`);
             dbSaveMessage({ id: sentKey?.id || randomUUID(), jid: sender, senderJid: ownJid, pushName: null, phone, text: response, direction: 'outbound', timestamp: Date.now(), processed: 1, rawType: 'text' });
+          } else {
+            try { console.log(JSON.stringify({ event: 'progress_placeholder_leak', branch: 'group', preview: response.slice(0, 40) })); } catch { /* noop */ }
           }
         }
 
@@ -3501,6 +3535,7 @@ module.exports = {
   checkHeartbeat,
   computeBackoffDelay,
   isSilentResponse,
+  isProgressTextLeak,
   stripNoReply,
   createHoldbackAccumulator,
   SILENT_HOLDBACK_MIN_CHARS,
