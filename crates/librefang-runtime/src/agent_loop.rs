@@ -2970,7 +2970,16 @@ async fn finalize_successful_end_turn(
     if !ctx.opts.is_fork {
         if let Some(pm_store) = ctx.proactive_memory {
             let user_id = ctx.session.agent_id.0.to_string();
-            let new_messages = &ctx.session.messages[end_turn.new_messages_start..];
+            // Clamp the slice start: history-trim or compaction during the
+            // turn can drop messages out of the session, so the
+            // `new_messages_start` cursor captured at turn entry may now
+            // exceed `messages.len()`. A direct `[start..]` panics with
+            // "range start index N out of range for slice of length M"
+            // (live observed). Saturating clamp yields an empty slice in
+            // that case — auto-memorize then sees no new content and
+            // skips, which matches the post-trim invariant.
+            let start = end_turn.new_messages_start.min(ctx.session.messages.len());
+            let new_messages = &ctx.session.messages[start..];
             let messages_json = serialize_session_messages(new_messages);
             match pm_store
                 .auto_memorize(&user_id, &messages_json, ctx.sender_user_id)
