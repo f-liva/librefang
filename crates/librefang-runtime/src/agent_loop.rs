@@ -310,6 +310,84 @@ fn is_progress_text_leak(text: &str) -> bool {
     t.ends_with("...") || t.ends_with("…")
 }
 
+/// Strip channel-envelope prefixes from a user-message or agent-response
+/// string before persisting it as long-term episodic memory.
+///
+/// The WhatsApp gateway and other channel adapters wrap inbound text with
+/// session-context envelopes that are useful in the *current* turn (the LLM
+/// needs to know who is speaking in a group, or that a message is a
+/// quote-reply) but become toxic prompt scaffolding when those wrapped
+/// strings land verbatim in episodic memory: on recall the model sees
+/// `User asked: [Group message from X]\n…\nI responded: …` — a perfect
+/// mirror of training-data turn frames — and dumps the literal bullet back
+/// into the next chat reply (observed: real WhatsApp group leak 2026-05-10,
+/// scaffolding visible to humans).
+///
+/// Drops any line that *starts with* one of the known envelope prefixes:
+/// `[Group message from `, `[In risposta a: `, `[Replying to: `,
+/// `[Stranger from `, `[Stranger]`, `[Forwarded]`, `[User]`. Bracketed
+/// content that does not begin with one of these prefixes is preserved
+/// (e.g. an inline `[meeting at 5pm]` in user prose stays intact).
+fn sanitize_for_memory(text: &str) -> String {
+    const PREFIXES: &[&str] = &[
+        "[Group message from ",
+        "[In risposta a: ",
+        "[Replying to: ",
+        "[Stranger from ",
+        "[Stranger]",
+        "[Forwarded]",
+        "[User]",
+    ];
+    let mut out = String::with_capacity(text.len());
+    for line in text.split_inclusive('\n') {
+        if PREFIXES.iter().any(|p| line.starts_with(p)) {
+            continue;
+        }
+        out.push_str(line);
+    }
+    out.trim().to_string()
+}
+
+/// Detect a cascade scaffolding leak: an agent response that contains two
+/// or more structural markers from the prompt or memory layer. Real replies
+/// almost never need to mention these in sequence; when two co-occur it is
+/// almost always the model regurgitating training-data turn frames or
+/// recalled memory bullets verbatim (observed 2026-05-10 on a WhatsApp
+/// group, with the agent dumping `User asked: …\nI responded: …\n[Group
+/// message from …]` into the chat in response to an emoji-only inbound
+/// message).
+///
+/// A single, legitimate self-reference (a user asking the agent to repeat
+/// what they said earlier might produce one `User asked:` occurrence in
+/// the reply) is intentionally allowed. Two or more = cascade.
+fn is_cascade_leak(text: &str) -> bool {
+    const MARKERS: &[&str] = &[
+        "User asked:",
+        "I responded:",
+        "[Group message from ",
+        "[In risposta a:",
+        "[Replying to:",
+        "[Past exchange]",
+        "[recall:turn]",
+        "[/recall]",
+        "## Sender",
+        "## Today",
+        "## Calendar",
+        "## Tasks",
+        "## Response Style",
+    ];
+    let mut hits = 0usize;
+    for m in MARKERS {
+        if text.contains(m) {
+            hits += 1;
+            if hits >= 2 {
+                return true;
+            }
+        }
+    }
+    false
+}
+
 /// Returns true if this tool-error content is a "soft" error — one the LLM is
 /// expected to recover from cheaply on the next iteration (approval denials,
 /// sandbox rejections, modify-and-retry hints, argument-truncation nudges).
@@ -2887,37 +2965,37 @@ async fn finalize_successful_end_turn(
     }
 
     // Post-turn memory writes and context-engine updates are skipped for
-    // fork turns. Three reasons: (1) the fork's conversation is ephemeral
-    // by design — persisting its content to the memory bank would leak
-    // derivative artefacts into long-term memory; (2) `context_engine`
-    // state tracked across real turns (summary chains, token budgets)
-    // shouldn't be advanced by a fork that doesn't count as a real user
-    // interaction; (3) critical — `auto_memorize` below would fire
-    // `run_forked_agent_oneshot` again on the fork's own completion,
-    // recursing into another fork, ad infinitum. Gating here is what
-    // stops that cycle.
+    // fork and incognito turns. Three reasons for fork (unchanged): (1)
+    // ephemeral conversation must not leak into long-term memory; (2)
+    // context_engine state shouldn't advance; (3) auto_memorize recursion
+    // guard. For incognito: memory reads remain full-access (the agent
+    // already recalled memories before this point), but writes are
+    // silently dropped so the private conversation leaves no trace.
     if !ctx.opts.is_fork {
         // Skip storing the interaction when the agent produced no
         // meaningful response (silent turn, empty string, sentinel
         // placeholder). Without this gate the memory bank slowly
-        // fills with `[recall:turn] user: "..." | agent: ""` rows
-        // — model retrieves them as past interactions and learns
-        // an "empty reply" pattern, which then leaks back as visible
+        // fills with `[recall:turn] user: "..." | agent: ""` rows —
+        // model retrieves them as past interactions and learns an
+        // "empty reply" pattern, which then leaks back as visible
         // text on the next turn (`<empty>`, `<response>`, etc.).
         let response_meaningful = !end_turn.final_response.trim().is_empty()
             && !crate::silent_response::is_silent_response(&end_turn.final_response);
         if response_meaningful {
-            // The `[recall:turn]` / `[/recall]` markers anchor the
-            // block as a memory record so the model does not confuse
-            // retrieved bullets with a live user/assistant turn. Do
-            // NOT reshape this back into a `User asked: / I responded:`
-            // wording — the conversational form caused the model to
-            // recite past memory bullets as if they were the live turn.
-            // Use `Display` (not `Debug`) so accents and emoji reach
-            // the embedding driver as raw UTF-8.
+            // Memory-scaffolding shape (`[recall:turn]` / `[/recall]`
+            // markers anchor the block so the model does not confuse
+            // retrieved bullets with a live user/assistant turn) plus
+            // sanitize_for_memory on both sides so channel envelopes
+            // (`[Group message from …]`, `[In risposta a: …]`,
+            // `[Stranger from …]`, etc) don't land in episodic memory
+            // and resurface as prompt-scaffolding-looking bullets on
+            // recall. Do NOT reshape back to a conversational form like
+            // `User asked:/I responded:` — that mirror is exactly what
+            // the 2026-05-10 cascade-leak incident traced to.
             let interaction_text = format!(
                 "[recall:turn]\nuser: {}\n---\nagent: {}\n[/recall]",
-                ctx.user_message, end_turn.final_response,
+                sanitize_for_memory(ctx.user_message),
+                sanitize_for_memory(&end_turn.final_response),
             );
             remember_interaction_best_effort(
                 ctx.memory,
@@ -3702,6 +3780,40 @@ pub async fn run_agent_loop(
                         new_messages_start,
                     )
                     .await;
+                }
+
+                // Cascade scaffolding-leak guard: model dumped two or more
+                // structural markers (memory frames, prompt section headers,
+                // gateway envelopes) into the reply text. This is almost
+                // always recall-regurgitation rather than user-facing content
+                // (see is_cascade_leak doc-comment). Drop as silent.
+                if response.tool_calls.is_empty()
+                    && !tools_recovered_from_text
+                    && is_cascade_leak(&text)
+                {
+                    warn!(
+                        agent = %manifest.name,
+                        text_excerpt = %text.chars().take(120).collect::<String>(),
+                        "Cascade scaffolding leak detected (2+ structural markers in text-only EndTurn) — dropping as silent"
+                    );
+                    session
+                        .messages
+                        .push(Message::assistant("[no reply needed]".to_string()));
+                    if !opts.is_fork {
+                        memory
+                            .save_session_async(session)
+                            .await
+                            .map_err(|e| LibreFangError::Memory(e.to_string()))?;
+                    }
+                    return Ok(build_silent_agent_loop_result(
+                        total_usage,
+                        iteration + 1,
+                        parsed_directives,
+                        decision_traces,
+                        memories_used.clone(),
+                        experiment_context.clone(),
+                        new_messages_start,
+                    ));
                 }
 
                 // Progress-text-leak guard: model emitted a short ellipsis-
@@ -5162,6 +5274,38 @@ pub async fn run_agent_loop_streaming(
                         new_messages_start,
                     )
                     .await;
+                }
+
+                // Cascade scaffolding-leak guard (streaming path) — see
+                // non-stream mirror above. Drops text-only EndTurn replies
+                // that contain 2+ structural prompt/memory markers.
+                if response.tool_calls.is_empty()
+                    && !tools_recovered_from_text
+                    && is_cascade_leak(&text)
+                {
+                    warn!(
+                        agent = %manifest.name,
+                        text_excerpt = %text.chars().take(120).collect::<String>(),
+                        "Cascade scaffolding leak detected (streaming, 2+ structural markers in text-only EndTurn) — dropping as silent"
+                    );
+                    session
+                        .messages
+                        .push(Message::assistant("[no reply needed]".to_string()));
+                    if !opts.is_fork {
+                        memory
+                            .save_session_async(session)
+                            .await
+                            .map_err(|e| LibreFangError::Memory(e.to_string()))?;
+                    }
+                    return Ok(build_silent_agent_loop_result(
+                        total_usage,
+                        iteration + 1,
+                        parsed_directives_s,
+                        decision_traces,
+                        memories_used.clone(),
+                        experiment_context.clone(),
+                        new_messages_start,
+                    ));
                 }
 
                 // Progress-text-leak guard (streaming path) — see non-stream
@@ -6730,6 +6874,64 @@ mod tests {
             "This is a much longer response where the model actually produced a full explanation of what it did and the ellipsis at the end is just stylistic...";
         assert!(long.chars().count() > 120);
         assert!(!is_progress_text_leak(long));
+    }
+
+    #[test]
+    fn sanitize_for_memory_strips_known_envelopes() {
+        let raw = "[Group message from Alice]\n[In risposta a: \"hi\"]\nciao tutti";
+        assert_eq!(sanitize_for_memory(raw), "ciao tutti");
+    }
+
+    #[test]
+    fn sanitize_for_memory_strips_stranger_and_forwarded() {
+        let raw = "[Stranger from +393331234567]\n[Forwarded]\nhey there";
+        assert_eq!(sanitize_for_memory(raw), "hey there");
+        assert_eq!(
+            sanitize_for_memory("[Stranger]\nplain inbound"),
+            "plain inbound"
+        );
+        assert_eq!(sanitize_for_memory("[User]\nfoo"), "foo");
+    }
+
+    #[test]
+    fn sanitize_for_memory_preserves_inline_brackets_and_clean_input() {
+        // Square brackets that don't start a line as an envelope prefix
+        // must be preserved — they are legitimate user content.
+        assert_eq!(
+            sanitize_for_memory("[Alice]: ciao [meet at 5pm]"),
+            "[Alice]: ciao [meet at 5pm]"
+        );
+        assert_eq!(sanitize_for_memory("plain message"), "plain message");
+        assert_eq!(sanitize_for_memory(""), "");
+        // English variant of the WhatsApp reply marker.
+        assert_eq!(sanitize_for_memory("[Replying to: \"hi\"]\nhello"), "hello");
+    }
+
+    #[test]
+    fn is_cascade_leak_trips_on_two_or_more_markers() {
+        let leak_sender_calendar = "## Sender\nMessage from Alice\n## Calendar\nNo events";
+        assert!(is_cascade_leak(leak_sender_calendar));
+        let leak_turn_frames = "User asked: foo\nI responded: bar";
+        assert!(is_cascade_leak(leak_turn_frames));
+        let leak_gateway_envelopes = "[Group message from X]\n[In risposta a: \"y\"]\ntext";
+        assert!(is_cascade_leak(leak_gateway_envelopes));
+        // Real-world incident shape — turn frame plus gateway envelope.
+        let real_incident = "[User]\n[Group message from ALESSANDRO Liva]\nGrande Ambrogio\nUser asked: foo\nI responded: bar";
+        assert!(is_cascade_leak(real_incident));
+    }
+
+    #[test]
+    fn is_cascade_leak_does_not_trip_on_single_marker_or_clean_text() {
+        // One legitimate self-reference is not a cascade.
+        assert!(!is_cascade_leak(
+            "The phrase 'User asked:' is from training data."
+        ));
+        assert!(!is_cascade_leak("normal reply with no markers"));
+        assert!(!is_cascade_leak(""));
+        // Single quote-reply envelope mentioned in a reply (rare but valid).
+        assert!(!is_cascade_leak(
+            "I noticed you wrote `[In risposta a: ...]` in your message."
+        ));
     }
 
     #[test]
