@@ -8,6 +8,7 @@
 
 // Core infrastructure — always compiled
 pub mod bridge;
+pub mod coalescing;
 pub mod commands;
 pub mod formatter;
 pub mod group_history;

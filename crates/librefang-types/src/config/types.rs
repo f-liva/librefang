@@ -2965,6 +2965,77 @@ pub struct KernelConfig {
     /// Default: `60` minutes.
     #[serde(default = "default_workflow_stale_timeout_minutes")]
     pub workflow_stale_timeout_minutes: u64,
+    /// Default wall-clock timeout (seconds) for an entire workflow run.
+    ///
+    /// Individual workflows can override this via `Workflow::total_timeout_secs`.
+    /// When both are `None` the workflow runs unbounded (no total timeout).
+    /// Default: `None` (unbounded).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workflow_default_total_timeout_secs: Option<u64>,
+    /// Message dispatcher configuration (coalescing, batching).
+    #[serde(default)]
+    pub dispatcher: DispatcherConfig,
+}
+
+/// Message dispatcher configuration.
+///
+/// Controls how incoming messages are batched and delivered to agents.
+///
+/// Configure in config.toml:
+/// ```toml
+/// [dispatcher.coalesce]
+/// enabled = true
+/// window_seconds = 15
+/// on_busy = "queue"
+/// ```
+#[derive(Debug, Clone, Default, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(default)]
+pub struct DispatcherConfig {
+    /// Input coalescing (debounce) configuration.
+    pub coalesce: CoalesceConfig,
+}
+
+/// Input coalescing (debounce) configuration for the message dispatcher.
+///
+/// When enabled, messages from the same user in the same chat are held in
+/// a sliding window instead of being dispatched immediately. When the window
+/// expires without new messages, all accumulated messages are delivered to
+/// the agent as a single turn.
+///
+/// Per-agent override: set `coalesce_disabled = true` in `agent.toml` to
+/// bypass coalescing for realtime agents.
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(default)]
+pub struct CoalesceConfig {
+    /// Enable input coalescing (default: false).
+    pub enabled: bool,
+    /// Sliding-window timeout in seconds (default: 15). Each new message
+    /// resets the timer.
+    pub window_seconds: u64,
+    /// Behaviour when the target agent is already processing a turn and
+    /// new messages arrive within the coalesce window.
+    pub on_busy: CoalesceOnBusyMode,
+}
+
+impl Default for CoalesceConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            window_seconds: 15,
+            on_busy: CoalesceOnBusyMode::Queue,
+        }
+    }
+}
+
+/// Behaviour when coalesced messages arrive while the agent is busy.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum CoalesceOnBusyMode {
+    /// Queue the coalesced batch and dispatch it after the current turn completes.
+    Queue,
+    /// Cancel the current generation, merge new messages into context,
+    /// and re-dispatch a single combined turn.
+    CancelAndMerge,
 }
 
 /// Input sanitization mode for channel messages.
@@ -4812,6 +4883,8 @@ impl Default for KernelConfig {
             tool_invoke: ToolInvokeConfig::default(),
             parallel_tools: ParallelToolsConfig::default(),
             workflow_stale_timeout_minutes: default_workflow_stale_timeout_minutes(),
+            workflow_default_total_timeout_secs: None,
+            dispatcher: DispatcherConfig::default(),
         }
     }
 }
