@@ -15,7 +15,8 @@ use async_trait::async_trait;
 use futures::StreamExt;
 use librefang_types::agent::AgentId;
 use librefang_types::config::{
-    AutoRouteStrategy, ChannelOverrides, DmPolicy, GroupPolicy, OutputFormat, PrefixStyle,
+    AutoRouteStrategy, ChannelOverrides, DispatcherConfig, DmPolicy, GroupPolicy, OutputFormat,
+    PrefixStyle,
 };
 use librefang_types::message::ContentBlock;
 use regex::{Regex, RegexSet};
@@ -485,6 +486,7 @@ pub trait ChannelBridgeHandle: Send + Sync {
 struct PendingMessage {
     message: ChannelMessage,
     image_blocks: Option<Vec<ContentBlock>>,
+    arrived_at: Instant,
 }
 
 struct SenderBuffer {
@@ -522,10 +524,11 @@ impl MessageDebouncer {
     fn push(
         &self,
         key: &str,
-        pending: PendingMessage,
+        mut pending: PendingMessage,
         buffers: &mut HashMap<String, SenderBuffer>,
     ) {
         use std::time::Duration;
+        pending.arrived_at = Instant::now();
         let debounce_dur = Duration::from_millis(self.debounce_ms);
         let max_dur = Duration::from_millis(self.debounce_max_ms);
 
@@ -611,6 +614,7 @@ impl MessageDebouncer {
         // `push()` and a max_timer task both enqueue the same key, the second
         // drain call will find the entry already gone and return `None` here.
         let buf = buffers.remove(key)?;
+        let first_arrived = buf.first_arrived;
         if buf.messages.is_empty() {
             return None;
         }
@@ -631,6 +635,11 @@ impl MessageDebouncer {
         let first = messages.remove(0);
         let mut merged_msg = first.message;
         let mut all_blocks: Vec<ContentBlock> = Vec::new();
+
+        let ts = |arrived: Instant| -> String {
+            let secs = arrived.duration_since(first_arrived).as_secs();
+            format!("[+{secs}s] ")
+        };
 
         if let Some(blocks) = first.image_blocks {
             all_blocks.extend(blocks);
@@ -683,9 +692,17 @@ impl MessageDebouncer {
                     args: cmd_args,
                 };
             } else {
-                let mut text_parts = vec![content_to_text(&merged_msg.content)];
+                let mut text_parts = vec![format!(
+                    "{}{}",
+                    ts(first.arrived_at),
+                    content_to_text(&merged_msg.content)
+                )];
                 for pm in messages {
-                    text_parts.push(content_to_text(&pm.message.content));
+                    text_parts.push(format!(
+                        "{}{}",
+                        ts(pm.arrived_at),
+                        content_to_text(&pm.message.content)
+                    ));
                     if let Some(blocks) = pm.image_blocks {
                         all_blocks.extend(blocks);
                     }
@@ -693,9 +710,17 @@ impl MessageDebouncer {
                 merged_msg.content = ChannelContent::Text(text_parts.join("\n"));
             }
         } else {
-            let mut text_parts = vec![content_to_text(&merged_msg.content)];
+            let mut text_parts = vec![format!(
+                "{}{}",
+                ts(first.arrived_at),
+                content_to_text(&merged_msg.content)
+            )];
             for pm in messages {
-                text_parts.push(content_to_text(&pm.message.content));
+                text_parts.push(format!(
+                    "{}{}",
+                    ts(pm.arrived_at),
+                    content_to_text(&pm.message.content)
+                ));
                 if let Some(blocks) = pm.image_blocks {
                     all_blocks.extend(blocks);
                 }
@@ -962,6 +987,8 @@ pub struct BridgeManager {
     /// lose the attachments and context other participants posted while
     /// it was silent.
     group_history: Arc<crate::group_history::GroupHistoryBuffer>,
+    /// Message dispatcher configuration (coalescing, batching).
+    dispatcher_config: DispatcherConfig,
 }
 
 impl BridgeManager {
@@ -985,6 +1012,7 @@ impl BridgeManager {
             group_history: crate::group_history::install_global(Arc::new(
                 crate::group_history::GroupHistoryBuffer::with_default_retention(),
             )),
+            dispatcher_config: DispatcherConfig::default(),
         }
     }
 
@@ -993,6 +1021,7 @@ impl BridgeManager {
         handle: Arc<dyn ChannelBridgeHandle>,
         router: Arc<AgentRouter>,
         sanitize_config: &librefang_types::config::SanitizeConfig,
+        dispatcher_config: &DispatcherConfig,
     ) -> Self {
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
         Self {
@@ -1012,6 +1041,7 @@ impl BridgeManager {
             group_history: crate::group_history::install_global(Arc::new(
                 crate::group_history::GroupHistoryBuffer::with_default_retention(),
             )),
+            dispatcher_config: dispatcher_config.clone(),
         }
     }
 
@@ -1118,18 +1148,29 @@ impl BridgeManager {
 
         let ct_str = channel_type_str(&adapter.channel_type()).to_string();
         let overrides = handle.channel_overrides(&ct_str, None).await;
-        let debounce_ms = overrides
+        let coalesce_cfg = &self.dispatcher_config.coalesce;
+        let overrides_debounce_ms = overrides
             .as_ref()
             .map(|o| o.message_debounce_ms)
             .unwrap_or(0);
-        let debounce_max_ms = overrides
-            .as_ref()
-            .map(|o| o.message_debounce_max_ms)
-            .unwrap_or(30000);
-        let max_buffer = overrides
-            .as_ref()
-            .map(|o| o.message_debounce_max_buffer)
-            .unwrap_or(64);
+
+        let (debounce_ms, debounce_max_ms, max_buffer) = if overrides_debounce_ms > 0 {
+            (
+                overrides_debounce_ms,
+                overrides
+                    .as_ref()
+                    .map(|o| o.message_debounce_max_ms)
+                    .unwrap_or(30000),
+                overrides
+                    .as_ref()
+                    .map(|o| o.message_debounce_max_buffer)
+                    .unwrap_or(64),
+            )
+        } else if coalesce_cfg.enabled {
+            (coalesce_cfg.window_seconds * 1000, 30000, 64)
+        } else {
+            (0, 30000, 64)
+        };
 
         let semaphore = Arc::new(tokio::sync::Semaphore::new(32));
 
@@ -1215,8 +1256,36 @@ impl BridgeManager {
                                         None
                                     };
 
-                                    let pending = PendingMessage { message, image_blocks };
-                                    debouncer.push(&sender_key, pending, &mut buffers);
+                                    if message.metadata.get("urgent").and_then(|v| v.as_bool()).unwrap_or(false) {
+                                        let handle = handle.clone();
+                                        let router = router.clone();
+                                        let adapter = adapter_clone.clone();
+                                        let rate_limiter = rate_limiter.clone();
+                                        let sanitizer = sanitizer.clone();
+                                        let journal = journal.clone();
+                                        let sem = semaphore.clone();
+                                        let thread_ownership = Arc::clone(&thread_ownership);
+                                        let msg = message;
+                                        tokio::spawn(async move {
+                                            let _permit = match sem.acquire().await {
+                                                Ok(p) => p,
+                                                Err(_) => return,
+                                            };
+                                            dispatch_message(
+                                                &msg,
+                                                &handle,
+                                                &router,
+                                                adapter.as_ref(),
+                                                &rate_limiter,
+                                                &sanitizer,
+                                                journal.as_ref(),
+                                                &thread_ownership,
+                                            ).await;
+                                        });
+                                    } else {
+                                        let pending = PendingMessage { message, image_blocks, arrived_at: Instant::now() };
+                                        debouncer.push(&sender_key, pending, &mut buffers);
+                                    }
                                 }
                                 None => {
                                     let keys: Vec<String> = buffers.keys().cloned().collect();
@@ -6114,6 +6183,7 @@ mod tests {
             let pending = PendingMessage {
                 message: msg.clone(),
                 image_blocks: None,
+                arrived_at: Instant::now(),
             };
 
             debouncer.push("discord:user123", pending, &mut buffers);
@@ -6138,6 +6208,7 @@ mod tests {
                 PendingMessage {
                     message: msg1,
                     image_blocks: None,
+                    arrived_at: Instant::now(),
                 },
                 &mut buffers,
             );
@@ -6146,6 +6217,7 @@ mod tests {
                 PendingMessage {
                     message: msg2,
                     image_blocks: None,
+                    arrived_at: Instant::now(),
                 },
                 &mut buffers,
             );
@@ -6153,7 +6225,7 @@ mod tests {
             let result = debouncer.drain("discord:user123", &mut buffers);
             assert!(result.is_some());
             let (drained_msg, _) = result.unwrap();
-            assert_content_eq(&drained_msg.content, "hello\nworld");
+            assert_content_eq(&drained_msg.content, "[+0s] hello\n[+0s] world");
         }
 
         #[tokio::test]
@@ -6169,6 +6241,7 @@ mod tests {
                 PendingMessage {
                     message: cmd1,
                     image_blocks: None,
+                    arrived_at: Instant::now(),
                 },
                 &mut buffers,
             );
@@ -6177,6 +6250,7 @@ mod tests {
                 PendingMessage {
                     message: cmd2,
                     image_blocks: None,
+                    arrived_at: Instant::now(),
                 },
                 &mut buffers,
             );
@@ -6206,6 +6280,7 @@ mod tests {
                 PendingMessage {
                     message: cmd1,
                     image_blocks: None,
+                    arrived_at: Instant::now(),
                 },
                 &mut buffers,
             );
@@ -6214,6 +6289,7 @@ mod tests {
                 PendingMessage {
                     message: cmd2,
                     image_blocks: None,
+                    arrived_at: Instant::now(),
                 },
                 &mut buffers,
             );
@@ -6221,7 +6297,7 @@ mod tests {
             let result = debouncer.drain("discord:user123", &mut buffers);
             assert!(result.is_some());
             let (drained_msg, _) = result.unwrap();
-            assert_content_eq(&drained_msg.content, "/help\n/status");
+            assert_content_eq(&drained_msg.content, "[+0s] /help\n[+0s] /status");
         }
 
         #[tokio::test]
@@ -6246,6 +6322,7 @@ mod tests {
                 PendingMessage {
                     message: msg1,
                     image_blocks: None,
+                    arrived_at: Instant::now(),
                 },
                 &mut buffers,
             );
@@ -6254,6 +6331,7 @@ mod tests {
                 PendingMessage {
                     message: msg2,
                     image_blocks: None,
+                    arrived_at: Instant::now(),
                 },
                 &mut buffers,
             );
@@ -6280,6 +6358,7 @@ mod tests {
                 PendingMessage {
                     message: msg1,
                     image_blocks: None,
+                    arrived_at: Instant::now(),
                 },
                 &mut buffers,
             );
@@ -6288,6 +6367,7 @@ mod tests {
                 PendingMessage {
                     message: msg2,
                     image_blocks: None,
+                    arrived_at: Instant::now(),
                 },
                 &mut buffers,
             );
@@ -6295,7 +6375,7 @@ mod tests {
             let result = debouncer.drain("discord:user123", &mut buffers);
             assert!(result.is_some());
             let (drained_msg, _) = result.unwrap();
-            assert_content_eq(&drained_msg.content, "1\n2");
+            assert_content_eq(&drained_msg.content, "[+0s] 1\n[+0s] 2");
         }
     }
 

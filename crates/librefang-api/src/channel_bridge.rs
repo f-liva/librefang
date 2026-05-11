@@ -3540,8 +3540,12 @@ pub async fn start_channel_bridge_with_config(
     let data_dir = std::path::PathBuf::from(
         std::env::var("LIBREFANG_HOME").unwrap_or_else(|_| ".".to_string()),
     );
-    let mut manager =
-        BridgeManager::with_sanitizer(bridge_handle.clone(), router, &kernel.config_ref().sanitize);
+    let mut manager = BridgeManager::with_sanitizer(
+        bridge_handle.clone(),
+        router,
+        &kernel.config_ref().sanitize,
+        &kernel.config_ref().dispatcher,
+    );
     if let Ok(journal) = librefang_channels::message_journal::MessageJournal::open(&data_dir) {
         journal.spawn_compaction_timer();
         manager = manager.with_journal(journal);
