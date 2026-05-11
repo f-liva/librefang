@@ -3,6 +3,7 @@
 //! Defines `ChannelBridgeHandle` (implemented by librefang-api on the kernel) and
 //! `BridgeManager` which owns running adapters and dispatches messages.
 
+use crate::coalescing::{CoalesceKey, CoalesceOnBusy, CoalesceRuntimeConfig, CoalescingDispatcher};
 use crate::formatter;
 use crate::rate_limiter::ChannelRateLimiter;
 use crate::router::AgentRouter;
@@ -15,7 +16,8 @@ use async_trait::async_trait;
 use futures::StreamExt;
 use librefang_types::agent::AgentId;
 use librefang_types::config::{
-    AutoRouteStrategy, ChannelOverrides, DmPolicy, GroupPolicy, OutputFormat, PrefixStyle,
+    AutoRouteStrategy, ChannelOverrides, DispatcherConfig, DmPolicy, GroupPolicy, OutputFormat,
+    PrefixStyle,
 };
 use librefang_types::message::ContentBlock;
 use regex::{Regex, RegexSet};
@@ -1078,6 +1080,108 @@ fn flush_debounced(
     Some(join_handle)
 }
 
+/// Flush a coalesced batch — identical pattern to `flush_debounced` but
+/// reads from a `CoalescingDispatcher` instead of a `MessageDebouncer`.
+#[allow(clippy::too_many_arguments)]
+fn flush_coalesced(
+    key: &str,
+    coalescer: &mut CoalescingDispatcher,
+    handle: &Arc<dyn ChannelBridgeHandle>,
+    router: &Arc<AgentRouter>,
+    adapter: &Arc<dyn ChannelAdapter>,
+    rate_limiter: &ChannelRateLimiter,
+    sanitizer: &Arc<InputSanitizer>,
+    semaphore: &Arc<tokio::sync::Semaphore>,
+    journal: &Option<crate::message_journal::MessageJournal>,
+    thread_ownership: &Arc<crate::thread_ownership::ThreadOwnershipRegistry>,
+) -> Option<tokio::task::JoinHandle<()>> {
+    let batch = coalescer.drain(key)?;
+    let (text, blocks, merged_msg) = CoalescingDispatcher::merge_batch(batch);
+
+    let mut merged_msg = merged_msg;
+    merged_msg.content = ChannelContent::Text(text);
+
+    let channel_handle = (*handle).clone();
+    let router = router.clone();
+    let adapter = adapter.clone();
+    let rate_limiter = rate_limiter.clone();
+    let sanitizer = Arc::clone(sanitizer);
+    let journal = journal.clone();
+    let sem = semaphore.clone();
+    let thread_ownership = Arc::clone(thread_ownership);
+
+    let join_handle = tokio::spawn(async move {
+        let _permit = match sem.acquire().await {
+            Ok(p) => p,
+            Err(_) => return,
+        };
+
+        if let Some(mut blocks) = blocks {
+            let ct_str = channel_type_str(&merged_msg.channel);
+
+            let overrides = channel_handle
+                .channel_overrides(
+                    ct_str,
+                    merged_msg
+                        .metadata
+                        .get("account_id")
+                        .and_then(|v| v.as_str()),
+                )
+                .await;
+            let channel_default_format = default_output_format_for_channel(ct_str);
+            let output_format = overrides
+                .as_ref()
+                .and_then(|o| o.output_format)
+                .unwrap_or(channel_default_format);
+            let threading_enabled = overrides.as_ref().map(|o| o.threading).unwrap_or(false);
+            let thread_id = if threading_enabled {
+                merged_msg.thread_id.as_deref()
+            } else {
+                None
+            };
+
+            let text = content_to_text(&merged_msg.content);
+            if !text.is_empty() {
+                blocks.insert(
+                    0,
+                    ContentBlock::Text {
+                        text,
+                        provider_metadata: None,
+                    },
+                );
+            }
+
+            dispatch_with_blocks(
+                blocks,
+                &merged_msg,
+                &channel_handle,
+                &router,
+                adapter.as_ref(),
+                ct_str,
+                thread_id,
+                output_format,
+                overrides.as_ref(),
+                journal.as_ref(),
+                &thread_ownership,
+            )
+            .await;
+        } else {
+            dispatch_message(
+                &merged_msg,
+                &channel_handle,
+                &router,
+                adapter.as_ref(),
+                &rate_limiter,
+                &sanitizer,
+                journal.as_ref(),
+                &thread_ownership,
+            )
+            .await;
+        }
+    });
+    Some(join_handle)
+}
+
 /// Owns all running channel adapters and dispatches messages to agents.
 pub struct BridgeManager {
     handle: Arc<dyn ChannelBridgeHandle>,
@@ -1095,6 +1199,8 @@ pub struct BridgeManager {
     /// Single-process thread-ownership claims. Suppresses multi-agent
     /// duplicate replies in shared group threads (#3334).
     thread_ownership: Arc<crate::thread_ownership::ThreadOwnershipRegistry>,
+    /// Message dispatcher configuration (coalescing, batching).
+    dispatcher_config: DispatcherConfig,
 }
 
 impl BridgeManager {
@@ -1113,6 +1219,7 @@ impl BridgeManager {
             webhook_routes: Vec::new(),
             journal: None,
             thread_ownership: Arc::new(crate::thread_ownership::ThreadOwnershipRegistry::new()),
+            dispatcher_config: DispatcherConfig::default(),
         }
     }
 
@@ -1121,6 +1228,7 @@ impl BridgeManager {
         handle: Arc<dyn ChannelBridgeHandle>,
         router: Arc<AgentRouter>,
         sanitize_config: &librefang_types::config::SanitizeConfig,
+        dispatcher_config: &DispatcherConfig,
     ) -> Self {
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
         Self {
@@ -1135,6 +1243,7 @@ impl BridgeManager {
             webhook_routes: Vec::new(),
             journal: None,
             thread_ownership: Arc::new(crate::thread_ownership::ThreadOwnershipRegistry::new()),
+            dispatcher_config: dispatcher_config.clone(),
         }
     }
 
@@ -1257,7 +1366,133 @@ impl BridgeManager {
         let semaphore = Arc::new(tokio::sync::Semaphore::new(32));
         let upload_dir = handle.effective_channels_download_dir();
 
-        if debounce_ms == 0 {
+        if debounce_ms == 0 && self.dispatcher_config.coalesce.enabled {
+            // Coalescing path: buffer rapid-fire messages into a single agent turn
+            use std::time::Duration;
+            let coalesce_cfg = CoalesceRuntimeConfig {
+                enabled: true,
+                window: Duration::from_secs(self.dispatcher_config.coalesce.window_seconds),
+                on_busy: CoalesceOnBusy::from(self.dispatcher_config.coalesce.on_busy),
+            };
+            let (mut coalescer, mut flush_rx) = CoalescingDispatcher::new(coalesce_cfg);
+
+            let task = tokio::spawn(async move {
+                let mut stream = std::pin::pin!(stream);
+                loop {
+                    let flush_key: Option<String> = tokio::select! {
+                        msg = stream.next() => {
+                            match msg {
+                                Some(message) => {
+                                    let blocks = if let ChannelContent::Image {
+                                        ref url, ref caption, ref mime_type
+                                    } = message.content {
+                                        let extra_headers = adapter_clone.fetch_headers_for(url);
+                                        match download_image_to_blocks(url, caption.as_deref(), mime_type.as_deref(), &upload_dir, &extra_headers).await {
+                                            blocks if blocks.iter().any(|b| matches!(b, ContentBlock::Image { .. } | ContentBlock::ImageFile { .. })) => Some(blocks),
+                                            _ => None,
+                                        }
+                                    } else {
+                                        None
+                                    };
+
+                                    let coalesce_key = CoalesceKey {
+                                        channel: channel_type_str(&message.channel).to_string(),
+                                        chat_or_user: message.sender.platform_id.clone(),
+                                        sender_id: message.sender.platform_id.clone(),
+                                    };
+
+                                    let buffered = coalescer.push(
+                                        coalesce_key,
+                                        message.clone(),
+                                        blocks,
+                                        AgentId::default(),
+                                    );
+
+                                    if !buffered {
+                                        // Urgent bypass — dispatch immediately
+                                        let handle = handle.clone();
+                                        let router = router.clone();
+                                        let adapter = adapter_clone.clone();
+                                        let rate_limiter = rate_limiter.clone();
+                                        let sanitizer = sanitizer.clone();
+                                        let journal = journal.clone();
+                                        let sem = semaphore.clone();
+                                        let thread_ownership = Arc::clone(&thread_ownership);
+                                        tokio::spawn(async move {
+                                            let _permit = match sem.acquire().await {
+                                                Ok(p) => p,
+                                                Err(_) => return,
+                                            };
+                                            dispatch_message(
+                                                &message,
+                                                &handle,
+                                                &router,
+                                                adapter.as_ref(),
+                                                &rate_limiter,
+                                                &sanitizer,
+                                                journal.as_ref(),
+                                                &thread_ownership,
+                                            ).await;
+                                        });
+                                    }
+                                    None
+                                }
+                                None => {
+                                    let keys: Vec<String> = coalescer.buffered_keys();
+                                    let mut handles = Vec::new();
+                                    for key in keys {
+                                        if let Some(handle) = flush_coalesced(&key, &mut coalescer, &handle, &router, &adapter_clone, &rate_limiter, &sanitizer, &semaphore, &journal, &thread_ownership) {
+                                            handles.push(handle);
+                                        }
+                                    }
+                                    for handle in handles {
+                                        let _ = handle.await;
+                                    }
+                                    info!("Channel adapter {} stream ended", adapter_clone.name());
+                                    break;
+                                }
+                            }
+                        }
+                        Some(key) = flush_rx.recv() => {
+                            Some(key)
+                        }
+                        _ = shutdown.changed() => {
+                            if *shutdown.borrow() {
+                                let keys: Vec<String> = coalescer.buffered_keys();
+                                let mut handles = Vec::new();
+                                for key in keys {
+                                    if let Some(handle) = flush_coalesced(&key, &mut coalescer, &handle, &router, &adapter_clone, &rate_limiter, &sanitizer, &semaphore, &journal, &thread_ownership) {
+                                        handles.push(handle);
+                                    }
+                                }
+                                for handle in handles {
+                                    let _ = handle.await;
+                                }
+                                info!("Shutting down channel adapter {}", adapter_clone.name());
+                                break;
+                            }
+                            None
+                        }
+                    };
+
+                    if let Some(key) = flush_key {
+                        let _ = flush_coalesced(
+                            &key,
+                            &mut coalescer,
+                            &handle,
+                            &router,
+                            &adapter_clone,
+                            &rate_limiter,
+                            &sanitizer,
+                            &semaphore,
+                            &journal,
+                            &thread_ownership,
+                        );
+                    }
+                }
+            });
+            self.tasks.push(task);
+        } else if debounce_ms == 0 {
             // Fast path: no debouncing (current behavior)
             let task = tokio::spawn(async move {
                 let mut stream = std::pin::pin!(stream);

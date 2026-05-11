@@ -9,6 +9,7 @@
 // Core infrastructure — always compiled
 pub mod attachment_enrich;
 pub mod bridge;
+pub mod coalescing;
 pub mod commands;
 pub mod formatter;
 pub mod group_history;
