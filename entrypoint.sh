@@ -1,5 +1,9 @@
 #!/bin/bash
 # Drop root privileges and run librefang as the librefang user
+# Set HOME to /data so npx and other tools have a writable cache dir.
+# The deploy Dockerfile uses useradd -m -> /home/librefang, but the main
+# Dockerfile uses adduser --system -> /nonexistent.  Normalise to /data.
+export HOME="${LIBREFANG_HOME:-/data}"
 chown -R librefang:librefang /data 2>/dev/null
 chown -R librefang:librefang /home/librefang 2>/dev/null
 
