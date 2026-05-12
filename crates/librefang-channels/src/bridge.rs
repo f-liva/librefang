@@ -1275,6 +1275,14 @@ impl BridgeManager {
             (0, 30000, 64)
         };
 
+        info!(
+            "Adapter {} debounce_ms={} max_ms={} max_buf={}",
+            adapter_clone.name(),
+            debounce_ms,
+            debounce_max_ms,
+            max_buffer,
+        );
+
         let semaphore = Arc::new(tokio::sync::Semaphore::new(32));
 
         if debounce_ms == 0 && self.dispatcher_config.coalesce.enabled {

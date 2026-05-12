@@ -26,7 +26,6 @@ use tracing::{debug, info, warn};
 /// secrets that belong to other LLM providers.
 const SENSITIVE_ENV_EXACT: &[&str] = &[
     "OPENAI_API_KEY",
-    "ANTHROPIC_API_KEY",
     "GEMINI_API_KEY",
     "GOOGLE_API_KEY",
     "GROQ_API_KEY",
