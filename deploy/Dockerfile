@@ -95,4 +95,5 @@ RUN chmod +x /usr/local/bin/entrypoint.sh
 EXPOSE 4545
 VOLUME /data
 ENV LIBREFANG_HOME=/data
+ENV HOME=/data
 ENTRYPOINT ["entrypoint.sh"]
