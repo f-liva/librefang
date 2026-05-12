@@ -2,10 +2,6 @@
 set -e
 
 # Runs as root. Files created here must be chown'd to 'librefang'.
-# Set HOME to /data so npm/npx/cargo etc have a writable cache dir.
-# The system user (adduser --system) defaults to HOME=/nonexistent
-# which breaks any tool that writes to $HOME/.cache, $HOME/.npm, etc.
-export HOME="${LIBREFANG_HOME:-/data}"
 
 DATA_DIR="${LIBREFANG_HOME:-/data}"
 CONFIG="$DATA_DIR/config.toml"
