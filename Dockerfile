@@ -74,6 +74,7 @@ RUN usermod -s /sbin/nologin librefang && \
     chown -R librefang:librefang /opt/librefang/packages
 EXPOSE 4545
 ENV LIBREFANG_HOME=/data
+ENV HOME=/data
 # docker-entrypoint.sh uses gosu to exec as the librefang user, so we
 # keep the entrypoint itself running as root to allow bind-mount chown
 # and data-dir initialisation before privilege drop.
