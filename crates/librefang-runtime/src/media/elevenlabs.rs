@@ -55,7 +55,7 @@ fn builtin_voice_id(name: &str) -> Option<&'static str> {
     let lower = name.to_ascii_lowercase();
     BUILTINS
         .iter()
-        .find(|(k, _)| *k == &lower)
+        .find(|(k, _)| *k == lower)
         .map(|(_, id)| *id)
 }
 
@@ -122,7 +122,7 @@ impl MediaDriver for ElevenLabsMediaDriver {
                     None
                 })
             })
-            .or_else(|| request.voice.as_deref())
+            .or(request.voice.as_deref())
             .unwrap_or(DEFAULT_VOICE_ID);
         let format = request.format.as_deref().unwrap_or("mp3_44100_128");
 
