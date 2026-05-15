@@ -24,7 +24,7 @@ use tracing::error;
 use zeroize::Zeroizing;
 
 /// Env var fallback for vault key.
-const VAULT_KEY_ENV: &str = "LIBREFANG_VAULT_KEY";
+pub(crate) const VAULT_KEY_ENV: &str = "LIBREFANG_VAULT_KEY";
 
 /// Service name used by the legacy v1 XOR-obfuscated keyring file as a salt
 /// in the unmasking hash. Must remain stable across targets so v1 → v2
