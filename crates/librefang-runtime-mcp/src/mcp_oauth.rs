@@ -865,6 +865,7 @@ mod tests {
             auth_url: Some("https://override.com/auth".to_string()),
             token_url: Some("https://override.com/token".to_string()),
             client_id: Some("override-client".to_string()),
+            client_secret_env: None,
             scopes: vec!["admin".to_string()],
             user_scopes: Vec::new(),
         };
