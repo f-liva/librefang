@@ -168,7 +168,20 @@ impl CredentialVault {
         }
     }
 
-    /// Initialize a new vault. Generates a master key and stores it in the OS keyring.
+    /// Initialize a new vault. Resolves the master key through the SAME
+    /// code path used by `resolve_master_key()`, so a freshly-init'd vault
+    /// is always decryptable by a subsequent `unlock()` on a separate
+    /// instance (the MCP OAuth handler's `vault_set` pattern).
+    ///
+    /// Adapted from upstream PR #5074 — minimal port without the
+    /// startup-sentinel changes that custom doesn't carry yet. Two parts:
+    /// (1) init's key resolution goes through `resolve_master_key`
+    /// directly so it can no longer diverge from the next unlock's
+    /// resolution by construction; (2) post-write verify constructs a
+    /// fresh `CredentialVault::new` instance and `unlock()`s the
+    /// just-saved file — surfaces any latent divergence as an actionable
+    /// error here rather than letting the next caller fail downstream
+    /// with an opaque `aead::Error`.
     pub fn init(&mut self) -> ExtensionResult<()> {
         if self.path.exists() {
             return Err(ExtensionError::Vault(
@@ -176,43 +189,77 @@ impl CredentialVault {
             ));
         }
 
-        // Check if a master key is already available (env var or keyring)
-        let key_bytes = if let Ok(existing_b64) = std::env::var(VAULT_KEY_ENV) {
-            // Use the existing key from env var
-            info!("Using existing vault key from {}", VAULT_KEY_ENV);
-            decode_master_key(&existing_b64)?
-        } else if let Ok(existing_b64) = load_keyring_key() {
-            info!("Using existing vault key from OS keyring");
-            decode_master_key(&existing_b64)?
-        } else {
-            // Generate a random master key
-            let mut kb = Zeroizing::new([0u8; 32]);
-            OsRng.fill_bytes(kb.as_mut());
-            let key_b64 = Zeroizing::new(base64::Engine::encode(
-                &base64::engine::general_purpose::STANDARD,
-                kb.as_ref(),
-            ));
+        // `cached_key` is None here (we just constructed `self` or a prior
+        // op left it cleared), so resolve_master_key falls through to
+        // env → keyring.
+        let key_bytes = match self.resolve_master_key() {
+            Ok(k) => k,
+            Err(ExtensionError::VaultLocked) => {
+                // No master key resolvable anywhere — generate a random
+                // one and persist it to the OS keyring (or file fallback)
+                // so subsequent `resolve_master_key` calls on fresh
+                // instances find the same value.
+                let mut kb = Zeroizing::new([0u8; 32]);
+                OsRng.fill_bytes(kb.as_mut());
+                let key_b64 = Zeroizing::new(base64::Engine::encode(
+                    &base64::engine::general_purpose::STANDARD,
+                    kb.as_ref(),
+                ));
 
-            // Try to store in OS keyring
-            match store_keyring_key(&key_b64) {
-                Ok(()) => {
-                    info!("Vault master key stored in OS keyring");
+                match store_keyring_key(&key_b64) {
+                    Ok(()) => {
+                        info!("Vault master key stored in OS keyring");
+                    }
+                    Err(e) => {
+                        warn!(
+                            "Could not store vault key in OS keyring: {e}. \
+                             Set {VAULT_KEY_ENV} env var manually. \
+                             Use `librefang vault init` interactively to retrieve the key.",
+                        );
+                    }
                 }
-                Err(e) => {
-                    warn!(
-                        "Could not store vault key in OS keyring: {e}. \
-                         Set {VAULT_KEY_ENV} env var manually. \
-                         Use `librefang vault init` interactively to retrieve the key.",
-                    );
-                }
+                kb
             }
-            kb
+            Err(other) => return Err(other),
         };
 
         // Create empty vault file
         self.entries.clear();
         self.unlocked = true;
         self.save(&key_bytes)?;
+
+        // Post-write verification: construct a sibling CredentialVault
+        // instance walking the unlock path — the exact code path the next
+        // `KernelOAuthProvider::vault_set` call from the MCP OAuth handler
+        // will take. Catches init/unlock divergence at the source with a
+        // clear, actionable error rather than letting the next caller
+        // fail with an opaque `aead::Error`. Constructing a sibling
+        // instance (instead of just re-resolving the key) also catches a
+        // path-binding regression where AAD would differ between save
+        // and load.
+        let mut verify = CredentialVault::new(self.path.clone());
+        if let Err(e) = verify.unlock() {
+            // Roll back the freshly-written file so the next `init()`
+            // attempt isn't blocked by the "Vault already exists" guard
+            // against a file that can't be opened.
+            if let Err(unlink_err) = std::fs::remove_file(&self.path) {
+                warn!(
+                    error = ?unlink_err,
+                    path = ?self.path,
+                    "vault init rollback: failed to unlink corrupt vault file",
+                );
+            }
+            return Err(ExtensionError::Vault(format!(
+                "Vault init succeeded on disk but the freshly-written file \
+                 cannot be decrypted by a fresh CredentialVault::unlock() \
+                 — the same code path subsequent vault_set calls will \
+                 walk. This means init() and resolve_master_key() resolved \
+                 different master keys; LIBREFANG_VAULT_KEY may have \
+                 changed during init or the OS keyring returned an \
+                 unexpected value. Underlying error: {e}"
+            )));
+        }
+
         self.cached_key = Some(key_bytes);
         info!("Credential vault initialized at {:?}", self.path);
         Ok(())
@@ -337,14 +384,22 @@ impl CredentialVault {
             return Ok(cached.clone());
         }
 
-        // Try OS keyring first
-        if let Ok(key_b64) = load_keyring_key() {
+        // Env var wins (explicit operator override; matches container
+        // deploy via lzc-manifest where LIBREFANG_VAULT_KEY is baked into
+        // the daemon proc env). Falls through to keyring only when env is
+        // unset. Pre-fix this branch was reachable only after keyring
+        // failure, which caused init()-vs-unlock() divergence when a
+        // partially-available DBus keyring returned a different value
+        // than the env var that init() had used — surfacing as aead::Error
+        // on the next vault_set call from the MCP OAuth handler.
+        if let Ok(key_b64) = std::env::var(VAULT_KEY_ENV) {
+            let key_b64 = Zeroizing::new(key_b64);
             return decode_master_key(&key_b64);
         }
 
-        // Fallback to env var
-        if let Ok(key_b64) = std::env::var(VAULT_KEY_ENV) {
-            let key_b64 = Zeroizing::new(key_b64);
+        // Fallback to OS keyring (Linux Secret Service / macOS Keychain /
+        // Windows Credential Manager).
+        if let Ok(key_b64) = load_keyring_key() {
             return decode_master_key(&key_b64);
         }
 
