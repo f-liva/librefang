@@ -496,6 +496,62 @@ fn is_parameter_error_content(content: &str) -> bool {
     lower.contains("argument is required")
 }
 
+/// Filter session history for a stranger turn: drop any assistant message
+/// whose immediately preceding user message was NOT wrapped in
+/// `<stranger_inbound ...>` XML. Defense-in-depth against history pollution
+/// when an earlier turn (pre-fix or via a hot-patch gap) accidentally let
+/// the model read owner-private data (calendar, email, contacts, files)
+/// from an owner-turn session that was later replayed inside the stranger
+/// session record.
+///
+/// Conservative: when we cannot identify the preceding user role for an
+/// assistant message, we drop the assistant message — favouring a possibly
+/// over-pruned prompt to leaking owner data into a stranger reply.
+///
+/// Live repro 2026-05-18: stranger turn from +393534919650 received the
+/// pre-existing reply
+/// "Ecco la Sua agenda di domani, lunedì 19 maggio: Fabiano Ghedin
+///  (compleanno), Palestra 18-19:30, Salsa Alessandra 19:30-20:30" inside
+/// the session record because an earlier owner-misclassified turn wrote it
+/// there. The next stranger turn replayed that owner reply as context and
+/// the model leaked the agenda again to a different stranger ("Marco").
+fn filter_history_for_stranger_turn(messages: &mut Vec<Message>) {
+    if messages.is_empty() {
+        return;
+    }
+
+    let mut keep = vec![true; messages.len()];
+    let mut last_user_was_stranger: Option<bool> = None;
+    for (i, m) in messages.iter().enumerate() {
+        match m.role {
+            Role::User => {
+                let text = match &m.content {
+                    MessageContent::Text(s) => Some(s.as_str()),
+                    MessageContent::Blocks(blocks) => blocks.iter().find_map(|b| match b {
+                        ContentBlock::Text { text, .. } => Some(text.as_str()),
+                        _ => None,
+                    }),
+                };
+                last_user_was_stranger =
+                    Some(text.is_some_and(|t| t.trim_start().starts_with("<stranger_inbound ")));
+            }
+            Role::Assistant => {
+                if last_user_was_stranger != Some(true) {
+                    keep[i] = false;
+                }
+            }
+            _ => {}
+        }
+    }
+
+    let mut idx = 0;
+    messages.retain(|_| {
+        let k = keep[idx];
+        idx += 1;
+        k
+    });
+}
+
 /// Safely trim message history to `DEFAULT_MAX_HISTORY_MESSAGES`, cutting at
 /// conversation-turn boundaries so ToolUse/ToolResult pairs are never split.
 ///
@@ -2651,6 +2707,34 @@ fn prepare_llm_messages(
                 "[System context — what you know about this person]\n{mem_msg}"
             )),
         );
+    }
+
+    // Stranger-turn history filter — when the current turn is a stranger
+    // turn, scrub any historical assistant message that was emitted in
+    // response to a non-stranger user message. The persistent session may
+    // contain pre-fix owner-misclassified replies (cal/email content) and
+    // the model would happily replay them to a stranger; mirror of the
+    // tool-denial gate but operating on already-generated context.
+    if is_current_turn_stranger(session) {
+        let before = messages.len();
+        filter_history_for_stranger_turn(&mut messages);
+        let after = messages.len();
+        if before != after {
+            tracing::warn!(
+                agent = %manifest.name,
+                dropped = before - after,
+                "Stranger-turn history filter dropped non-stranger assistant context"
+            );
+        }
+        let before_persist = session.messages.len();
+        filter_history_for_stranger_turn(&mut session.messages);
+        if session.messages.len() != before_persist {
+            tracing::warn!(
+                agent = %manifest.name,
+                dropped = before_persist - session.messages.len(),
+                "Stranger-turn filter purged polluted assistant entries from persisted session"
+            );
+        }
     }
 
     safe_trim_messages(
