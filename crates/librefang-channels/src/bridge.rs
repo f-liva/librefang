@@ -482,6 +482,21 @@ pub trait ChannelBridgeHandle: Send + Sync {
     fn channels_download_max_bytes(&self) -> Option<u64> {
         None
     }
+
+    /// Auto-describe an inbound channel image saved to disk. Mirrors the
+    /// pattern from upstream `transcribe_inbound_audio` but for vision.
+    /// When `[media] image_description = true`, the bridge calls this method
+    /// before dispatch so the inline `ImageFile` block is accompanied by a
+    /// `<image_description>` text block produced by the configured
+    /// `image_provider` (default Gemini 2.5 Flash), suppressing primary-model
+    /// OCR hallucination on small in-image text. Default impl is feature-off.
+    async fn describe_inbound_image(
+        &self,
+        _path: &std::path::Path,
+        _mime_type: &str,
+    ) -> Result<Option<String>, String> {
+        Ok(None)
+    }
 }
 
 struct PendingMessage {
@@ -1305,9 +1320,11 @@ impl BridgeManager {
                                     let blocks = if let ChannelContent::Image {
                                         ref url, ref caption, ref mime_type
                                     } = message.content {
-                                        match download_image_to_blocks(url, caption.as_deref(), mime_type.as_deref()).await {
-                                            blocks if blocks.iter().any(|b| matches!(b, ContentBlock::Image { .. } | ContentBlock::ImageFile { .. })) => Some(blocks),
-                                            _ => None,
+                                        let raw = download_image_to_blocks(url, caption.as_deref(), mime_type.as_deref()).await;
+                                        if raw.iter().any(|b| matches!(b, ContentBlock::Image { .. } | ContentBlock::ImageFile { .. })) {
+                                            Some(enrich_image_blocks_with_description(raw, &handle).await)
+                                        } else {
+                                            None
                                         }
                                     } else {
                                         None
@@ -1484,9 +1501,11 @@ impl BridgeManager {
                                     let image_blocks = if let ChannelContent::Image {
                                         ref url, ref caption, ref mime_type
                                     } = message.content {
-                                        match download_image_to_blocks(url, caption.as_deref(), mime_type.as_deref()).await {
-                                            blocks if blocks.iter().any(|b| matches!(b, ContentBlock::Image { .. } | ContentBlock::ImageFile { .. })) => Some(blocks),
-                                            _ => None,
+                                        let raw = download_image_to_blocks(url, caption.as_deref(), mime_type.as_deref()).await;
+                                        if raw.iter().any(|b| matches!(b, ContentBlock::Image { .. } | ContentBlock::ImageFile { .. })) {
+                                            Some(enrich_image_blocks_with_description(raw, &handle).await)
+                                        } else {
+                                            None
                                         }
                                     } else {
                                         None
@@ -2989,13 +3008,14 @@ async fn dispatch_message(
         ref mime_type,
     } = message.content
     {
-        let blocks = download_image_to_blocks(url, caption.as_deref(), mime_type.as_deref()).await;
-        if blocks.iter().any(|b| {
+        let raw = download_image_to_blocks(url, caption.as_deref(), mime_type.as_deref()).await;
+        if raw.iter().any(|b| {
             matches!(
                 b,
                 ContentBlock::Image { .. } | ContentBlock::ImageFile { .. }
             )
         }) {
+            let blocks = enrich_image_blocks_with_description(raw, handle).await;
             // We have actual image data — send as structured blocks for vision
             dispatch_with_blocks(
                 blocks,
@@ -4662,6 +4682,66 @@ async fn download_image_to_blocks(
 
     blocks
 }
+
+/// Post-process inbound image blocks: when the bridge handle's
+/// `describe_inbound_image` returns `Some(text)`, prepend the description as a
+/// `<image_description>` text block so the LLM sees Gemini's authoritative
+/// OCR/visual text before the inline `ImageFile`. When the handle returns
+/// `None` (feature off) or `Err` (provider failure), passes the blocks
+/// through unmodified.
+async fn enrich_image_blocks_with_description(
+    blocks: Vec<ContentBlock>,
+    handle: &Arc<dyn ChannelBridgeHandle>,
+) -> Vec<ContentBlock> {
+    let target = blocks.iter().find_map(|b| match b {
+        ContentBlock::ImageFile { path, media_type } => Some((path.clone(), media_type.clone())),
+        _ => None,
+    });
+    let Some((path, mime)) = target else {
+        return blocks;
+    };
+    let path_buf = std::path::PathBuf::from(&path);
+    let fut = handle.describe_inbound_image(&path_buf, &mime);
+    let result = match tokio::time::timeout(INBOUND_DESCRIBE_TIMEOUT, fut).await {
+        Ok(inner) => inner,
+        Err(_elapsed) => {
+            tracing::warn!(
+                path = %path,
+                mime = %mime,
+                timeout_secs = INBOUND_DESCRIBE_TIMEOUT.as_secs(),
+                "Inbound image auto-describe timed out; passing image through unannotated"
+            );
+            return blocks;
+        }
+    };
+    match result {
+        Ok(Some(text)) if !text.trim().is_empty() => {
+            let desc = format!("<image_description>\n{}\n</image_description>", text.trim());
+            let mut out = Vec::with_capacity(blocks.len() + 1);
+            out.push(ContentBlock::Text {
+                text: desc,
+                provider_metadata: None,
+            });
+            out.extend(blocks);
+            out
+        }
+        Ok(_) => blocks,
+        Err(reason) => {
+            tracing::warn!(
+                error = %reason,
+                path = %path,
+                "Image auto-describe failed; passing image through unannotated"
+            );
+            blocks
+        }
+    }
+}
+
+/// Wall-clock budget for `describe_inbound_image` on the dispatch hot path.
+/// 30 s: long enough for `gemini-2.5-flash` to OCR a multi-line locandina
+/// with retries, short enough to keep the per-(agent,channel) session from
+/// stalling behind a single hung vision call.
+const INBOUND_DESCRIBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
 /// Dispatch a multimodal message (content blocks) to an agent, handling routing
 /// and RBAC the same way as the text path.

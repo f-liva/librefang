@@ -2140,6 +2140,41 @@ impl ChannelBridgeHandle for KernelBridgeAdapter {
     fn channels_download_max_bytes(&self) -> Option<u64> {
         Some(self.kernel.config_ref().channels.file_download_max_bytes)
     }
+
+    /// Auto-describe inbound channel image. When `[media] image_description`
+    /// is enabled, dispatches the saved file through `MediaEngine::describe_image`
+    /// (default `gemini-2.5-flash`) and returns the description so the bridge
+    /// can prepend it as a `<image_description>` text block before the inline
+    /// `ImageFile`. Anchors primary-model OCR on Gemini's output to suppress
+    /// fabricated weekdays / dates / prices on small in-image text.
+    async fn describe_inbound_image(
+        &self,
+        path: &std::path::Path,
+        mime_type: &str,
+    ) -> Result<Option<String>, String> {
+        if !self.kernel.config_ref().media.image_description {
+            return Ok(None);
+        }
+
+        let size_bytes = match tokio::fs::metadata(path).await {
+            Ok(m) => m.len(),
+            Err(e) => return Err(format!("stat saved image failed: {e}")),
+        };
+
+        let attachment = librefang_types::media::MediaAttachment {
+            media_type: librefang_types::media::MediaType::Image,
+            mime_type: mime_type.to_string(),
+            source: librefang_types::media::MediaSource::FilePath {
+                path: path.to_string_lossy().into_owned(),
+            },
+            size_bytes,
+        };
+
+        match self.kernel.media().describe_image(&attachment).await {
+            Ok(result) => Ok(Some(result.description)),
+            Err(reason) => Err(reason),
+        }
+    }
 }
 
 /// Parse a trigger pattern string from chat into a `TriggerPattern`.
