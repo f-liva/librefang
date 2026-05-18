@@ -22,21 +22,51 @@ const {
 const { buildSessionKey, channelTypeForChat } = require('./lib/session-key');
 
 // ---------------------------------------------------------------------------
-// Process-level error handlers
+// Process-level error handlers 
 // ---------------------------------------------------------------------------
-// Surface unhandled rejections explicitly (Node 15+ would otherwise kill
-// the process on the next tick) and let PM2 restart on truly synchronous
-// faults via uncaughtException + exit(1).
+// Without these, an unhandled rejection from a setTimeout/setInterval
+// callback (e.g. the reconnect timer, the catch-up sweep, the dedup-store
+// eviction) terminates the process under Node 15+ default behaviour. PM2
+// would restart but the auth state could be left in an indeterminate
+// shape and the operator gets no signal. We log explicitly so the
+// post-mortem doesn't require diff'ing PM2 restart counts against
+// ambient cron noise.
+// Rolling unhandled-rejection counter. The single-rejection case is
+// usually a recoverable network blip in a setInterval cleanup, but a
+// burst signals genuine broken state — escalate to crash so PM2
+// restarts us instead of accumulating half-finished transactions.
+//
+// The handler below MUST stay synchronous (no `await` between
+// length-check / shift / push / threshold-check); the array is a
+// shared module-level mutable, and Node's single-threaded event loop
+// is the only thing keeping concurrent updates safe.
+const UNHANDLED_REJECTION_BURST_THRESHOLD = 5;
+const UNHANDLED_REJECTION_WINDOW_MS = 5 * 60 * 1000;
+const recentUnhandledRejections = [];
 process.on('unhandledRejection', (reason, promise) => {
   const detail =
     reason && (reason.stack || reason.message)
       ? reason.stack || reason.message
       : String(reason);
   console.error('[gateway][CRITICAL] unhandledRejection:', detail);
+  const now = Date.now();
+  const cutoff = now - UNHANDLED_REJECTION_WINDOW_MS;
+  while (recentUnhandledRejections.length && recentUnhandledRejections[0] < cutoff) {
+    recentUnhandledRejections.shift();
+  }
+  recentUnhandledRejections.push(now);
+  if (recentUnhandledRejections.length >= UNHANDLED_REJECTION_BURST_THRESHOLD) {
+    console.error(
+      `[gateway][CRITICAL] ${recentUnhandledRejections.length} unhandled rejections in ${UNHANDLED_REJECTION_WINDOW_MS / 1000}s — exiting for PM2 restart`,
+    );
+    process.exit(1);
+  }
 });
 process.on('uncaughtException', (err) => {
   const detail = err && (err.stack || err.message) ? err.stack || err.message : String(err);
   console.error('[gateway][CRITICAL] uncaughtException:', detail);
+  // Uncaught synchronous throws indicate truly broken state — exit and
+  // let PM2 restart.
   process.exit(1);
 });
 
@@ -172,6 +202,11 @@ const stmtGetByJid = db.prepare(`
   FROM messages WHERE jid = ? AND timestamp >= ? ORDER BY timestamp DESC LIMIT ?
 `);
 
+// Cap on rows returned by `dbGetUnprocessed` when no explicit limit is
+// passed. The catch-up sweep supplies its own `CATCHUP_BATCH_SIZE`; the
+// `/messages/unprocessed` debug endpoint hits this default.
+const UNPROCESSED_QUERY_DEFAULT_LIMIT = 1000;
+
 // `(processing_since IS NULL OR processing_since < ?)` skips
 // rows the main handler claimed less than PROCESSING_LEASE_MS ago. The
 // caller passes `Date.now() - PROCESSING_LEASE_MS` as the second
@@ -185,6 +220,7 @@ const stmtGetUnprocessed = db.prepare(`
     AND timestamp < ?
     AND (processing_since IS NULL OR processing_since < ?)
   ORDER BY timestamp ASC
+  LIMIT ?
 `);
 
 const stmtMarkProcessing = db.prepare(`
@@ -254,8 +290,8 @@ function dbGetMessagesByJid(jid, limit = 20, since = 0) {
  * to drain only rows whose claim is older than the lease (covers the
  * crashed-handler case).
  */
-function dbGetUnprocessed(olderThan, processingLeaseExpiredBefore = Date.now()) {
-  return stmtGetUnprocessed.all(olderThan, processingLeaseExpiredBefore);
+function dbGetUnprocessed(olderThan, processingLeaseExpiredBefore = Date.now(), limit = UNPROCESSED_QUERY_DEFAULT_LIMIT) {
+  return stmtGetUnprocessed.all(olderThan, processingLeaseExpiredBefore, limit);
 }
 
 /**
@@ -323,18 +359,35 @@ function readWhatsAppConfig(configPath) {
   const defaults = {
     default_agent: 'assistant',
     owner_numbers: [],
+    conversation_ttl_hours: 24,
+    // When false, the gateway suppresses streaming `sendMessage(..., {edit})`
+    // updates and only sends the final accumulated text once the agent loop
+    // completes. Trades real-time feedback for a clean chat UX (no "edited"
+    // tag flicker on every chunk). Default true preserves pre-flag behaviour.
     stream_to_channel: true,
+    // English-only by default keeps upstream deployments locale-neutral;
+    // set `[relay_intent].languages = ["en", "it", …]` in config.toml
+    // to enable extra language packs.
+    relay_intent_languages: ['en'],
+    api_key: '',
   };
   try {
     const content = fs.readFileSync(configPath, 'utf8');
     const parsed = toml.parse(content);
     const wa = parsed?.channels?.whatsapp || {};
+    const relay = parsed?.relay_intent || {};
     const cfg = {
       default_agent: wa.default_agent || defaults.default_agent,
       owner_numbers: Array.isArray(wa.owner_numbers) ? wa.owner_numbers : defaults.owner_numbers,
+      conversation_ttl_hours: parseInt(wa.conversation_ttl_hours, 10) || defaults.conversation_ttl_hours,
       stream_to_channel: typeof wa.stream_to_channel === 'boolean' ? wa.stream_to_channel : defaults.stream_to_channel,
+      relay_intent_languages:
+        Array.isArray(relay.languages) && relay.languages.length > 0
+          ? relay.languages
+          : defaults.relay_intent_languages,
+      api_key: typeof parsed?.api_key === 'string' ? parsed.api_key : '',
     };
-    console.log(`[gateway] Read config from ${configPath}: default_agent="${cfg.default_agent}", owner_numbers=${JSON.stringify(cfg.owner_numbers)}, stream_to_channel=${cfg.stream_to_channel}`);
+    console.log(`[gateway] Read config from ${configPath}: default_agent="${cfg.default_agent}", owner_numbers=${JSON.stringify(cfg.owner_numbers)}, conversation_ttl_hours=${cfg.conversation_ttl_hours}, stream_to_channel=${cfg.stream_to_channel}, relay_intent_languages=${JSON.stringify(cfg.relay_intent_languages)}`);
     return cfg;
   } catch (err) {
     console.warn(`[gateway] Could not read ${configPath}: ${err.message} — using defaults/env vars`);
@@ -349,6 +402,11 @@ const tomlConfig = readWhatsAppConfig(CONFIG_PATH);
 // ---------------------------------------------------------------------------
 const PORT = parseInt(process.env.WHATSAPP_GATEWAY_PORT || '3009', 10);
 const LIBREFANG_URL = (process.env.LIBREFANG_URL || 'http://127.0.0.1:4545').replace(/\/+$/, '');
+// API key for daemon's Bearer auth. Sourced from env LIBREFANG_API_KEY first
+// (so the spawn-by-kernel path can inject it without touching config.toml),
+// then from the top-level `api_key` field in config.toml. Empty when the
+// daemon has no auth configured — gateway requests omit the header.
+const LIBREFANG_API_KEY = process.env.LIBREFANG_API_KEY || tomlConfig.api_key || '';
 const DEFAULT_AGENT = process.env.LIBREFANG_DEFAULT_AGENT || tomlConfig.default_agent;
 const AGENT_NAME = DEFAULT_AGENT;
 
@@ -363,7 +421,7 @@ const OWNER_JID = OWNER_JIDS.size > 0 ? [...OWNER_JIDS][0] : '';
 // updates to WhatsApp/Telegram and only sends the final accumulated text
 // once the agent loop completes. Trades real-time feedback for a clean
 // chat UX (no "edited" tag flicker on every chunk). Default true (preserve
-// pre-2026-05-07 behaviour). Override via `[channels.whatsapp]
+// pre-flag behaviour). Override via `[channels.whatsapp]
 // stream_to_channel = false` in config.toml.
 const STREAM_TO_CHANNEL = tomlConfig.stream_to_channel !== false;
 
@@ -373,6 +431,10 @@ const STREAM_TO_CHANNEL = tomlConfig.stream_to_channel !== false;
 // new behaviour without a rebuild. Defaults to "on".
 const OWNER_CHANNEL_MODE = (process.env.LIBREFANG_OWNER_CHANNEL || 'on').toLowerCase();
 const OWNER_CHANNEL_ENABLED = OWNER_CHANNEL_MODE !== 'off';
+
+// Conversation TTL from config.toml (default 24 hours)
+const CONVERSATION_TTL_HOURS = parseInt(process.env.CONVERSATION_TTL_HOURS || String(tomlConfig.conversation_ttl_hours), 10);
+const CONVERSATION_TTL_MS = CONVERSATION_TTL_HOURS * 3600 * 1000;
 
 // Validate owner numbers at startup
 if (OWNER_NUMBERS.length > 0) {
@@ -408,13 +470,18 @@ let isConnecting = false;
 // forces reconnect before auth stabilizes and the loop never settles.
 const HEARTBEAT_MS = parseInt(process.env.WA_HEARTBEAT_MS || '300000', 10);
 const HEARTBEAT_CHECK_INTERVAL_MS = parseInt(process.env.WA_HEARTBEAT_CHECK_MS || '30000', 10);
-// `/health` reports `degraded` past this; kept under HEARTBEAT_MS so
-// external monitoring sees trouble before the watchdog reconnect fires.
+// separate threshold for the /health endpoint so external
+// monitoring degrades earlier than the watchdog's force-reconnect
+// trigger. 5 minutes is enough to filter out brief WhatsApp server
+// pauses without false-flagging a dead socket.
 const HEALTH_STALE_THRESHOLD_MS = parseInt(process.env.WA_HEALTH_STALE_MS || '300000', 10);
 let lastInboundAt = Date.now();
 let heartbeatInterval = null;
-// Module-scoped so `cleanupSocket()` can clear it alongside
-// `heartbeatInterval` without a second `connection.update` listener.
+// lifted to module scope so `cleanupSocket()` can clear it
+// alongside `heartbeatInterval`, instead of relying on a second
+// `sock.ev.on('connection.update', ...)` listener (which doubled the
+// fire count for every connection event). Set inside `startConnection`,
+// cleared on every teardown path.
 let gapDetectionTimer = null;
 
 // Pure predicate — true when we've been silent longer than thresholdMs.
@@ -457,14 +524,21 @@ try {
 }
 
 function persistCachedAgentId(id) {
+  // Atomic via tmp + rename so a SIGKILL mid-write can't leave a
+  // truncated agent_id.json that the next boot fails to parse. The
+  // read-side parse error path is self-healing (re-resolves from API),
+  // but a clean swap avoids the noisy warning.
+  const tmp = AGENT_ID_CACHE_PATH + '.tmp';
   try {
     fs.writeFileSync(
-      AGENT_ID_CACHE_PATH,
+      tmp,
       JSON.stringify({ id, name: DEFAULT_AGENT, ts: Date.now() }),
       { mode: 0o600 },
     );
+    fs.renameSync(tmp, AGENT_ID_CACHE_PATH);
   } catch (err) {
     console.warn(`[gateway] Could not persist agent id: ${err.message}`);
+    try { fs.unlinkSync(tmp); } catch { /* noop */ }
   }
 }
 
@@ -614,24 +688,15 @@ async function resolveLidProactively(sock, lid, cache, timeoutMs = 5000) {
 // ---------------------------------------------------------------------------
 // Message store for Baileys retry mechanism
 // ---------------------------------------------------------------------------
-// Baileys needs getMessage() to re-decrypt messages on retry. We keep a
-// bounded in-memory store of recently received messages.
-//
-// Each entry holds both the inner `message` payload (what Baileys' getMessage
-// hook returns for retry decryption) and the full `waMessage` envelope
-// (key + message + timestamp + participant — what `sock.sendMessage` needs
-// for the `quoted` option to render a reply-thread bubble on the WA UI).
-//
-// agent-side `reply_to_msg_id` was being POSTed to the gateway
-// but silently dropped. The fix wires the body field through here so the
-// outbound send can quote the original message.
+// Baileys needs getMessage() to re-decrypt messages on retry.  We keep a
+// bounded in-memory store of recently received raw messages.
 const MESSAGE_STORE_MAX = 500;
 const MESSAGE_STORE_TTL_MS = 10 * 60 * 1000; // 10 min
-const messageStore = new Map(); // key: msgId → { message, waMessage?, ts }
+const messageStore = new Map(); // key: msgId → { message, ts }
 
-function messageStoreSet(msgId, message, waMessage) {
+function messageStoreSet(msgId, message) {
   if (!msgId || !message) return;
-  messageStore.set(msgId, { message, waMessage, ts: Date.now() });
+  messageStore.set(msgId, { message, ts: Date.now() });
   // Evict oldest entries if over limit
   if (messageStore.size > MESSAGE_STORE_MAX) {
     const oldest = messageStore.keys().next().value;
@@ -647,65 +712,6 @@ function messageStoreGet(msgId) {
     return undefined;
   }
   return entry.message;
-}
-
-// Returns the full `WAMessage` envelope (or undefined when missing/expired).
-// Required by Baileys' `quoted` option on outbound sends, which expects the
-// whole message — not just the inner `message` content.
-function messageStoreGetWAMessage(msgId) {
-  const entry = messageStore.get(msgId);
-  if (!entry) return undefined;
-  if (Date.now() - entry.ts > MESSAGE_STORE_TTL_MS) {
-    messageStore.delete(msgId);
-    return undefined;
-  }
-  return entry.waMessage;
-}
-
-// Strip the optional `WAID:` prefix that the Rust runtime tags onto WhatsApp
-// message IDs to disambiguate them from other channels' IDs (Telegram,
-// Slack, …). Lookup keys in the store use bare `msg.key.id`. The match is
-// case-insensitive so either casing works; ids without the prefix pass
-// through unchanged.
-function stripWaidPrefix(id) {
-  if (typeof id !== 'string') return '';
-  const trimmed = id.trim();
-  if (!trimmed) return '';
-  if (trimmed.length >= 5 && trimmed.slice(0, 5).toUpperCase() === 'WAID:') {
-    return trimmed.slice(5);
-  }
-  return trimmed;
-}
-
-// Resolve the `quoted` payload for an outbound send from the body's
-// `reply_to` field. Returns:
-//   - `undefined`         when `replyTo` is null/empty/non-string OR when the
-//                         stored message has expired / never existed (fail
-//                         soft: send goes through without a quote bubble)
-//   - the WAMessage object when the lookup hit
-//
-// `lookup` is injected so unit tests can supply a stub instead of touching
-// the module-level `messageStore`.
-function resolveQuotedFromReplyTo(replyTo, lookup) {
-  if (replyTo === null || replyTo === undefined) return undefined;
-  if (typeof replyTo !== 'string') {
-    console.warn(`[gateway][reply_to] ignoring non-string value: ${typeof replyTo}`);
-    return undefined;
-  }
-  const stripped = stripWaidPrefix(replyTo);
-  if (!stripped) return undefined;
-  let waMessage;
-  try {
-    waMessage = lookup(stripped);
-  } catch (err) {
-    console.warn(`[gateway][reply_to] lookup threw for "${stripped}": ${err?.message || err}`);
-    return undefined;
-  }
-  if (!waMessage) {
-    console.warn(`[gateway][reply_to] no stored message for "${stripped}" — sending without quote`);
-    return undefined;
-  }
-  return waMessage;
 }
 
 // ---------------------------------------------------------------------------
@@ -861,6 +867,62 @@ function markdownToWhatsApp(text) {
 }
 
 // ---------------------------------------------------------------------------
+// Step B: Conversation Tracker — in-memory Map with TTL
+// ---------------------------------------------------------------------------
+// Map<stranger_jid, ConversationState>
+const activeConversations = new Map();
+
+// Max messages to keep per conversation
+const MAX_CONVERSATION_MESSAGES = 20;
+
+/**
+ * Record an inbound or outbound message in the conversation tracker.
+ * Creates the conversation entry if it doesn't exist.
+ */
+function trackMessage(strangerJid, pushName, phone, text, direction) {
+  let convo = activeConversations.get(strangerJid);
+  if (!convo) {
+    convo = {
+      pushName,
+      phone,
+      messages: [],
+      lastActivity: Date.now(),
+      messageCount: 0,
+      escalated: false,
+    };
+    activeConversations.set(strangerJid, convo);
+  }
+  convo.pushName = pushName || convo.pushName;
+  convo.lastActivity = Date.now();
+  convo.messageCount += 1;
+  convo.messages.push({
+    text: (text || '').substring(0, 500),
+    timestamp: Date.now(),
+    direction, // 'inbound' | 'outbound'
+  });
+  // Cap message history
+  if (convo.messages.length > MAX_CONVERSATION_MESSAGES) {
+    convo.messages = convo.messages.slice(-MAX_CONVERSATION_MESSAGES);
+  }
+}
+
+/**
+ * Evict expired conversations based on TTL.
+ */
+function evictExpiredConversations() {
+  const now = Date.now();
+  for (const [jid, convo] of activeConversations) {
+    if (now - convo.lastActivity > CONVERSATION_TTL_MS) {
+      console.log(`[gateway] Evicting expired conversation: ${convo.pushName} (${convo.phone})`);
+      activeConversations.delete(jid);
+    }
+  }
+}
+
+// Periodic sweep every 15 minutes
+setInterval(evictExpiredConversations, 15 * 60 * 1000);
+
+// ---------------------------------------------------------------------------
 // Step F: Rate limiting — per-JID for strangers
 // ---------------------------------------------------------------------------
 const rateLimitMap = new Map(); // Map<jid, { timestamps: number[] }>
@@ -931,118 +993,88 @@ setInterval(() => {
 }, 10 * 60 * 1000);
 
 // ---------------------------------------------------------------------------
-// Phase 07 §C — Wrap inbound stranger messages in <stranger_inbound> XML
+// Step D: Build active conversations context block for owner messages
 // ---------------------------------------------------------------------------
-// Anticipates Phase 06 XML migration. The model receives structured context
-// (jid, sender name, timestamp) without any persistent state being held by
-// the gateway. This is the canonical replacement for the legacy
-// flat-text stranger-context block removed in PLAN-01.
-//
-// Defense-in-depth: Phase 05 §A first-char '<' detection on OUTPUT path
-// catches model echo-leak of this tag. The per-agent persona deployment
-// (CONTEXT §H) teaches the agent to read this XML format — until that
-// rolls out, an agent that doesn't recognize the tag may copy it back in
-// its reply, which the output guard then strips.
+function buildConversationsContext() {
+  if (activeConversations.size === 0) return '';
 
-/**
- * Escape a string for safe insertion as an XML attribute value.
- * Handles &, <, >, ", '.
- */
-function xmlAttrEscape(s) {
-  return String(s ?? '')
-    .replace(/&/g, '&amp;')
-    .replace(/</g, '&lt;')
-    .replace(/>/g, '&gt;')
-    .replace(/"/g, '&quot;')
-    .replace(/'/g, '&apos;');
-}
-
-/**
- * Escape body text. We only neutralize the closing fence to prevent a
- * stranger from injecting `</stranger_inbound>` followed by attacker XML
- * (parser-confusion / fence-injection vector). Other characters are passed
- * through — the model handles them naturally and full XML body escaping
- * would only obscure user content for the LLM.
- */
-function xmlBodyEscape(s) {
-  return String(s ?? '').replace(/<\/stranger_inbound>/gi, '&lt;/stranger_inbound&gt;');
-}
-
-/**
- * Wrap an inbound stranger message in <stranger_inbound> XML.
- *
- * @param {string} jid           - Stranger WhatsApp JID (e.g., '393480000000@s.whatsapp.net')
- * @param {string|null} pushName - Sender's WhatsApp display name (may be null)
- * @param {string} isoTimestamp  - ISO 8601 timestamp of inbound (caller-provided)
- * @param {string} text          - Message body (may be empty for media-only)
- * @param {object} [opts]
- * @param {string} [opts.mediaType]   - 'voice' | 'image' | 'document' (omit for text-only)
- * @param {string} [opts.mediaUrl]    - URL of media file (when mediaType set; may be undefined)
- * @param {string} [opts.transcript]  - Pre-computed Whisper transcript for voice
- * @returns {string} XML-wrapped message ready to forward to kernel
- */
-function wrapStrangerInbound(jid, pushName, isoTimestamp, text, opts = {}) {
-  const safeJid = xmlAttrEscape(jid);
-  const safeName = xmlAttrEscape(pushName || '(unknown)');
-  const safeTs = xmlAttrEscape(isoTimestamp);
-  const attrs = [`jid="${safeJid}"`, `name="${safeName}"`, `timestamp="${safeTs}"`];
-
-  if (opts.mediaType) {
-    attrs.push(`media_type="${xmlAttrEscape(opts.mediaType)}"`);
+  const lines = ['[ACTIVE_STRANGER_CONVERSATIONS]'];
+  let idx = 1;
+  for (const [jid, convo] of activeConversations) {
+    const lastMsg = convo.messages[convo.messages.length - 1];
+    const agoMs = Date.now() - (lastMsg?.timestamp || convo.lastActivity);
+    const agoStr = formatTimeAgo(agoMs);
+    const lastText = lastMsg ? `"${lastMsg.text.substring(0, 100)}"` : '(no messages)';
+    const escalatedTag = convo.escalated ? ' [ESCALATED]' : '';
+    lines.push(`${idx}. ${convo.pushName} (${convo.phone}) [JID: ${jid}] — last: ${lastText} (${agoStr})${escalatedTag}`);
+    idx++;
   }
+  lines.push('[/ACTIVE_STRANGER_CONVERSATIONS]');
+  return lines.join('\n');
+}
 
-  let body;
-  if (opts.mediaType === 'voice') {
-    const transcript = opts.transcript ? xmlBodyEscape(opts.transcript) : '(no transcript available)';
-    const url = opts.mediaUrl ? `\nurl: ${xmlAttrEscape(opts.mediaUrl)}` : '';
-    body = `voice note from ${safeName}${url}\ntranscript: ${transcript}`;
-  } else if (opts.mediaType === 'image') {
-    const caption = text ? xmlBodyEscape(text) : '(no caption)';
-    const url = opts.mediaUrl ? `\nurl: ${xmlAttrEscape(opts.mediaUrl)}` : '';
-    body = `image from ${safeName}${url}\ncaption: ${caption}`;
-  } else if (opts.mediaType === 'document') {
-    const caption = text ? xmlBodyEscape(text) : '(no caption)';
-    const url = opts.mediaUrl ? `\nurl: ${xmlAttrEscape(opts.mediaUrl)}` : '';
-    body = `document from ${safeName}${url}\ncaption: ${caption}`;
-  } else {
-    body = xmlBodyEscape(text || '');
-  }
-
-  return `<stranger_inbound ${attrs.join(' ')}>\n${body}\n</stranger_inbound>`;
+function formatTimeAgo(ms) {
+  const seconds = Math.floor(ms / 1000);
+  if (seconds < 60) return `${seconds}s ago`;
+  const minutes = Math.floor(seconds / 60);
+  if (minutes < 60) return `${minutes}min ago`;
+  const hours = Math.floor(minutes / 60);
+  if (hours < 24) return `${hours}h ago`;
+  const days = Math.floor(hours / 24);
+  return `${days}d ago`;
 }
 
 // ---------------------------------------------------------------------------
-// Phase 08 §C — [NOTIFY_OWNER] text-tag parser ERADICATED.
-//
-// Removed: NOTIFY_OWNER_RE, extractNotifyOwner.
-//
-// Owner notifications now flow exclusively through the typed `owner_notice`
-// SSE event emitted by the kernel `notify_owner` MCP tool (Phase 08 §A,
-// hardened in PLAN-01). The gateway consumes that event via the
-// `onOwnerNotice` callback wired into `forwardToLibreFangStreaming` and
-// fans out to OWNER_JIDS at the post-stream block below.
-//
-// D-05 hard cut: no compatibility shim, no fallback parser. Persona prompts
-// that still emit `[NOTIFY_OWNER]{...}[/NOTIFY_OWNER]` literal text will
-// deliver that text verbatim to the recipient until the persona is updated
-// (Phase 08 §H deployment note).
+// Step C: Build stranger context prefix (factual only, no personality)
 // ---------------------------------------------------------------------------
+function buildStrangerContext(pushName, phone, strangerJid) {
+  const convo = activeConversations.get(strangerJid);
+  const messageCount = convo ? convo.messageCount : 1;
+  const firstMessageAt = convo && convo.messages.length > 0
+    ? new Date(convo.messages[0].timestamp).toISOString()
+    : new Date().toISOString();
+
+  return [
+    '[WHATSAPP_STRANGER_CONTEXT]',
+    `Incoming WhatsApp message from: ${pushName} (${phone})`,
+    `This person is NOT the owner. They are an external contact.`,
+    `Active conversation: ${messageCount} messages, started ${firstMessageAt}`,
+    '',
+    'Available routing tags:',
+    '- [NOTIFY_OWNER]{"reason": "...", "summary": "..."}[/NOTIFY_OWNER] — sends a notification to the owner',
+    '[/WHATSAPP_STRANGER_CONTEXT]',
+    '',
+  ].join('\n');
+}
 
 // ---------------------------------------------------------------------------
-// Phase 08 §D — detectStrangerTurnOwnerLeak regex defense ERADICATED.
-//
-// Removed: OWNER_LEAK_PATTERNS, detectStrangerTurnOwnerLeak.
-//
-// The Phase 08 §B kernel-level stranger-turn contract (Section 9.7,
-// PLAN-02) structurally enforces tool-only output during a stranger turn:
-// the model emits `channel_send` / `notify_owner` tool calls, no free
-// prose ever reaches the stranger dispatch site. The regex bandage from
-// hot-fix (commit 18d9e3c5) is therefore redundant and removed.
-//
-// Bonus: eliminates false-positive risk on legitimate stranger replies
-// containing the literals "Signore", "/message/send", or `{"success":true}`
-// quoted verbatim by the model.
+// Step C: Parse NOTIFY_OWNER tags from agent response
 // ---------------------------------------------------------------------------
+const NOTIFY_OWNER_RE = /\[NOTIFY_OWNER\]\s*(\{[\s\S]*?\})\s*\[\/NOTIFY_OWNER\]/g;
+
+function extractNotifyOwner(responseText) {
+  const notifications = [];
+  for (const match of responseText.matchAll(NOTIFY_OWNER_RE)) {
+    try {
+      const parsed = JSON.parse(match[1]);
+      notifications.push({
+        reason: parsed.reason || 'unknown',
+        summary: parsed.summary || '',
+      });
+    } catch {
+      console.error('[gateway] Failed to parse NOTIFY_OWNER JSON:', match[1]);
+    }
+  }
+  // §A — legacy text-tag path is kept one release for compatibility, but
+  // every hit is loud-logged so callers can migrate to the typed
+  // `notify_owner` tool. Suppressed when the new envelope already routed
+  // the same payload (caller checks collectedOwnerNotices first).
+  if (notifications.length > 0) {
+    console.warn('[gateway][deprecated] NOTIFY_OWNER text tag detected; migrate to the notify_owner LLM tool. Hits:', notifications.length);
+  }
+  const cleanedText = responseText.replace(NOTIFY_OWNER_RE, '').trim();
+  return { notifications, cleanedText };
+}
 
 // ---------------------------------------------------------------------------
 // Silent-response sentinel — gateway-side mirror of the canonical Rust
@@ -1143,7 +1175,7 @@ function isSilentResponse(text) {
 // Matches both `(parens)` and `[brackets]` shapes wrapping a single
 // progress verb. Narrow on purpose so legitimate user content that
 // happens to start with a paren or bracket is not blocked.
-const PROGRESS_PLACEHOLDER_RE = /^[\s ]*[\(\[][^\(\[\)\]]{0,80}(thinking|reading|loading|processing|analyzing|still working|conversation context)[^\(\[\)\]]{0,80}[\)\]][\s ]*$/i;
+const PROGRESS_PLACEHOLDER_RE = /^[\s ]*[\(\[][^\(\[\)\]]{0,80}(thinking|reading|loading|processing|analyzing|still working|conversation context)[^\(\[\)\]]{0,80}[\)\]][\s ]*$/i;
 
 function isProgressTextLeak(text) {
   if (typeof text !== 'string' || !text) return false;
@@ -1234,6 +1266,73 @@ function createHoldbackAccumulator({ onFlush, onSilent, minChars = SILENT_HOLDBA
 }
 
 // ---------------------------------------------------------------------------
+// Step E: Parse relay commands from agent response
+// ---------------------------------------------------------------------------
+
+// The agent can embed a relay command in its response using this JSON format:
+// [RELAY_TO_STRANGER]{"jid":"...@s.whatsapp.net","message":"..."}[/RELAY_TO_STRANGER]
+const RELAY_RE = /\[RELAY_TO_STRANGER\]\s*(\{[\s\S]*?\})\s*\[\/RELAY_TO_STRANGER\]/g;
+
+function extractRelayCommands(responseText) {
+  const relays = [];
+  for (const match of responseText.matchAll(RELAY_RE)) {
+    try {
+      const parsed = JSON.parse(match[1]);
+      if (parsed.jid && parsed.message) {
+        relays.push({ jid: parsed.jid, message: parsed.message });
+      }
+    } catch {
+      console.error('[gateway] Failed to parse relay command JSON:', match[1]);
+    }
+  }
+  const cleanedText = responseText.replace(RELAY_RE, '').trim();
+  return { relays, cleanedText };
+}
+
+// ---------------------------------------------------------------------------
+// Step F: Anti-confusion safeguards — relay validation + audit logging
+// ---------------------------------------------------------------------------
+
+/**
+ * Validate and execute a relay to a stranger.
+ * Returns a status string for the owner confirmation.
+ */
+async function executeRelay(relay) {
+  const { jid, message } = relay;
+
+  // F1: JID must exist in active conversations
+  const convo = activeConversations.get(jid);
+  if (!convo) {
+    const errorMsg = `Relay rejected: no active conversation for JID ${jid}. The conversation may have expired.`;
+    console.warn(`[gateway] ${errorMsg}`);
+    return { success: false, error: errorMsg };
+  }
+
+  // F2: Socket must be connected
+  if (!sock || connStatus !== 'connected') {
+    return { success: false, error: 'WhatsApp not connected' };
+  }
+
+  try {
+    const sentRelay = await sock.sendMessage(jid, { text: markdownToWhatsApp(message) });
+    if (ECHO_TRACKER_ENABLED) echoTracker.track(message);
+
+    // F4: Audit log
+    console.log(`[gateway] RELAY SENT | to: ${convo.pushName} (${convo.phone}) [${jid}] | message: "${message.substring(0, 100)}" | timestamp: ${new Date().toISOString()}`);
+
+    // Update conversation tracker with outbound message
+    trackMessage(jid, convo.pushName, convo.phone, message, 'outbound');
+    // Save relay outbound to DB
+    dbSaveMessage({ id: sentRelay?.key?.id || randomUUID(), jid, senderJid: ownJid, pushName: null, phone: convo.phone, text: message, direction: 'outbound', timestamp: Date.now(), processed: 1, rawType: 'text' });
+
+    return { success: true, recipient: convo.pushName, phone: convo.phone };
+  } catch (err) {
+    console.error(`[gateway] Relay send failed to ${jid}:`, err.message);
+    return { success: false, error: err.message };
+  }
+}
+
+// ---------------------------------------------------------------------------
 // Resolve agent name → UUID via LibreFang API
 // ---------------------------------------------------------------------------
 function resolveAgentId() {
@@ -1253,7 +1352,8 @@ function resolveAgentId() {
         port: url.port || 4545,
         path: url.pathname,
         method: 'GET',
-        headers: { 'Accept': 'application/json' },
+        headers: {
+          ...(LIBREFANG_API_KEY ? { Authorization: 'Bearer ' + LIBREFANG_API_KEY } : {}), 'Accept': 'application/json' },
         timeout: 10_000,
       },
       (res) => {
@@ -1310,8 +1410,10 @@ async function cleanupSocket() {
     clearInterval(heartbeatInterval);
     heartbeatInterval = null;
   }
-  // gapDetectionTimer is per-connection too — drop it alongside the
-  // heartbeat so reconnect doesn't leak a closure on stale state.
+  // gapDetectionTimer is also per-connection. Clear it
+  // alongside heartbeat so the reconnect path doesn't leave a leftover
+  // closure scanning a stale `stmtGetLastSeen` while the new sock is
+  // booting.
   if (gapDetectionTimer) {
     clearInterval(gapDetectionTimer);
     gapDetectionTimer = null;
@@ -1325,6 +1427,35 @@ async function cleanupSocket() {
   try { previousSock.end?.(); } catch {}
 }
 
+// Schedule the next reconnect attempt with exponential backoff. The
+// `.catch` arms a fresh `scheduleReconnect()` so that a `startConnection`
+// throw before the new sock's `connection.update` listener gets installed
+// does NOT strand the gateway: without self-rescheduling there would be
+// no future event source to fire the next retry, and only the 30s
+// health-check + PM2 restart would rescue. Self-rescheduling keeps the
+// in-process recovery loop alive end-to-end.
+function scheduleReconnect() {
+  reconnectAttempts += 1;
+  const delay = computeBackoffDelay(reconnectAttempts);
+  console.log(
+    `[gateway] Reconnecting in ${Math.round(delay / 1000)}s (attempt ${reconnectAttempts}, jittered)`,
+  );
+  connStatus = 'disconnected';
+  statusMessage = `Reconnecting (attempt ${reconnectAttempts})...`;
+  setTimeout(() => {
+    startConnection().catch((err) => {
+      console.warn(
+        '[gateway] reconnect attempt failed:',
+        err && err.message ? err.message : err,
+      );
+      // Self-rescheduling: a throw before the close-listener install
+      // means there is no future `connection.update close` to fire the
+      // next retry. The next backoff tick keeps the loop alive.
+      scheduleReconnect();
+    });
+  }, delay);
+}
+
 async function startConnection() {
   if (isConnecting) {
     console.log('[gateway] Connection attempt already in progress, skipping');
@@ -1333,9 +1464,12 @@ async function startConnection() {
   isConnecting = true;
   try {
 
-  // Defensive cleanup before re-init: covers a sock orphaned by a
-  // crash mid-init that never emitted `close` (PM2 respawn case).
-  // No-op when sock is already null.
+  // defensive teardown of any leftover sock + per-connection
+  // timers from a previous invocation. The normal teardown path runs in
+  // the `connection.update` close branch, but a sock that was abandoned
+  // without emitting close (e.g. process killed mid-init last cycle and
+  // PM2 respawned us) would leak its listeners and timers. The
+  // `cleanupSocket()` is a no-op when sock is already null.
   await cleanupSocket();
 
   // Dynamic imports — Baileys is ESM-only in v6+
@@ -1426,26 +1560,10 @@ async function startConnection() {
         // backoff 2s → 30s, factor 1.8, ±25% jitter, NO hard stop — a
         // transient outage longer than 5 attempts (the previous cap) used
         // to leave the gateway permanently disconnected until manual
-        // restart. We now keep retrying at the capped interval.
-        reconnectAttempts += 1;
-        const delay = computeBackoffDelay(reconnectAttempts);
-        console.log(
-          `[gateway] Reconnecting in ${Math.round(delay / 1000)}s (attempt ${reconnectAttempts}, jittered)`,
-        );
-        connStatus = 'disconnected';
-        statusMessage = `Reconnecting (attempt ${reconnectAttempts})...`;
-        // startConnection now throws on failure (was
-        // try/finally only); a setTimeout-fired rejection would otherwise
-        // become an unhandled rejection. The catch keeps the next reconnect
-        // tick scheduled (we'll retry on the next connection.update close).
-        setTimeout(() => {
-          startConnection().catch((err) => {
-            console.warn(
-              '[gateway] reconnect attempt failed:',
-              err && err.message ? err.message : err,
-            );
-          });
-        }, delay);
+        // restart. We now keep retrying at the capped interval. The
+        // helper handles the backoff, status-line update, and self-
+        // rescheduling on retry-throw.
+        scheduleReconnect();
       }
     }
 
@@ -1518,11 +1636,9 @@ async function startConnection() {
     if (type !== 'notify') return;
 
     for (const msg of messages) {
-      // Store raw message for Baileys retry mechanism and resolve successful retries.
-      // The third argument (`msg`) is the full WAMessage envelope, used by
-      // outbound sends with `reply_to` to render a quote-reply bubble.
+      // Store raw message for Baileys retry mechanism and resolve successful retries
       if (msg.key?.id && msg.message) {
-        messageStoreSet(msg.key.id, msg.message, msg);
+        messageStoreSet(msg.key.id, msg.message);
         const retryKey = getDecryptRetryKey(msg.key.remoteJid || '', msg.key.id);
         if (decryptRetryMap.has(retryKey)) {
           console.log(`[gateway][retry] Decryption retry succeeded for ${msg.key.id}`);
@@ -1750,20 +1866,26 @@ async function startConnection() {
         // without attachment — the agent sees text but no media; better
         // than no response at all.
         let result = null;
+        // Hold the timer so we can clearTimeout on the success path —
+        // otherwise the zombie keeps the event loop alive for 90s after
+        // each media message and N concurrent inflight = N zombies.
+        let mediaTimeoutHandle = null;
         try {
           result = await Promise.race([
             processMediaMessage(msg, innerMsg, cachedAgentId),
-            new Promise((_, reject) =>
-              setTimeout(
+            new Promise((_, reject) => {
+              mediaTimeoutHandle = setTimeout(
                 () => reject(new Error('media_pipeline_timeout')),
                 MEDIA_PIPELINE_TIMEOUT_MS,
-              ),
-            ),
+              );
+            }),
           ]);
         } catch (err) {
           console.warn(
             `[gateway] media pipeline failed (${err && err.message ? err.message : err}) — forwarding without attachment`,
           );
+        } finally {
+          if (mediaTimeoutHandle) clearTimeout(mediaTimeoutHandle);
         }
         if (result && result.attachment) {
           attachments.push(result.attachment);
@@ -1915,6 +2037,10 @@ async function startConnection() {
 
       // Forward to LibreFang agent
       try {
+        // Track stranger messages
+        if (isStranger) {
+          trackMessage(sender, pushName, phone, messageText, 'inbound');
+        }
 
         // Build the message to send to the agent
         let messageToSend;
@@ -1924,48 +2050,16 @@ async function startConnection() {
           // Include sender identity so the LLM knows who is talking in the group
           messageToSend = `[Group message from ${pushName || phone}]\n${messageText}`;
         } else if (isStranger) {
-          // Phase 07 §C — inline XML wrap. Replaces the legacy
-          // flat-text stranger-context block (removed PLAN-01).
-          // Owner DM and group branches stay UN-wrapped on purpose.
-          //
-          // Timestamp source: prefer Baileys `msgTimestamp` (already
-          // computed at the message-store save site downstream as
-          // ms-since-epoch). Fall back to wall clock if the field is
-          // missing for any reason.
-          const tsMs = msg.messageTimestamp
-            ? (typeof msg.messageTimestamp === 'number'
-                ? msg.messageTimestamp * 1000
-                : Number(msg.messageTimestamp) * 1000)
-            : Date.now();
-          const isoTs = new Date(tsMs).toISOString();
-
-          // Detect media via `innerMsg` (set at line ~1226 as
-          // `msg.message || {}`) — same convention as
-          // `getDownloadableMedia()` and the contextInfo collector
-          // earlier in this handler. NOT `msg.message?.audioMessage`.
-          if (innerMsg.audioMessage) {
-            // For voice: `messageText` already contains the Whisper
-            // transcript when audio_understanding is enabled (see L1430
-            // `[Voice transcription]: ...`). Strip the prefix so the XML
-            // body holds clean transcript text.
-            const transcriptOnly = transcriptionText
-              || messageText.replace(/^\[(Voice|Audio) transcription\]:\s*/, '');
-            messageToSend = wrapStrangerInbound(sender, pushName, isoTs, '', {
-              mediaType: 'voice',
-              transcript: transcriptOnly || undefined,
-            });
-          } else if (innerMsg.imageMessage) {
-            messageToSend = wrapStrangerInbound(sender, pushName, isoTs, messageText, {
-              mediaType: 'image',
-            });
-          } else if (innerMsg.documentMessage
-                  || innerMsg.documentWithCaptionMessage?.message?.documentMessage) {
-            messageToSend = wrapStrangerInbound(sender, pushName, isoTs, messageText, {
-              mediaType: 'document',
-            });
-          } else {
-            messageToSend = wrapStrangerInbound(sender, pushName, isoTs, messageText);
-          }
+          const strangerContext = buildStrangerContext(pushName, phone, sender);
+          messageToSend = strangerContext + messageText;
+        } else if (isOwner && activeConversations.size > 0 && ownerIntentsRelay(messageText)) {
+          // Only inject the relay system instruction when the owner's text
+          // expresses an explicit delegated-speech intent. A neutral greeting
+          // from the owner to the agent during an active stranger conversation
+          // must NOT be forced into relay mode.
+          const context = buildConversationsContext();
+          systemPrefix = buildRelaySystemInstruction();
+          messageToSend = context + '\n\n[OWNER_MESSAGE]\n' + messageText;
         } else {
           messageToSend = messageText;
         }
@@ -1982,30 +2076,23 @@ async function startConnection() {
         const onProgress = async (partialText) => {
           // Streaming-to-channel disabled via `[channels.whatsapp]
           // stream_to_channel = false` — let the final delivery path
-          // (forwardToLibreFangStreaming → sendOrEdit) handle the full
-          // text in one send so WhatsApp/Telegram don't show the
-          // "edited" tag on every chunk.
+          // handle the full text in one send so WhatsApp/Telegram don't
+          // show the "edited" tag on every chunk.
           if (!STREAM_TO_CHANNEL) return;
           if (streamEditFailures >= STREAM_EDIT_MAX_FAILURES) return;
-          // snapshot the sock at callback entry. The global
-          // `sock` can be nulled out by a concurrent reconnect between
-          // the existence check and the actual sendMessage await.
+          // Snapshot the sock at callback entry. The global `sock` can be
+          // nulled out by a concurrent reconnect between the existence check
+          // and the actual sendMessage await.
           const localSock = sock;
           if (!localSock) return;
-          // Phase 08 §E: removed `if (isStranger) return;` early-return
-          // (hot-fix 11adcd8a). Now redundant: the
-          // §B Section 9.7 kernel contract forces tool-only output during a
-          // stranger turn, so no prose ever reaches this onProgress callback
-          // for a stranger anyway. Removing the early-return restores
-          // pre-#41 streaming behaviour for owner / group turns (no
-          // regression — owner streaming was working before #41).
-          //
-          // Phase 08 §C: removed NOTIFY_OWNER_RE strip — the [NOTIFY_OWNER]
-          // text-tag parser was eradicated entirely. The `[no reply needed]`
-          // strip is preserved (separate canonical sentinel).
+          // Strip internal tags before sending partial text to WhatsApp.
+          // Bail early if no brackets — most chunks won't contain tags.
           let cleaned = partialText;
-          if (cleaned.includes('[no reply needed]')) {
-            cleaned = cleaned.replace(/\[no reply needed\]/gi, '');
+          if (cleaned.includes('[NOTIFY_OWNER]') || cleaned.includes('[RELAY_TO_STRANGER]') || cleaned.includes('[no reply needed]')) {
+            cleaned = cleaned
+              .replace(NOTIFY_OWNER_RE, '')
+              .replace(RELAY_RE, '')
+              .replace(/\[no reply needed\]/gi, '');
           }
           // OB-07 hold-back gate: until we have already established a
           // visible WhatsApp message (streamMsgKey != null), refuse to
@@ -2085,22 +2172,6 @@ async function startConnection() {
         // OB-01: happens regardless of whether a public reply will be sent
         // below; the owner receives the private payload even when the model
         // elects to stay silent in the source chat.
-        //
-        // Phase 08 §F — parse `[urgency]` prefix from owner_notice payloads.
-        //   Format emitted by kernel `notify_owner` (Phase 08 §A, PLAN-01):
-        //     "[{urgency}] {reason}: {summary}"
-        //     where urgency ∈ {low, normal, high}.
-        //   When prefix is `[high]`, the gateway COULD bypass dedup (D-04).
-        //   In current fork/custom there is NO dedup gate on the
-        //   `collectedOwnerNotices` fan-out — `shouldDebounceEscalation`
-        //   was called only inside the legacy `[NOTIFY_OWNER]` loop deleted
-        //   by §C above. So the urgency parsing here is TELEMETRY ONLY:
-        //   we log the urgency level for observability, strip the `[urgency]`
-        //   prefix from the displayed text so the owner sees a clean line,
-        //   and treat the absence of a prefix as `normal` (BC-safe).
-        //   D-04's "bypass on high" is a structural no-op until/unless a
-        //   future dedup gate is added on this code path.
-        const URGENCY_PREFIX_RE = /^\[(low|normal|high)\]\s+/;
         if (OWNER_CHANNEL_ENABLED && collectedOwnerNotices.length > 0) {
           if (OWNER_JIDS.size === 0) {
             console.log(JSON.stringify({
@@ -2111,24 +2182,18 @@ async function startConnection() {
             }));
           } else {
             for (const noticeText of collectedOwnerNotices) {
-              const m = URGENCY_PREFIX_RE.exec(noticeText);
-              const urgency = m ? m[1] : 'normal';
-              const displayText = m
-                ? noticeText.replace(URGENCY_PREFIX_RE, '')
-                : noticeText;
               for (const ownerJid of OWNER_JIDS) {
                 try {
-                  await sock.sendMessage(ownerJid, { text: displayText });
+                  await sock.sendMessage(ownerJid, { text: noticeText });
                 } catch (e) {
                   console.error(`[gateway] owner_notify send failed to ${ownerJid}: ${e.message}`);
                 }
               }
               console.log(JSON.stringify({
                 event: 'owner_notify',
-                urgency,
                 target_jids: [...OWNER_JIDS],
                 source_chat: sender,
-                bytes: displayText.length,
+                bytes: noticeText.length,
               }));
             }
           }
@@ -2138,15 +2203,34 @@ async function startConnection() {
         // trailing or glued to an emoji it would otherwise reach WhatsApp.
         const response = markdownToWhatsApp(stripNoReply(rawResponse));
 
-        // Helper: send a new message or edit the streamed one for final delivery
+        // Helper: send a new message or edit the streamed one for final delivery.
+        //
+        // Snapshot `sock` once at entry — the streaming `onProgress`
+        // callback already does this for per-chunk edits, but the final
+        // delivery here lands AFTER the LLM stream completes, which is a
+        // much wider window for a concurrent reconnect to call
+        // `cleanupSocket()` and null out the global. Without the
+        // snapshot the awaits below race the reconnect and either throw
+        // a "Cannot read properties of null" or send through a
+        // half-closed socket.
         const sendOrEdit = async (jid, finalText) => {
+          const s = sock;
+          if (!s) {
+            console.warn(JSON.stringify({
+              event: 'send_message_outbound',
+              kind: 'sock_unavailable_at_send',
+              jid,
+              had_stream: Boolean(streamMsgKey),
+            }));
+            return streamMsgKey || null;
+          }
           if (streamMsgKey && jid === sender) {
             // Edit-only on the streamed message. A new-message fallback
             // would duplicate the partial chunk the user already sees
             // when the edit fails (stale key, sock drop mid-stream); we
             // accept the last visible chunk as final instead.
             try {
-              await sock.sendMessage(jid, { text: finalText, edit: streamMsgKey });
+              await s.sendMessage(jid, { text: finalText, edit: streamMsgKey });
               if (ECHO_TRACKER_ENABLED) echoTracker.track(finalText);
               console.log(JSON.stringify({
                 event: 'send_message_outbound',
@@ -2165,47 +2249,104 @@ async function startConnection() {
               return streamMsgKey;
             }
           }
-          // No streaming happened (fallback path) — send new message
-          const sent = await sock.sendMessage(jid, { text: finalText });
-          if (ECHO_TRACKER_ENABLED) echoTracker.track(finalText);
-          console.log(JSON.stringify({
-            event: 'send_message_outbound',
-            kind: 'new_message',
-            jid,
-            len: finalText.length,
-            msg_id: sent?.key?.id || null,
-          }));
-          return sent?.key;
+          // No streaming happened (fallback path) — send new message.
+          //
+          // Mirror the edit branch's catch-arm: if the snapshot was
+          // non-null at entry but the underlying connection has since
+          // half-closed (cleanupSocket() racing the await), Baileys
+          // will throw here. The edit branch swallows the same throw
+          // and returns the streamed key; without an equivalent
+          // try/catch the new-message path would propagate the
+          // exception up to the message-handler scope and drop the
+          // entire delivery. Catch + log + return null so the caller
+          // sees the failure as a soft "nothing sent" (same shape it
+          // already handles when sendOrEdit's entry-snapshot was null).
+          try {
+            const sent = await s.sendMessage(jid, { text: finalText });
+            if (ECHO_TRACKER_ENABLED) echoTracker.track(finalText);
+            console.log(JSON.stringify({
+              event: 'send_message_outbound',
+              kind: 'new_message',
+              jid,
+              len: finalText.length,
+              msg_id: sent?.key?.id || null,
+            }));
+            return sent?.key;
+          } catch (err) {
+            console.warn(JSON.stringify({
+              event: 'send_message_outbound',
+              kind: 'new_message_failed',
+              jid,
+              error: err && err.message ? err.message : String(err),
+            }));
+            return null;
+          }
         };
 
         if (response && sock) {
           if (isStranger) {
-            // Phase 08 §C/§D: extractNotifyOwner deleted (typed owner_notice
-            // channel via `notify_owner` MCP tool is the only owner-notify
-            // path now — see PLAN-01 hardening). detectStrangerTurnOwnerLeak
-            // deleted (Section 9.7 kernel stranger-turn contract enforces
-            // tool-only output, see PLAN-02). The owner notifications loop
-            // that followed has been removed as dead code: notifications no
-            // longer accumulate here, they arrive via the typed channel
-            // fan-out at the `collectedOwnerNotices` block above.
-            const strangerSafeText = response;
+            // Step C: Agent response goes to STRANGER, not owner
+            const { notifications, cleanedText } = extractNotifyOwner(response);
 
-            if (strangerSafeText && strangerSafeText.trim() && !isProgressTextLeak(strangerSafeText)) {
-              const formattedText = markdownToWhatsApp(strangerSafeText);
+            // Send cleaned response to the stranger (format after tag extraction)
+            if (cleanedText && !isProgressTextLeak(cleanedText)) {
+              const formattedText = markdownToWhatsApp(cleanedText);
               const sentKey = await sendOrEdit(sender, formattedText);
               console.log(`[gateway] Replied to stranger ${pushName} (${phone})${streamMsgKey ? ' (streamed)' : ''}`);
 
+              // Track outbound message
+              trackMessage(sender, pushName, phone, cleanedText, 'outbound');
               // Save outbound to DB
-              dbSaveMessage({ id: sentKey?.id || randomUUID(), jid: sender, senderJid: ownJid, pushName: null, phone, text: strangerSafeText, direction: 'outbound', timestamp: Date.now(), processed: 1, rawType: 'text' });
-            } else if (isProgressTextLeak(strangerSafeText)) {
-              try { console.log(JSON.stringify({ event: 'progress_placeholder_leak', branch: 'stranger', preview: strangerSafeText.slice(0, 40) })); } catch { /* noop */ }
+              dbSaveMessage({ id: sentKey?.id || randomUUID(), jid: sender, senderJid: ownJid, pushName: null, phone, text: cleanedText, direction: 'outbound', timestamp: Date.now(), processed: 1, rawType: 'text' });
+            } else if (isProgressTextLeak(cleanedText)) {
+              try { console.log(JSON.stringify({ event: 'progress_placeholder_leak', branch: 'stranger', preview: cleanedText.slice(0, 40) })); } catch { /* noop */ }
+            }
+
+            // Step C + F: If NOTIFY_OWNER tags found, send notification to owner
+            for (const notif of notifications) {
+              const convo = activeConversations.get(sender);
+              // F: Escalation deduplication
+              if (shouldDebounceEscalation(sender)) {
+                console.log(`[gateway] Debounced escalation for ${pushName} — skipping duplicate notification`);
+                continue;
+              }
+
+              // Mark conversation as escalated
+              if (convo) convo.escalated = true;
+
+              const ownerNotif = notif.summary || `[${pushName}] ${notif.reason}`;
+
+              // Send notification to primary owner
+              await sock.sendMessage(OWNER_JID, { text: ownerNotif });
+              if (ECHO_TRACKER_ENABLED) echoTracker.track(ownerNotif);
+              console.log(`[gateway] NOTIFY_OWNER sent for ${pushName}: ${notif.reason}`);
             }
 
           } else if (isOwner && !isGroup) {
-            // Phase 07 §F — relay parser eradicated. Owner DM responses are
-            // forwarded verbatim; PLAN-02 (§B channel_send WhatsApp extension)
-            // will introduce LLM-routed delivery to strangers via tool calls.
-            let ownerReply = response;
+            // Step E: Check for relay commands in the agent response (DMs only, never groups)
+            const { relays, cleanedText } = extractRelayCommands(response);
+
+            // Execute any relay commands
+            const relayResults = [];
+            for (const relay of relays) {
+              const result = await executeRelay(relay);
+              relayResults.push(result);
+            }
+
+            // Build owner confirmation message
+            let ownerReply = cleanedText;
+
+            // Log relay results (don't append technical details to owner message)
+            for (let i = 0; i < relayResults.length; i++) {
+              const r = relayResults[i];
+              if (r.success) {
+                console.log(`[gateway] Relay delivered to ${r.recipient} (${r.phone})`);
+              } else {
+                console.error(`[gateway] Relay failed: ${r.error}`);
+                const failLine = `\n✗ Relay failed: ${r.error}`;
+                ownerReply = ownerReply ? ownerReply + failLine : failLine.trim();
+              }
+            }
 
             if (ownerReply && !isProgressTextLeak(ownerReply)) {
               ownerReply = markdownToWhatsApp(ownerReply);
@@ -2337,15 +2478,21 @@ async function startConnection() {
       if (now - row.last_timestamp > 2 * 60 * 60 * 1000) continue;
       const gap = now - row.last_timestamp;
       if (gap > GAP_THRESHOLD_MS) {
-        // The 2h `last_timestamp` window above is the only liveness proxy.
-        console.warn(`[gateway][gap-detect] No messages from ${row.jid} for ${Math.round(gap / 60000)}min — possible message loss`);
+        // Check if there's an active conversation for this JID (only warn for active ones)
+        if (activeConversations.has(row.jid)) {
+          console.warn(`[gateway][gap-detect] No messages from ${row.jid} for ${Math.round(gap / 60000)}min — possible message loss`);
+        }
       }
     }
   }, GAP_DETECTION_INTERVAL_MS);
 
   } catch (err) {
-    // Re-throw so HTTP callers and the reconnect setTimeout can react
-    // instead of seeing a silently bricked socket.
+    // `startConnection()` previously had only try/finally so any
+    // error in dynamic import / makeWASocket / auth load was swallowed and
+    // the operator saw a bot stuck on `connStatus = 'disconnected'` with no
+    // diagnostic. Surface it: log + status update + re-throw so callers
+    // (the `await startConnection()` sites in /login/start, /reset, etc)
+    // can surface it to the HTTP response instead of returning success.
     console.error('[gateway] startConnection failed:', err && err.message ? err.message : err);
     if (err && err.stack) console.error(err.stack);
     connStatus = 'disconnected';
@@ -2501,6 +2648,7 @@ async function uploadToLibreFang(agentId, buffer, contentType, filename) {
           path: url.pathname,
           method: 'POST',
           headers: {
+          ...(LIBREFANG_API_KEY ? { Authorization: 'Bearer ' + LIBREFANG_API_KEY } : {}),
             'Content-Type': contentType,
             'X-Filename': filename,
             'Content-Length': buffer.length,
@@ -2578,6 +2726,58 @@ async function processMediaMessage(fullMsg, innerMsg, agentId) {
     console.error(`[gateway] Media processing failed for ${filename}: ${err.message}`);
     return null; // Caller will fall back to text descriptor
   }
+}
+
+// ---------------------------------------------------------------------------
+// Detect whether an owner message expresses relay intent.
+//
+// Before this guard, `buildRelaySystemInstruction` was injected for every
+// owner turn whenever any stranger conversation was active — which forced
+// the model to interpret neutral owner-to-bot messages ("saludos", "hola",
+// "come stai?") as requests to relay a reply to the last stranger. Result
+// observed in production: owner writing "saludos" to the bot triggered a
+// RELAY_TO_STRANGER to an unrelated namesake contact.
+//
+// Only inject the relay instruction when the owner's message expresses an
+// explicit delegated-speech intent. Everything else is treated as owner
+// talking directly to the agent.
+// Regex compiled once at module load from the configured language
+// packs in `lib/intent_patterns.js`. Adding a locale is a file-level
+// change; adding the code to the config toggles it on.
+const RELAY_INTENT_RE = require('./lib/intent_patterns').compileIntentRegex(
+  tomlConfig.relay_intent_languages,
+);
+
+function ownerIntentsRelay(text) {
+  const t = (text || '').trim().toLowerCase();
+  if (!t) return false;
+  if (t.startsWith('/relay') || t.startsWith('/reply')) return true;
+  if (/(^|\s)@[\w.+-]+/.test(t)) return true;
+  return RELAY_INTENT_RE.test(t);
+}
+
+// ---------------------------------------------------------------------------
+// Build relay system instruction (Step E — separate from user text)
+// ---------------------------------------------------------------------------
+function buildRelaySystemInstruction() {
+  return [
+    '[SYSTEM_INSTRUCTION_WHATSAPP_RELAY]',
+    'You are acting as a bridge between the owner and external contacts.',
+    'When the owner wants to reply to a stranger, you MUST:',
+    '1. Determine which stranger the owner is addressing (from the active conversations list above)',
+    '2. Reformulate the message appropriately (never forward the raw owner message)',
+    '3. Wrap the outgoing message in this exact format:',
+    '[RELAY_TO_STRANGER]{"jid":"<stranger_jid>","message":"<your reformulated message>"}[/RELAY_TO_STRANGER]',
+    '',
+    'RULES:',
+    '- The "jid" MUST be one from the [ACTIVE_STRANGER_CONVERSATIONS] list',
+    '- The "message" MUST be a reformulated, polished version — never copy the owner\'s raw words',
+    '- If the intended recipient is ambiguous, ask the owner to clarify instead of guessing',
+    '- If the owner is talking to you (the agent) and NOT replying to a stranger, respond normally without any relay block',
+    '- You can include both a relay block AND a confirmation message to the owner in the same response',
+    '[/SYSTEM_INSTRUCTION_WHATSAPP_RELAY]',
+    '',
+  ].join('\n');
 }
 
 // ---------------------------------------------------------------------------
@@ -2662,6 +2862,7 @@ async function forwardToLibreFang(text, systemPrefix, phone, pushName, isOwner, 
         path: url.pathname,
         method: 'POST',
         headers: {
+          ...(LIBREFANG_API_KEY ? { Authorization: 'Bearer ' + LIBREFANG_API_KEY } : {}),
           'Content-Type': 'application/json',
           'Content-Length': Buffer.byteLength(payloadStr),
         },
@@ -2818,6 +3019,7 @@ async function forwardToLibreFangStreaming(text, systemPrefix, phone, pushName, 
         path: url.pathname,
         method: 'POST',
         headers: {
+          ...(LIBREFANG_API_KEY ? { Authorization: 'Bearer ' + LIBREFANG_API_KEY } : {}),
           'Content-Type': 'application/json',
           'Content-Length': Buffer.byteLength(payloadStr),
           Accept: 'text/event-stream',
@@ -2955,28 +3157,41 @@ async function forwardToLibreFangStreaming(text, systemPrefix, phone, pushName, 
 const CATCHUP_INTERVAL_MS = 5 * 60 * 1000;  // 5 minutes
 const CATCHUP_AGE_MS = 30_000;               // only messages older than 30s
 const CATCHUP_MAX_RETRIES = 3;
-// Cap per-cycle drain so a backlog doesn't hold the per-agent kernel
-// mutex for tens of minutes; the rest gets picked up next tick.
+// bound how many messages a single sweep cycle drains. With
+// the per-agent serializing mutex inside LibreFang, a 50-message backlog
+// previously took ~25 minutes of sequential LLM calls and starved live
+// traffic. The remainder is picked up by the next sweep tick.
 const CATCHUP_BATCH_SIZE = 8;
-// Small pacing between iterations so back-to-back forwards don't hammer
-// the kernel at line-rate.
+// small inter-iteration delay so a backlog doesn't hammer
+// LibreFang at line-rate. 750ms is below human-perceptible reply latency
+// for the catch-up case (which is already late by definition) and gives
+// the kernel breathing room.
 const CATCHUP_INTER_DELAY_MS = 750;
-// Stale-claim cutoff: covers a worst-case media-pipeline timeout (~90s)
-// plus margin for slow LLM forward; beyond that the sweep treats the
-// row as orphaned and retries.
+// how long the main handler can hold a `processing_since`
+// claim before the sweep treats it as expired (handler crashed without
+// releasing). 5 min covers a worst-case media-pipeline timeout (#21 cap
+// 90s) plus a comfortable margin for slow LLM forward.
 const PROCESSING_LEASE_MS = 5 * 60 * 1000;
 
 async function runCatchUpSweep() {
+  if (shuttingDown) return;
   if (connStatus !== 'connected' || !sock) return;
 
   const cutoff = Date.now() - CATCHUP_AGE_MS;
   const leaseCutoff = Date.now() - PROCESSING_LEASE_MS;
-  const unprocessed = dbGetUnprocessed(cutoff, leaseCutoff).slice(0, CATCHUP_BATCH_SIZE);
+  const unprocessed = dbGetUnprocessed(cutoff, leaseCutoff, CATCHUP_BATCH_SIZE);
   if (unprocessed.length === 0) return;
 
   console.log(`[gateway][catchup] Found ${unprocessed.length} unprocessed message(s) (batch cap ${CATCHUP_BATCH_SIZE}), attempting re-forward...`);
 
   for (const msg of unprocessed) {
+    // Bail mid-sweep on shutdown so a paused inter-iteration `setTimeout`
+    // doesn't resume into a `dbIncrRetryOrFail` / `dbSaveMessage` after
+    // `db.close()` runs in the `server.close` callback.
+    if (shuttingDown) {
+      console.log('[gateway][catchup] shutdown signaled mid-sweep — bailing out');
+      return;
+    }
     // Skip messages already at max retries (they'll be marked failed by dbIncrRetryOrFail)
     if (msg.retry_count >= CATCHUP_MAX_RETRIES) {
       dbIncrRetryOrFail(msg.id, CATCHUP_MAX_RETRIES);
@@ -3043,14 +3258,23 @@ async function runCatchUpSweep() {
       dbIncrRetryOrFail(msg.id, CATCHUP_MAX_RETRIES);
     }
     // pace the sweep so the kernel's per-agent mutex isn't
-    // hammered at line-rate.
+    // hammered at line-rate. `unref()` lets the event loop exit
+    // ~CATCHUP_INTER_DELAY_MS sooner during shutdown per pending iteration.
     if (CATCHUP_INTER_DELAY_MS > 0) {
-      await new Promise((r) => setTimeout(r, CATCHUP_INTER_DELAY_MS));
+      await new Promise((r) => {
+        const t = setTimeout(r, CATCHUP_INTER_DELAY_MS);
+        t.unref();
+      });
     }
   }
 }
 
-setInterval(runCatchUpSweep, CATCHUP_INTERVAL_MS);
+// Both intervals are captured so gracefulShutdown can clear them
+// alongside the per-connection heartbeat / gap-detection timers.
+// Without these handles, an in-flight sweep mid-`await` could resume
+// and write to a closed db handle after `db.close()` runs, racing the
+// 10s force-exit timer.
+const catchUpInterval = setInterval(runCatchUpSweep, CATCHUP_INTERVAL_MS);
 
 // ---------------------------------------------------------------------------
 // DB Cleanup: delete old processed/failed messages (Fase 4.1)
@@ -3068,12 +3292,12 @@ function runDbCleanup() {
 
 // Run cleanup on startup (no-op if DB is fresh) and then daily
 runDbCleanup();
-setInterval(runDbCleanup, CLEANUP_INTERVAL_MS);
+const dbCleanupInterval = setInterval(runDbCleanup, CLEANUP_INTERVAL_MS);
 
 // ---------------------------------------------------------------------------
 // Send a message via Baileys (called by LibreFang for outgoing)
 // ---------------------------------------------------------------------------
-async function sendMessage(to, text, options = {}) {
+async function sendMessage(to, text) {
   if (!sock || connStatus !== 'connected') {
     throw new Error('WhatsApp not connected');
   }
@@ -3082,8 +3306,7 @@ async function sendMessage(to, text, options = {}) {
   const jid = phoneToJid(to);
 
   const formatted = markdownToWhatsApp(text);
-  const sendOpts = options && options.quoted ? { quoted: options.quoted } : undefined;
-  const sent = await sock.sendMessage(jid, { text: formatted }, sendOpts);
+  const sent = await sock.sendMessage(jid, { text: formatted });
   if (ECHO_TRACKER_ENABLED) echoTracker.track(text);
   // Save outbound message to DB (store formatted text to match what was delivered)
   dbSaveMessage({
@@ -3100,7 +3323,7 @@ async function sendMessage(to, text, options = {}) {
   });
 }
 
-async function sendImage(to, imageUrl, caption, options = {}) {
+async function sendImage(to, imageUrl, caption) {
   if (!sock || connStatus !== 'connected') {
     throw new Error('WhatsApp not connected');
   }
@@ -3135,8 +3358,7 @@ async function sendImage(to, imageUrl, caption, options = {}) {
   const imgMsg = { image: buffer };
   if (caption) imgMsg.caption = caption;
 
-  const sendOpts = options && options.quoted ? { quoted: options.quoted } : undefined;
-  const sent = await sock.sendMessage(jid, imgMsg, sendOpts);
+  const sent = await sock.sendMessage(jid, imgMsg);
   dbSaveMessage({
     id: sent?.key?.id || randomUUID(),
     jid,
@@ -3151,7 +3373,7 @@ async function sendImage(to, imageUrl, caption, options = {}) {
   });
 }
 
-async function sendAudio(to, audioUrl, ptt = true, options = {}) {
+async function sendAudio(to, audioUrl, ptt = true) {
   if (!sock || connStatus !== 'connected') {
     throw new Error('WhatsApp not connected');
   }
@@ -3186,8 +3408,7 @@ async function sendAudio(to, audioUrl, ptt = true, options = {}) {
   // ptt: true sends as a voice note (push-to-talk bubble); false sends as audio file
   const audioMsg = { audio: buffer, mimetype: 'audio/ogg; codecs=opus', ptt };
 
-  const sendOpts = options && options.quoted ? { quoted: options.quoted } : undefined;
-  const sent = await sock.sendMessage(jid, audioMsg, sendOpts);
+  const sent = await sock.sendMessage(jid, audioMsg);
   dbSaveMessage({
     id: sent?.key?.id || randomUUID(),
     jid,
@@ -3309,44 +3530,58 @@ const server = http.createServer(async (req, res) => {
     // POST /message/send — send outgoing message via Baileys
     if (req.method === 'POST' && path === '/message/send') {
       const body = await parseBody(req);
-      const { to, text, reply_to } = body;
+      const { to, text } = body;
 
       if (!to || !text) {
         return jsonResponse(req, res, 400, { error: 'Missing "to" or "text" field' });
       }
 
-      const quoted = resolveQuotedFromReplyTo(reply_to, messageStoreGetWAMessage);
-      await sendMessage(to, text, { quoted });
+      await sendMessage(to, text);
       return jsonResponse(req, res, 200, { success: true, message: 'Sent' });
     }
 
     // POST /message/send-image — send image via URL
     if (req.method === 'POST' && path === '/message/send-image') {
       const body = await parseBody(req);
-      const { to, image_url, caption, reply_to } = body;
+      const { to, image_url, caption } = body;
 
       if (!to || !image_url) {
         return jsonResponse(req, res, 400, { error: 'Missing "to" or "image_url" field' });
       }
 
-      const quoted = resolveQuotedFromReplyTo(reply_to, messageStoreGetWAMessage);
-      await sendImage(to, image_url, caption || '', { quoted });
+      await sendImage(to, image_url, caption || '');
       return jsonResponse(req, res, 200, { success: true, message: 'Image sent' });
     }
 
     // POST /message/send-audio — send audio file or voice note via URL
     if (req.method === 'POST' && path === '/message/send-audio') {
       const body = await parseBody(req);
-      const { to, audio_url, ptt, reply_to } = body;
+      const { to, audio_url, ptt } = body;
 
       if (!to || !audio_url) {
         return jsonResponse(req, res, 400, { error: 'Missing "to" or "audio_url" field' });
       }
 
       // ptt (push-to-talk) defaults to true — sends as voice note bubble
-      const quoted = resolveQuotedFromReplyTo(reply_to, messageStoreGetWAMessage);
-      await sendAudio(to, audio_url, ptt !== false, { quoted });
+      await sendAudio(to, audio_url, ptt !== false);
       return jsonResponse(req, res, 200, { success: true, message: 'Audio sent' });
+    }
+
+    // GET /conversations — list active stranger conversations (Step B)
+    if (req.method === 'GET' && path === '/conversations') {
+      const conversations = [];
+      for (const [jid, convo] of activeConversations) {
+        conversations.push({
+          jid,
+          pushName: convo.pushName,
+          phone: convo.phone,
+          messageCount: convo.messageCount,
+          lastActivity: convo.lastActivity,
+          escalated: convo.escalated,
+          lastMessage: convo.messages[convo.messages.length - 1] || null,
+        });
+      }
+      return jsonResponse(req, res, 200, { conversations });
     }
 
     // GET /messages/unprocessed — messages that failed to forward (Fase 2.2)
@@ -3407,6 +3642,7 @@ const server = http.createServer(async (req, res) => {
         stale,
         last_inbound_age_ms: connStatus === 'connected' ? Date.now() - lastInboundAt : null,
         session_id: sessionId || null,
+        active_conversations: activeConversations.size,
       });
     }
 
@@ -3436,6 +3672,7 @@ server.listen(PORT, '127.0.0.1', async () => {
   console.log(`[gateway] WhatsApp Web gateway listening on http://127.0.0.1:${PORT}`);
   console.log(`[gateway] LibreFang URL: ${LIBREFANG_URL}`);
   console.log(`[gateway] Default agent: ${DEFAULT_AGENT} (name: ${AGENT_NAME})`);
+  console.log(`[gateway] Conversation TTL: ${CONVERSATION_TTL_HOURS}h`);
 
   // Auto-connect from existing credentials on startup
   const fs = require('node:fs');
@@ -3481,24 +3718,37 @@ function gracefulShutdown(signal) {
   }, 10_000);
   forceExitTimer.unref();
 
-  // Tear down Baileys socket properly (fire-and-forget, we don't await).
-  // Log the error message if teardown fails — a silent catch would hide a
-  // broken Baileys shutdown in production.
-  cleanupSocket().catch(e =>
-    console.warn('[gateway] cleanupSocket error:', e?.message || e),
-  );
+  // Stop module-scope timers BEFORE we close the DB. Otherwise the next
+  // tick of `heartbeatInterval` / `gapDetectionTimer` / `runCatchUpSweep`
+  // / `runDbCleanup` races with `db.close()` and writes to a closed
+  // handle. The sweep can still be partway through an iteration when we
+  // get here — `shuttingDown` checked inside the loop body bails out
+  // before the next `dbIncrRetryOrFail` / `dbSaveMessage` call.
+  if (heartbeatInterval) {
+    clearInterval(heartbeatInterval);
+    heartbeatInterval = null;
+  }
+  if (gapDetectionTimer) {
+    clearInterval(gapDetectionTimer);
+    gapDetectionTimer = null;
+  }
+  clearInterval(catchUpInterval);
+  clearInterval(dbCleanupInterval);
 
   // Close HTTP server — forcibly drain all existing connections (Node.js 18.2+)
   if (server.closeAllConnections) {
     server.closeAllConnections();
   }
-  server.close(() => {
+  server.close(async () => {
+    // Await Baileys teardown so any in-flight write finishes before we
+    // checkpoint the DB. Logging the error so a broken shutdown is
+    // visible in production.
+    try {
+      await cleanupSocket();
+    } catch (e) {
+      console.warn('[gateway] cleanupSocket error:', e?.message || e);
+    }
     clearTimeout(forceExitTimer);
-    // checkpoint + close the SQLite handle so the WAL sidecar
-    // is flushed back into the main DB file before we exit. better-sqlite3
-    // in WAL mode is durable across SIGKILL, but a clean checkpoint avoids
-    // a stale .wal sitting around for the next boot to replay (and removes
-    // the small risk of WAL bloat under repeated kill/restart cycles).
     try {
       db.pragma('wal_checkpoint(TRUNCATE)');
       db.close();
@@ -3517,12 +3767,10 @@ process.on('SIGTERM', () => gracefulShutdown('SIGTERM'));
 // Export for testing
 module.exports = {
   markdownToWhatsApp,
-  // Phase 08 §C — extractNotifyOwner removed (text-tag parser eradicated).
-  // Phase 08 §D — detectStrangerTurnOwnerLeak removed (regex bandage eradicated).
-  // Phase 07 §C — inbound stranger XML wrap (testing + introspection)
-  wrapStrangerInbound,
-  xmlAttrEscape,
-  xmlBodyEscape,
+  extractNotifyOwner,
+  extractRelayCommands,
+  ownerIntentsRelay,
+  buildConversationsContext,
   isRateLimited,
   buildCorsHeaders,
   isAllowedOrigin,
@@ -3559,10 +3807,4 @@ module.exports = {
   runDispatchSelfTest,
   channelTypeForChat,
   buildSessionKey,
-  // reply_to → quoted bubble
-  stripWaidPrefix,
-  resolveQuotedFromReplyTo,
-  messageStoreSet,
-  messageStoreGet,
-  messageStoreGetWAMessage,
 };
