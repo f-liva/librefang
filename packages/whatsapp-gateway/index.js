@@ -1025,6 +1025,57 @@ function formatTimeAgo(ms) {
 }
 
 // ---------------------------------------------------------------------------
+// Phase 07 §C: Wrap stranger inbound in `<stranger_inbound ...>` XML
+// ---------------------------------------------------------------------------
+// Daemon-side `detect_stranger_turn` looks for `<stranger_inbound ` prefix
+// on the user message to gate Section 9.7 (Stranger Turn Contract) in the
+// prompt and the restricted tool surface. Pre-Phase 07 the gateway emitted
+// `[WHATSAPP_STRANGER_CONTEXT]…[/…]` which the daemon never matched, so
+// every stranger turn was treated as owner — the agent honored Signore
+// address and fetched owner calendar/email on a stranger's identity claim.
+// XML is escaped to neutralize closing-fence injection.
+function wrapStrangerInbound(jid, name, timestamp, text, opts = {}) {
+  const escAttr = (s) => String(s)
+    .replace(/&/g, '&amp;')
+    .replace(/"/g, '&quot;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/'/g, '&apos;');
+  const escBody = (s) => String(s)
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;');
+
+  const attrs = [
+    `jid="${escAttr(jid)}"`,
+    `name="${escAttr(name)}"`,
+    `timestamp="${escAttr(timestamp)}"`,
+  ];
+  if (opts.mediaType) {
+    attrs.push(`media_type="${escAttr(opts.mediaType)}"`);
+  }
+
+  const bodyParts = [];
+  const trimmedText = String(text || '').trim();
+  if (trimmedText) {
+    bodyParts.push(escBody(trimmedText));
+  }
+  if (opts.mediaUrl) {
+    bodyParts.push(`[url] ${escBody(opts.mediaUrl)}`);
+  }
+  if (opts.mediaType === 'voice') {
+    if (opts.transcript && String(opts.transcript).trim()) {
+      bodyParts.push(`transcript: ${escBody(opts.transcript)}`);
+    } else {
+      bodyParts.push('(no transcript available)');
+    }
+  }
+
+  const body = bodyParts.join('\n');
+  return `<stranger_inbound ${attrs.join(' ')}>${body}</stranger_inbound>`;
+}
+
+// ---------------------------------------------------------------------------
 // Step C: Build stranger context prefix (factual only, no personality)
 // ---------------------------------------------------------------------------
 function buildStrangerContext(pushName, phone, strangerJid) {
@@ -2050,8 +2101,12 @@ async function startConnection() {
           // Include sender identity so the LLM knows who is talking in the group
           messageToSend = `[Group message from ${pushName || phone}]\n${messageText}`;
         } else if (isStranger) {
-          const strangerContext = buildStrangerContext(pushName, phone, sender);
-          messageToSend = strangerContext + messageText;
+          messageToSend = wrapStrangerInbound(
+            sender,
+            pushName || phone,
+            new Date().toISOString(),
+            messageText
+          );
         } else if (isOwner && activeConversations.size > 0 && ownerIntentsRelay(messageText)) {
           // Only inject the relay system instruction when the owner's text
           // expresses an explicit delegated-speech intent. A neutral greeting
@@ -3767,6 +3822,7 @@ process.on('SIGTERM', () => gracefulShutdown('SIGTERM'));
 // Export for testing
 module.exports = {
   markdownToWhatsApp,
+  wrapStrangerInbound,
   extractNotifyOwner,
   extractRelayCommands,
   ownerIntentsRelay,
