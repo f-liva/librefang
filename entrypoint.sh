@@ -19,6 +19,20 @@ if [ -d /opt/librefang/packages/whatsapp-gateway ]; then
   # Remove stale pre-2026-04-14 bundle that shipped as index.cjs
   rm -f /data/whatsapp-gateway/index.cjs /data/whatsapp-gateway/index.cjs.hash
 
+  # Ensure Baileys node_modules exist and apply postinstall patches.
+  # scripts/postinstall.js carries the `Promise.all -> Promise.allSettled`
+  # patch against Baileys 6.x `executeInitQueries` (fetchProps 408 timeout
+  # breaks WA delivery on a Promise.all reject — see commit 941c1fec).
+  # Without re-running postinstall on every boot, a wiped /data or a
+  # node_modules-less first-run would skip the patch and silently lose
+  # inbound WA messages until manual sed.
+  chown -R librefang:librefang /data/whatsapp-gateway 2>/dev/null
+  if [ ! -d /data/whatsapp-gateway/node_modules ]; then
+    gosu librefang bash -c 'cd /data/whatsapp-gateway && npm install --omit=dev --no-fund --no-audit 2>&1 | tail -10' || true
+  else
+    gosu librefang bash -c 'cd /data/whatsapp-gateway && node scripts/postinstall.js 2>&1 | tail -5' || true
+  fi
+
   # Write a deployment-tuned ecosystem.config.cjs with LIBREFANG_CONFIG env
   # pointed at the real config path. We overwrite every boot so operator
   # edits can only live in /data/whatsapp-gateway/ecosystem.override.cjs
