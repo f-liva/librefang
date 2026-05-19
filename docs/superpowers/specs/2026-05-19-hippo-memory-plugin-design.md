@@ -16,13 +16,13 @@ The `hippo-memory` plugin integrates the Hippo biologically-inspired memory laye
 - **Continuity** - Session handoff for long-lived tasks
 - **Drill-down DAG** - Recover details from compressed summaries
 - **Per-Agent Isolation** - Each agent has its own Hippo database
-- **Embedded Hippo** - No external dependencies, plugin manages Hippo process lifecycle
+- **Embedded Hippo** - No external dependencies, plugin uses Hippo's JavaScript API directly in-process
 
 ### Architecture
 
-**Monolithic Node.js plugin** with embedded Hippo process management:
+**Monolithic Node.js plugin** with embedded Hippo store management:
 
-1. **Hippo Background Process Manager** - Starts, monitors, and restarts Hippo processes
+1. **Hippo Store Manager** - Initializes per-agent stores using `initStore()`
 2. **Per-Agent Database Isolation** - `agents/{agent_id}/hippo.db` with full isolation
 3. **Hook Layer** - All 7 hooks implemented in single `hooks/index.js`
 4. **Configuration** - `plugin.toml` with feature flags and tuning
@@ -50,7 +50,7 @@ The `hippo-memory` plugin integrates the Hippo biologically-inspired memory laye
 
 #### 1. bootstrap
 
-Creates per-agent database and initializes plugin state. Does not start Hippo process (lazy start).
+Creates per-agent database and initializes plugin state. Initializes Hippo store using `initStore()`.
 
 **Input:** `{ type: "bootstrap", agent_id, config }`
 
@@ -58,7 +58,7 @@ Creates per-agent database and initializes plugin state. Does not start Hippo pr
 
 #### 2. ingest
 
-Saves messages to Hippo with tagging and provenance. Lazy-starts Hippo if not running.
+Saves messages to Hippo with tagging and provenance. Initializes Hippo store if not initialized.
 
 **Input:** `{ type: "ingest", agent_id, message, timestamp }`
 
@@ -68,7 +68,7 @@ Tags: `kind:raw`, `role:{role}`, `scope:agent:{agent_id}`, `error` (if user erro
 
 #### 3. assemble
 
-Retrieves relevant memories with BM25 scoring, continuity, and optional goal stack boost.
+Retrieves relevant memories with hybrid search (BM25 + embeddings), continuity, and optional goal stack boost.
 
 **Input:** `{ type: "assemble", agent_id, query, budget, session_id, max_results }`
 
@@ -110,51 +110,64 @@ Merges sub-agent memories back into parent session with outcome propagation.
 
 ### Hippo Integration
 
-#### Process Management
+#### Store Initialization
 
-**Lazy Start (`ensureHippoRunning()`):**
-- Starts Hippo on first hook execution (`ingest` or `assemble`)
-- Allocates unique port per agent (start from 47111)
-- Saves PID and port to `state.json` for recovery
-- Health check loop runs in background
-
-**Health Check:**
-- HTTP ping to `http://127.0.0.1:{port}/v1/health` every `health_check_interval_secs` (default: 60s)
-- Automatic restart if Hippo unresponsive
-- Logged to state.json for debugging
+**Per-Agent Store Initialization (`ensureStoreInitialized()`):**
+- Initializes Hippo store on first hook execution (`bootstrap`, `ingest`, or `assemble`)
+- Uses `initStore(dbPath)` to create/open SQLite database
+- Store instance cached in-memory for subsequent hook calls
+- No process management - Hippo runs in plugin process
 
 **Cleanup:**
-- Kill all Hippo processes on plugin disable
+- Close all store connections on plugin disable
 - Remove agent DBs on plugin uninstall
-
-#### Port Allocation
-
-- Sequential allocation from `port_allocation_start` (default: 47111)
-- Collision check before allocation
-- Saved to state.json for persistence
 
 #### API Integration
 
 Uses Hippo's JavaScript API directly:
 
 ```javascript
-import { remember, recall, sleep, completeGoal } from 'hippo-memory';
+import { initStore, createMemory, writeEntry, hybridSearch, consolidate, applyOutcome, saveSessionHandoff, loadLatestHandoff } from 'hippo-memory';
+
+// In bootstrap hook
+const store = initStore(dbPath);
 
 // In ingest hook
-const result = await remember(dbPath, {
+const memory = createMemory({
   content: message.content,
   tags: [`role:${message.role}`, `kind:raw`, `scope:agent:${agent_id}`],
-  artifact_ref: `message:${timestamp}`
+  artifact_ref: `message:${timestamp}`,
+  owner: `agent:${agent_id}`
 });
+const result = await writeEntry(store, memory);
 
 // In assemble hook
-const results = await recall(dbPath, {
+const results = await hybridSearch(store, {
   query: input.query,
   limit: input.max_results,
   budget: input.budget,
   include_continuity: config.enable_continuity,
   scope: `agent:${agent_id}`
 });
+
+// In compact hook
+const result = await consolidate(store);
+
+// In after_turn hook (if goal outcome)
+await applyOutcome(store, {
+  goal_id: input.outcome.goal_id,
+  outcome_score: input.outcome.score,
+  session_id: input.session_id
+});
+
+// In continuity (after_turn)
+await saveSessionHandoff(store, {
+  session_id: input.session_id,
+  snapshot: {...}
+});
+
+// For handoff retrieval
+const handoff = await loadLatestHandoff(store, input.session_id);
 ```
 
 Zero HTTP overhead - direct function calls.
@@ -198,10 +211,6 @@ enable_goal_stack = { type = "boolean", default = true }
 enable_continuity = { type = "boolean", default = true }
 enable_drilldown = { type = "boolean", default = true }
 
-# Performance tuning
-health_check_interval_secs = { type = "number", default = 60 }
-port_allocation_start = { type = "number", default = 47111 }
-
 # Recall defaults
 default_recall_limit = { type = "number", default = 10 }
 default_fresh_tail_count = { type = "number", default = 5 }
@@ -219,50 +228,37 @@ Accessible in hooks via input `config` field.
 ```json
 {
   "version": "1.0.0",
-  "hippo_pids": {
-    "agent-123": {
-      "pid": 45678,
-      "port": 47111,
-      "db_path": "~/.librefang/plugins/hippo-memory/agents/agent-123/hippo.db",
-      "started_at": 1672531200
-    }
-  },
-  "port_counter": 47113,
-  "last_health_check": 1672531260
+  "last_db_check": 1672531200,
+  "initialized_agents": ["agent-123", "agent-456"]
 }
 ```
 
-Written atomically, readable for debugging, used for crash recovery.
+Written atomically, readable for debugging, used to track which agents have been initialized.
 
 ## Error Handling
 
-### Three-Layer Strategy
+### Two-Layer Strategy
 
 **Layer 1: Hook-Level Errors**
 - Catch-all `try/catch` in every hook
 - Exit with code 1 and structured error JSON on stdout/stderr
-- Error codes: `hippo_not_running`, `hippo_start_failed`, `db_corrupted`, `scope_violation`, `invalid_config`
+- Error codes: `db_corrupted`, `scope_violation`, `invalid_config`, `store_init_failed`
 
-**Layer 2: Health Check Recovery**
-- Automatic Hippo restart on health check failure
+**Layer 2: DB Corruption Recovery**
+- Automatic DB rebuild on SQLite corruption
+- Corrupted DBs are backed up with `.corrupted.{timestamp}` suffix
+- Hippo automatically recreates schema on next `initStore()` call
 - Logged to state.json with timestamp
-- 5s timeout on health check HTTP ping
-
-**Layer 3: Port Exhaustion**
-- Tries 100 consecutive ports before failing
-- `isPortFree()` check before allocation
-- Clear error message if exhaustion occurs
 
 ## Testing Strategy
 
 ### Unit Tests (Vitest)
 
 Coverage:
-- Process management (start, restart, port allocation)
-- Health check loop (crash recovery, timeout)
+- Store initialization (initStore, per-agent isolation)
 - Hook logic (all 7 hooks)
 - Integration (full workflow)
-- Edge cases (DB corruption, concurrent execution, multi-tenant isolation)
+- Edge cases (DB corruption, concurrent execution, multi-tenant isolation, scope filtering)
 
 ```bash
 cd ~/.librefang/plugins/hippo-memory
@@ -378,14 +374,9 @@ librefang plugin info hippo-memory
 librefang plugin lint hippo-memory
 ```
 
-**Check Hippo processes:**
-```bash
-cat ~/.librefang/plugins/hippo-memory/state.json | jq '.hippo_pids'
-curl http://127.0.0.1:47111/v1/health
-```
-
 **Check DB contents:**
 ```bash
+cd ~/.librefang/plugins/hippo-memory/agents/agent-123
 hippo recall --all --json | jq '.memories[] | .content'
 ```
 
@@ -394,7 +385,7 @@ hippo recall --all --json | jq '.memories[] | .content'
 ### Functional
 
 1. ✅ Ingest works - messages saved with tagging and provenance
-2. ✅ Recall works - query returns memories with BM25 scoring
+2. ✅ Recall works - query returns memories with hybrid search (BM25 + embeddings)
 3. ✅ Decay works - memories decay if not accessed
 4. ✅ Goal stack works - boost memories for active goal
 5. ✅ Continuity works - session handoff for long-lived tasks
@@ -405,9 +396,8 @@ hippo recall --all --json | jq '.memories[] | .content'
 
 8. ✅ Zero network outbound - no external HTTP calls
 9. ✅ Per-agent isolation - agent A cannot read agent B's memories
-10. ✅ Automatic health check - Hippo restarted if crashed
-11. ✅ Robust port allocation - no port conflicts between agents
-12. ✅ Plugin cleanup - processes killed on disable, DBs removed on uninstall
+10. ✅ Automatic DB recovery on corruption
+11. ✅ Plugin cleanup - store connections closed on disable, DBs removed on uninstall
 
 ### Integration
 
@@ -448,7 +438,6 @@ hippo recall --all --json | jq '.memories[] | .content'
 - Ingest + recall working
 - Decay + consolidation
 - Per-agent isolation
-- Automatic health check
 - Basic testing (5-10 key tests)
 
 **Post-MVP (v1.1.0+):**
@@ -467,20 +456,21 @@ rm -rf ~/.librefang/plugins/hippo-memory/agents/*
 librefang plugin enable hippo-memory
 ```
 
-**If Hippo process corrupts:**
+**If Hippo DB corrupts:**
 ```bash
-pkill -f "hippo start"
-# Plugin will restart automatically on next hook
+# Plugin automatically backs up corrupted DB and recreates
+# Check for .corrupted.* files:
+ls ~/.librefang/plugins/hippo-memory/agents/*/hippo.db.corrupted.*
 ```
 
 ## Summary
 
-The `hippo-memory` plugin provides a production-ready, feature-complete integration of Hippo's biologically-inspired memory layer into LibreFang. It uses a monolithic Node.js approach for simplicity, embedded Hippo processes for zero dependencies, and per-agent database isolation for multi-tenant safety. All Hippo features are supported: decay, consolidation, goal stack, continuity, and drill-down DAG. The plugin includes comprehensive error handling, automatic health monitoring, and a full testing strategy.
+The `hippo-memory` plugin provides a production-ready, feature-complete integration of Hippo's biologically-inspired memory layer into LibreFang. It uses a monolithic Node.js approach for simplicity, Hippo's JavaScript API for zero external process dependencies, and per-agent database isolation for multi-tenant safety. All Hippo features are supported: decay, consolidation, goal stack, continuity, and drill-down DAG. The plugin includes comprehensive error handling, automatic DB recovery on corruption, and a full testing strategy.
 
-**Approach:** Monolithic Node.js plugin with embedded Hippo process management
+**Approach:** Monolithic Node.js plugin with embedded Hippo store management
 **Isolation:** Per-agent databases with scope filtering
-**Performance:** Zero HTTP overhead - direct Hippo JavaScript API
-**Reliability:** Automatic health check, crash recovery, port allocation robustness
-**Extensibility:** All Hippo features (A-F) implemented, configurable via `plugin.toml`
+**Performance:** Zero HTTP overhead - direct Hippo JavaScript API (initStore, createMemory, hybridSearch, etc.)
+**Reliability:** Automatic DB recovery on corruption, no process management overhead
+**Extensibility:** All Hippo features implemented, configurable via `plugin.toml`
 
 Approved design. Proceeding to implementation planning.
