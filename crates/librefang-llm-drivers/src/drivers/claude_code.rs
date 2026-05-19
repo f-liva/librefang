@@ -377,13 +377,31 @@ impl ClaudeCodeDriver {
     /// Instead of `env_clear()` (which breaks Node.js, NVM, SSL, proxies),
     /// we keep the full environment and only remove known sensitive API keys
     /// from other LLM providers.
+    ///
+    /// `ANTHROPIC_API_KEY` / `CLAUDE_CODE_API_KEY` are conditionally stripped:
+    /// when OAuth credentials exist (the file written by `claude auth`), they
+    /// must take precedence so the CLI bills against the user's subscription
+    /// instead of the pay-per-use API key. A daemon that has both will
+    /// otherwise route every spawn through the API key — and once that key
+    /// runs out of credits, the CLI exits with `Credit balance is too low`
+    /// (HTTP 400) on stdout and exit code 1, surfacing in our logs as
+    /// `Claude Code CLI streaming subprocess exited with error exit_code=1
+    /// stderr=` and stalling all inbound traffic for the agent
+    /// (live incident 2026-05-19).
     fn apply_env_filter(cmd: &mut tokio::process::Command) {
         for key in SENSITIVE_ENV_EXACT {
             cmd.env_remove(key);
         }
+        if Self::oauth_credentials_present(cmd) {
+            cmd.env_remove("ANTHROPIC_API_KEY");
+            cmd.env_remove("CLAUDE_CODE_API_KEY");
+        }
         // Remove any env var with a sensitive suffix, unless it's CLAUDE_*
+        // or ANTHROPIC_*. The ANTHROPIC_ exception covers gateway / proxy
+        // credentials such as ANTHROPIC_AUTH_TOKEN, typically paired with
+        // ANTHROPIC_BASE_URL for Bedrock-style routing (#5006).
         for (key, _) in std::env::vars() {
-            if key.starts_with("CLAUDE_") {
+            if key.starts_with("CLAUDE_") || key.starts_with("ANTHROPIC_") {
                 continue;
             }
             let upper = key.to_uppercase();
@@ -425,6 +443,39 @@ impl ClaudeCodeDriver {
         if let Some(home) = candidate {
             cmd.env("HOME", home);
         }
+    }
+
+    /// Probe for a Claude Code OAuth credentials file.
+    ///
+    /// The CLI writes `~/.claude/.credentials.json` after `claude auth`
+    /// (subscription / Max billing). When that file exists for the
+    /// subprocess's effective `HOME`, the OAuth flow is the user's
+    /// chosen billing path and the API-key env vars must not override
+    /// it. Honours both `LIBREFANG_HOME` (driver override) and `HOME`
+    /// (process inherited), preferring `cmd.get_envs()` overrides so we
+    /// agree with `ensure_home_env`. Falls back to "no" on any IO error
+    /// — we strip when uncertain only if we positively know the
+    /// credentials exist, so we never break the historical API-key
+    /// path for users who haven't authenticated.
+    fn oauth_credentials_present(cmd: &tokio::process::Command) -> bool {
+        let home_override = cmd
+            .as_std()
+            .get_envs()
+            .find_map(|(k, v)| (k == std::ffi::OsStr::new("HOME")).then_some(v).flatten())
+            .map(std::ffi::OsString::from);
+        let home = home_override
+            .or_else(|| std::env::var_os("LIBREFANG_HOME"))
+            .or_else(|| std::env::var_os("HOME"));
+        let Some(home) = home else {
+            return false;
+        };
+        if home.is_empty() || home == std::ffi::OsStr::new("/nonexistent") {
+            return false;
+        }
+        let mut path = std::path::PathBuf::from(home);
+        path.push(".claude");
+        path.push(".credentials.json");
+        path.exists()
     }
 
     fn build_command_args(
@@ -1927,12 +1978,166 @@ mod tests {
 
     #[test]
     fn test_sensitive_env_list_coverage() {
-        // Ensure all major provider keys are in the strip list
+        // Ensure all major provider keys are in the strip list. ANTHROPIC_API_KEY
+        // is intentionally NOT in the unconditional list — it is stripped
+        // conditionally by apply_env_filter() when OAuth credentials are
+        // present (see test_apply_env_filter_strips_api_key_when_oauth_present).
         assert!(SENSITIVE_ENV_EXACT.contains(&"OPENAI_API_KEY"));
-        assert!(SENSITIVE_ENV_EXACT.contains(&"ANTHROPIC_API_KEY"));
         assert!(SENSITIVE_ENV_EXACT.contains(&"GEMINI_API_KEY"));
         assert!(SENSITIVE_ENV_EXACT.contains(&"GROQ_API_KEY"));
         assert!(SENSITIVE_ENV_EXACT.contains(&"DEEPSEEK_API_KEY"));
+    }
+
+    #[test]
+    fn test_apply_env_filter_keeps_anthropic_auth_token() {
+        // Regression for #5006: the suffix-sweep used to strip
+        // ANTHROPIC_AUTH_TOKEN because it ends in _TOKEN and lacks the
+        // CLAUDE_ prefix. The ANTHROPIC_* exception keeps gateway / proxy
+        // credentials (ANTHROPIC_AUTH_TOKEN + ANTHROPIC_BASE_URL pattern)
+        // intact while still stripping other providers' secrets.
+        //
+        // SAFETY: unique env var names; the test removes each one before
+        // returning.
+        unsafe {
+            std::env::set_var("ANTHROPIC_AUTH_TOKEN", "keep-me-5006");
+            std::env::set_var("OPENAI_API_KEY", "strip-openai-5006");
+            std::env::set_var("GROQ_API_KEY", "strip-groq-5006");
+            std::env::set_var("GEMINI_API_KEY", "strip-gemini-5006");
+            std::env::set_var("LIBREFANG_TEST_5006_OTHER_TOKEN", "strip-suffix-5006");
+        }
+
+        let mut cmd = tokio::process::Command::new("echo");
+        ClaudeCodeDriver::apply_env_filter(&mut cmd);
+
+        // `env_remove` records `(key, None)` in the Command's env table.
+        // Inspect it to learn which keys the filter targeted for removal.
+        let removed: std::collections::HashSet<String> = cmd
+            .as_std()
+            .get_envs()
+            .filter_map(|(k, v)| {
+                if v.is_none() {
+                    Some(k.to_string_lossy().to_string())
+                } else {
+                    None
+                }
+            })
+            .collect();
+
+        assert!(
+            !removed.contains("ANTHROPIC_AUTH_TOKEN"),
+            "ANTHROPIC_AUTH_TOKEN must be preserved for gateway / proxy users (#5006)"
+        );
+        assert!(
+            removed.contains("OPENAI_API_KEY"),
+            "OPENAI_API_KEY must still be stripped"
+        );
+        assert!(
+            removed.contains("GROQ_API_KEY"),
+            "GROQ_API_KEY must still be stripped"
+        );
+        assert!(
+            removed.contains("GEMINI_API_KEY"),
+            "GEMINI_API_KEY must still be stripped"
+        );
+        assert!(
+            removed.contains("LIBREFANG_TEST_5006_OTHER_TOKEN"),
+            "Generic *_TOKEN env vars (no CLAUDE_/ANTHROPIC_ prefix) must still be stripped"
+        );
+
+        // SAFETY: matches the set_var calls above.
+        unsafe {
+            std::env::remove_var("ANTHROPIC_AUTH_TOKEN");
+            std::env::remove_var("OPENAI_API_KEY");
+            std::env::remove_var("GROQ_API_KEY");
+            std::env::remove_var("GEMINI_API_KEY");
+            std::env::remove_var("LIBREFANG_TEST_5006_OTHER_TOKEN");
+        }
+    }
+
+    /// Regression for the 2026-05-19 live incident: the daemon's
+    /// container env exported `ANTHROPIC_API_KEY` (zero-credit
+    /// pay-per-use key, inherited from `secrets.env`) alongside an
+    /// already-authenticated OAuth Max subscription at
+    /// `$HOME/.claude/.credentials.json`. The CLI prefers the env-set
+    /// key, the key has no credits, every spawn exited code 1 with
+    /// "Credit balance is too low" on stdout, and Ambrogio stopped
+    /// replying to every inbound (WhatsApp DM, group, stranger).
+    ///
+    /// When OAuth credentials are present, the API-key env vars must be
+    /// stripped so the CLI falls back to subscription billing.
+    #[test]
+    fn test_apply_env_filter_strips_api_key_when_oauth_present() {
+        // Use a private HOME so test artefacts don't collide with the
+        // developer's real `~/.claude`.
+        let tmp_home = make_claude_tmp_dir("oauth-strip");
+        let creds_dir = tmp_home.join(".claude");
+        std::fs::create_dir_all(&creds_dir).unwrap();
+        std::fs::write(creds_dir.join(".credentials.json"), b"{}").unwrap();
+
+        // SAFETY: unique-suffix env vars; tearndown below restores.
+        unsafe {
+            std::env::set_var("ANTHROPIC_API_KEY", "strip-when-oauth-19");
+            std::env::set_var("CLAUDE_CODE_API_KEY", "strip-when-oauth-19");
+        }
+
+        let mut cmd = tokio::process::Command::new("echo");
+        cmd.env("HOME", &tmp_home);
+        ClaudeCodeDriver::apply_env_filter(&mut cmd);
+
+        let removed: std::collections::HashSet<String> = cmd
+            .as_std()
+            .get_envs()
+            .filter_map(|(k, v)| v.is_none().then(|| k.to_string_lossy().into_owned()))
+            .collect();
+
+        assert!(
+            removed.contains("ANTHROPIC_API_KEY"),
+            "ANTHROPIC_API_KEY must be stripped when OAuth credentials are present"
+        );
+        assert!(
+            removed.contains("CLAUDE_CODE_API_KEY"),
+            "CLAUDE_CODE_API_KEY must be stripped when OAuth credentials are present"
+        );
+
+        unsafe {
+            std::env::remove_var("ANTHROPIC_API_KEY");
+            std::env::remove_var("CLAUDE_CODE_API_KEY");
+        }
+        let _ = std::fs::remove_dir_all(&tmp_home);
+    }
+
+    /// Inverse: when there's no OAuth credentials file the API key
+    /// must be preserved — this is the historical pay-per-use path
+    /// (gateway / proxy users with `ANTHROPIC_AUTH_TOKEN` style setups
+    /// or single-user installs that never ran `claude auth`).
+    #[test]
+    fn test_apply_env_filter_keeps_api_key_without_oauth() {
+        let tmp_home = make_claude_tmp_dir("oauth-keep");
+        // Deliberately do NOT create .claude/.credentials.json under tmp_home.
+
+        unsafe {
+            std::env::set_var("ANTHROPIC_API_KEY", "keep-when-no-oauth-19");
+        }
+
+        let mut cmd = tokio::process::Command::new("echo");
+        cmd.env("HOME", &tmp_home);
+        ClaudeCodeDriver::apply_env_filter(&mut cmd);
+
+        let removed: std::collections::HashSet<String> = cmd
+            .as_std()
+            .get_envs()
+            .filter_map(|(k, v)| v.is_none().then(|| k.to_string_lossy().into_owned()))
+            .collect();
+
+        assert!(
+            !removed.contains("ANTHROPIC_API_KEY"),
+            "ANTHROPIC_API_KEY must be preserved when no OAuth credentials exist (historical pay-per-use path)"
+        );
+
+        unsafe {
+            std::env::remove_var("ANTHROPIC_API_KEY");
+        }
+        let _ = std::fs::remove_dir_all(&tmp_home);
     }
 
     #[test]
