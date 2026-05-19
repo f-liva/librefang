@@ -370,6 +370,8 @@ mod tests {
             timeout_secs: None,
             extra_body: None,
             agent_id: None,
+            sender_user_id: None,
+            sender_channel: None,
         }
     }
 

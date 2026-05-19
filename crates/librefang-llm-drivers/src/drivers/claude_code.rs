@@ -290,6 +290,8 @@ impl ClaudeCodeDriver {
     fn write_mcp_config(
         bridge: &McpBridgeConfig,
         agent_id: Option<&str>,
+        peer_jid: Option<&str>,
+        channel: Option<&str>,
     ) -> std::io::Result<PathBuf> {
         let path =
             std::env::temp_dir().join(format!("librefang-mcp-{}.json", uuid::Uuid::new_v4()));
@@ -315,6 +317,29 @@ impl ClaudeCodeDriver {
                 // "Agent ID required" even though the agent is fully
                 // registered (issue #2699).
                 headers.insert("X-LibreFang-Agent-Id".to_string(), serde_json::json!(id));
+            }
+        }
+        // Peer scope of the *current* turn — forwarded by `/mcp` into
+        // `ToolExecContext::sender_id` / `channel`. `channel_send` uses
+        // them to reject same-channel recipient mismatches (cross-chat
+        // audio leak 2026-05-19). The driver writes a fresh mcp_config
+        // for every `complete()` / `stream()` invocation, so these
+        // headers are tied to the inbound peer of that one turn and do
+        // not stale across turns.
+        if let Some(jid) = peer_jid {
+            if !jid.is_empty() {
+                headers.insert(
+                    "X-LibreFang-Current-Peer-Jid".to_string(),
+                    serde_json::json!(jid),
+                );
+            }
+        }
+        if let Some(ch) = channel {
+            if !ch.is_empty() {
+                headers.insert(
+                    "X-LibreFang-Current-Channel".to_string(),
+                    serde_json::json!(ch),
+                );
             }
         }
 
@@ -640,7 +665,12 @@ impl LlmDriver for ClaudeCodeDriver {
 
         if !request.tools.is_empty() {
             if let Some(ref bridge) = self.mcp_bridge {
-                match Self::write_mcp_config(bridge, request.agent_id.as_deref()) {
+                match Self::write_mcp_config(
+                    bridge,
+                    request.agent_id.as_deref(),
+                    request.sender_user_id.as_deref(),
+                    request.sender_channel.as_deref(),
+                ) {
                     Ok(path) => prepared.mcp_config_path = Some(path),
                     Err(e) => {
                         prepared.cleanup();
@@ -910,7 +940,12 @@ impl LlmDriver for ClaudeCodeDriver {
 
         if !request.tools.is_empty() {
             if let Some(ref bridge) = self.mcp_bridge {
-                match Self::write_mcp_config(bridge, request.agent_id.as_deref()) {
+                match Self::write_mcp_config(
+                    bridge,
+                    request.agent_id.as_deref(),
+                    request.sender_user_id.as_deref(),
+                    request.sender_channel.as_deref(),
+                ) {
                     Ok(path) => prepared.mcp_config_path = Some(path),
                     Err(e) => {
                         prepared.cleanup();
@@ -1444,6 +1479,8 @@ mod tests {
             timeout_secs: None,
             extra_body: None,
             agent_id: None,
+            sender_user_id: None,
+            sender_channel: None,
         };
 
         let prompt = ClaudeCodeDriver::build_prompt(&request);
@@ -1489,6 +1526,8 @@ mod tests {
             timeout_secs: None,
             extra_body: None,
             agent_id: None,
+            sender_user_id: None,
+            sender_channel: None,
         };
 
         let prompt = ClaudeCodeDriver::build_prompt(&request);
@@ -1551,6 +1590,8 @@ mod tests {
             timeout_secs: None,
             extra_body: None,
             agent_id: None,
+            sender_user_id: None,
+            sender_channel: None,
         };
 
         let prompt = ClaudeCodeDriver::build_prompt(&request);
@@ -1629,6 +1670,8 @@ mod tests {
             timeout_secs: None,
             extra_body: None,
             agent_id: None,
+            sender_user_id: None,
+            sender_channel: None,
         };
 
         let prompt = ClaudeCodeDriver::build_prompt(&request);
@@ -1980,7 +2023,8 @@ mod tests {
             base_url: "http://127.0.0.1:4545".to_string(),
             api_key: Some("secret-key".to_string()),
         };
-        let path = ClaudeCodeDriver::write_mcp_config(&bridge, Some("agent-1234")).unwrap();
+        let path =
+            ClaudeCodeDriver::write_mcp_config(&bridge, Some("agent-1234"), None, None).unwrap();
         let written = std::fs::read_to_string(&path).unwrap();
         let _ = std::fs::remove_file(&path);
         let cfg: serde_json::Value = serde_json::from_str(&written).unwrap();
@@ -2000,7 +2044,7 @@ mod tests {
             base_url: "http://127.0.0.1:4545".to_string(),
             api_key: Some("secret-key".to_string()),
         };
-        let path = ClaudeCodeDriver::write_mcp_config(&bridge, None).unwrap();
+        let path = ClaudeCodeDriver::write_mcp_config(&bridge, None, None, None).unwrap();
         let written = std::fs::read_to_string(&path).unwrap();
         let _ = std::fs::remove_file(&path);
         let cfg: serde_json::Value = serde_json::from_str(&written).unwrap();
@@ -2019,10 +2063,64 @@ mod tests {
             base_url: "http://127.0.0.1:4545".to_string(),
             api_key: None,
         };
-        let path = ClaudeCodeDriver::write_mcp_config(&bridge, None).unwrap();
+        let path = ClaudeCodeDriver::write_mcp_config(&bridge, None, None, None).unwrap();
         let written = std::fs::read_to_string(&path).unwrap();
         let _ = std::fs::remove_file(&path);
         let cfg: serde_json::Value = serde_json::from_str(&written).unwrap();
         assert!(cfg["mcpServers"]["librefang"].get("headers").is_none());
+    }
+
+    #[test]
+    fn test_mcp_config_carries_current_peer_and_channel_headers() {
+        // The cross-chat audio leak (2026-05-19) showed Claude CLI emitting
+        // a `channel_send` to a stranger's JID instead of the current
+        // peer's. The MCP bridge layer had no way to enforce peer scope
+        // because the driver did not forward the turn's inbound peer. The
+        // driver now writes `X-LibreFang-Current-Peer-Jid` and
+        // `X-LibreFang-Current-Channel`, which `/mcp` translates into
+        // `ToolExecContext::sender_id` / `channel` — `channel_send` then
+        // refuses same-channel recipient mismatches.
+        let bridge = McpBridgeConfig {
+            base_url: "http://127.0.0.1:4545".to_string(),
+            api_key: None,
+        };
+        let path = ClaudeCodeDriver::write_mcp_config(
+            &bridge,
+            Some("agent-1234"),
+            Some("393760105565@s.whatsapp.net"),
+            Some("whatsapp"),
+        )
+        .unwrap();
+        let written = std::fs::read_to_string(&path).unwrap();
+        let _ = std::fs::remove_file(&path);
+        let cfg: serde_json::Value = serde_json::from_str(&written).unwrap();
+        let headers = &cfg["mcpServers"]["librefang"]["headers"];
+        assert_eq!(
+            headers["X-LibreFang-Current-Peer-Jid"],
+            "393760105565@s.whatsapp.net"
+        );
+        assert_eq!(headers["X-LibreFang-Current-Channel"], "whatsapp");
+        assert_eq!(headers["X-LibreFang-Agent-Id"], "agent-1234");
+    }
+
+    #[test]
+    fn test_mcp_config_omits_peer_headers_when_unset_or_empty() {
+        // Empty / unset peer jid or channel must NOT produce empty header
+        // values — that would make the bridge guard think there *is* a
+        // peer scope and reject legitimate dispatches. Skip both fields
+        // entirely so `/mcp` falls back to the unguarded path.
+        let bridge = McpBridgeConfig {
+            base_url: "http://127.0.0.1:4545".to_string(),
+            api_key: None,
+        };
+        let path =
+            ClaudeCodeDriver::write_mcp_config(&bridge, Some("agent-1234"), Some(""), Some(""))
+                .unwrap();
+        let written = std::fs::read_to_string(&path).unwrap();
+        let _ = std::fs::remove_file(&path);
+        let cfg: serde_json::Value = serde_json::from_str(&written).unwrap();
+        let headers = &cfg["mcpServers"]["librefang"]["headers"];
+        assert!(headers.get("X-LibreFang-Current-Peer-Jid").is_none());
+        assert!(headers.get("X-LibreFang-Current-Channel").is_none());
     }
 }

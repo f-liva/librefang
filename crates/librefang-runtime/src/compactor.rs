@@ -687,6 +687,8 @@ async fn summarize_messages(
         timeout_secs: None,
         extra_body: None,
         agent_id: None,
+        sender_user_id: None,
+        sender_channel: None,
     };
 
     // Retry logic for transient failures
@@ -813,6 +815,8 @@ async fn summarize_in_chunks(
         timeout_secs: None,
         extra_body: None,
         agent_id: None,
+        sender_user_id: None,
+        sender_channel: None,
     };
 
     match driver.complete(merge_request).await {

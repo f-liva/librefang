@@ -267,6 +267,34 @@ pub struct CompletionRequest {
     /// registry. `None` for out-of-band callers (compaction, routing
     /// probes, tests) that have no agent identity to propagate.
     pub agent_id: Option<String>,
+    /// Inbound peer identity for the turn that triggered this LLM call.
+    ///
+    /// When set, identifies the user / contact whose message the agent is
+    /// currently responding to (e.g. a WhatsApp / Telegram JID, an email
+    /// address, an HTTP API caller id). Driver implementations that spawn
+    /// a subprocess and re-expose LibreFang's tool surface via an MCP
+    /// bridge (notably `claude-code`) forward this on the bridge HTTP
+    /// connection so that the bridge endpoint can rehydrate
+    /// `ToolExecContext::sender_id` — which `channel_send` then uses to
+    /// reject cross-chat recipient mismatches on the same channel
+    /// (audio-cross-chat leak 2026-05-19).
+    ///
+    /// `None` for out-of-band callers (cron, automation triggers without
+    /// an inbound peer, compaction, routing probes) where no peer scope
+    /// is in force.
+    pub sender_user_id: Option<String>,
+    /// Inbound channel for the turn that triggered this LLM call.
+    ///
+    /// Paired with [`Self::sender_user_id`]: identifies the channel name
+    /// (`"whatsapp"`, `"telegram"`, `"email"`, …) the peer reached the
+    /// agent through. Forwarded by subprocess drivers to the MCP bridge
+    /// so `channel_send` can scope the cross-chat guard to the **same**
+    /// channel — a different-channel dispatch (e.g. emailing while
+    /// replying to a WhatsApp peer) remains allowed; only intra-channel
+    /// re-targeting is the cross-chat-leak pattern.
+    ///
+    /// `None` for out-of-band callers with no channel context.
+    pub sender_channel: Option<String>,
 }
 
 /// A response from an LLM completion.
@@ -731,6 +759,8 @@ mod tests {
             timeout_secs: None,
             extra_body: None,
             agent_id: None,
+            sender_user_id: None,
+            sender_channel: None,
         };
 
         let response = driver.stream(request, tx).await.unwrap();

@@ -1242,6 +1242,24 @@ pub async fn mcp_http(
         .and_then(|s| s.parse::<librefang_types::agent::AgentId>().ok())
         .and_then(|id| state.kernel.agent_registry().get(id));
 
+    // Peer scope of the current turn — forwarded by the `claude-code`
+    // driver (and any future subprocess driver) so the bridge can wire
+    // `ToolExecContext::sender_id` / `channel`, which `channel_send`
+    // uses to reject same-channel recipient mismatches (cross-chat
+    // audio leak 2026-05-19). External MCP clients that don't set
+    // these headers continue to run with `None` — the cross-chat guard
+    // simply doesn't fire for them.
+    let current_peer_jid = headers
+        .get("x-librefang-current-peer-jid")
+        .and_then(|v| v.to_str().ok())
+        .map(|s| s.to_string())
+        .filter(|s| !s.is_empty());
+    let current_channel = headers
+        .get("x-librefang-current-channel")
+        .and_then(|v| v.to_str().ok())
+        .map(|s| s.to_string())
+        .filter(|s| !s.is_empty());
+
     // Check if this is a tools/call that needs real execution
     let method = request["method"].as_str().unwrap_or("");
     if method == "tools/call" {
@@ -1340,8 +1358,8 @@ pub async fn mcp_http(
             docker_opt,
             Some(state.kernel.processes()),
             None, // process_registry (network bridge doesn't run agent tools)
-            None, // sender_id (MCP HTTP has no sender context)
-            None, // channel
+            current_peer_jid.as_deref(), // sender_id (from X-LibreFang-Current-Peer-Jid)
+            current_channel.as_deref(), // channel (from X-LibreFang-Current-Channel)
             None, // checkpoint_manager (network bridge doesn't run agent tools)
             None, // interrupt (MCP HTTP calls have no session-scoped cancellation)
             None, // session_id (MCP HTTP is not tied to a live session)

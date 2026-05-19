@@ -405,7 +405,7 @@ pub async fn execute_tool_raw(
         process_manager,
         process_registry: _,
         sender_id,
-        channel: _,
+        channel,
         checkpoint_manager,
         interrupt,
         dangerous_command_checker,
@@ -879,7 +879,9 @@ pub async fn execute_tool_raw(
         "cron_cancel" => tool_cron_cancel(input, *kernel, *caller_agent_id).await,
 
         // Channel send tool (proactive outbound messaging)
-        "channel_send" => tool_channel_send(input, *kernel, *workspace_root, *sender_id).await,
+        "channel_send" => {
+            tool_channel_send(input, *kernel, *workspace_root, *sender_id, *channel).await
+        }
 
         // Persistent process tools
         "process_start" => tool_process_start(input, *process_manager, *caller_agent_id).await,
@@ -4102,6 +4104,7 @@ async fn tool_channel_send(
     kernel: Option<&Arc<dyn KernelHandle>>,
     workspace_root: Option<&Path>,
     sender_id: Option<&str>,
+    sender_channel: Option<&str>,
 ) -> Result<String, String> {
     let kh = require_kernel(kernel)?;
 
@@ -4124,6 +4127,43 @@ async fn tool_channel_send(
 
     if recipient.is_empty() {
         return Err("Recipient cannot be empty".to_string());
+    }
+
+    // Cross-chat dispatch guard (audio cross-chat leak 2026-05-19).
+    //
+    // When the MCP bridge populated the turn's peer scope (sender_id +
+    // channel via the `X-LibreFang-Current-Peer-Jid` and
+    // `X-LibreFang-Current-Channel` headers the `claude-code` driver
+    // writes into the per-invocation mcp_config), refuse `channel_send`
+    // dispatches that target a different recipient on the **same**
+    // channel — the model is attempting to relay outside the turn's
+    // peer scope, typically because of sticky context from a prior
+    // stranger turn or an outright hallucinated JID.
+    //
+    // Different-channel dispatches (e.g. an email reply composed during
+    // a WhatsApp turn, or a Telegram heads-up while answering an SMS)
+    // stay allowed — only intra-channel re-targeting is the cross-chat
+    // leak pattern. Cross-chat *escalation* must go through
+    // `notify_owner`, which is kernel-mediated and not subject to this
+    // guard.
+    //
+    // The guard is opt-in by construction: out-of-band callers (no
+    // peer scope, e.g. external MCP clients, cron, automation
+    // triggers) populate `sender_id` / `sender_channel` with `None` and
+    // the guard is skipped.
+    if let (Some(expected_peer), Some(turn_channel)) = (sender_id, sender_channel) {
+        if !expected_peer.is_empty()
+            && !turn_channel.is_empty()
+            && turn_channel.eq_ignore_ascii_case(&channel)
+            && recipient != expected_peer
+        {
+            return Err(format!(
+                "channel_send recipient '{recipient}' does not match the current peer \
+                 '{expected_peer}' on channel '{channel}'. Cross-chat dispatch is forbidden — \
+                 to reach a different contact, use notify_owner (kernel-mediated) or wait for \
+                 that contact's inbound message."
+            ));
+        }
     }
 
     let thread_id = input["thread_id"].as_str().filter(|s| !s.is_empty());
@@ -6557,7 +6597,7 @@ mod tests {
             "recipient": "@user",
             "message": "here is the api_key=sk-abcdefghijklmnop",
         });
-        let err = tool_channel_send(&input, Some(&kernel), None, Some("test_user_id"))
+        let err = tool_channel_send(&input, Some(&kernel), None, Some("test_user_id"), None)
             .await
             .expect_err("channel_send must reject tainted message");
         assert!(
@@ -6578,7 +6618,7 @@ mod tests {
             "image_url": "https://example.com/cat.png",
             "message": "see attached. token=sk-abcdefghijklmnop",
         });
-        let err = tool_channel_send(&input, Some(&kernel), None, Some("test_user_id"))
+        let err = tool_channel_send(&input, Some(&kernel), None, Some("test_user_id"), None)
             .await
             .expect_err("image caption must be sink-checked");
         assert!(
@@ -6599,7 +6639,7 @@ mod tests {
             "poll_question": "guess my api_key=sk-abcdefghijklmnop",
             "poll_options": ["yes", "no"],
         });
-        let err = tool_channel_send(&input, Some(&kernel), None, Some("test_user_id"))
+        let err = tool_channel_send(&input, Some(&kernel), None, Some("test_user_id"), None)
             .await
             .expect_err("poll question must be sink-checked");
         assert!(
@@ -6623,7 +6663,8 @@ mod tests {
         // This should NOT error with "Missing recipient" because sender_id is provided
         // It will error with "Channel file data send not available" because the mock kernel
         // doesn't implement channel_send, but that's expected
-        let result = tool_channel_send(&input, Some(&kernel), None, Some("12345_telegram")).await;
+        let result =
+            tool_channel_send(&input, Some(&kernel), None, Some("12345_telegram"), None).await;
         // The error should NOT be about missing recipient
         let err_msg = result.unwrap_err();
         assert!(
@@ -6644,12 +6685,147 @@ mod tests {
             // recipient intentionally omitted
             "message": "Hello!",
         });
-        let err = tool_channel_send(&input, Some(&kernel), None, None)
+        let err = tool_channel_send(&input, Some(&kernel), None, None, None)
             .await
             .expect_err("channel_send must require recipient without sender_id");
         assert!(
             err.contains("Missing 'recipient'"),
             "Expected missing recipient error, got: {err}"
+        );
+    }
+
+    // ── Cross-chat dispatch guard (audio leak 2026-05-19) ────────────────
+
+    #[tokio::test]
+    async fn test_tool_channel_send_rejects_cross_chat_recipient_same_channel() {
+        let kernel: Arc<dyn KernelHandle> = Arc::new(ApprovalKernel {
+            approval_requests: Arc::new(AtomicUsize::new(0)),
+            user_gate_override: None,
+        });
+        let input = serde_json::json!({
+            "channel": "whatsapp",
+            "recipient": "999999@s.whatsapp.net",
+            "message": "hi",
+        });
+        let err = tool_channel_send(
+            &input,
+            Some(&kernel),
+            None,
+            Some("393760105565@s.whatsapp.net"),
+            Some("whatsapp"),
+        )
+        .await
+        .expect_err("must reject cross-chat dispatch on same channel");
+        assert!(
+            err.contains("does not match the current peer")
+                && err.contains("Cross-chat dispatch is forbidden"),
+            "expected cross-chat rejection, got: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_tool_channel_send_cross_chat_guard_case_insensitive_channel() {
+        let kernel: Arc<dyn KernelHandle> = Arc::new(ApprovalKernel {
+            approval_requests: Arc::new(AtomicUsize::new(0)),
+            user_gate_override: None,
+        });
+        // Turn channel "WhatsApp" vs payload channel "whatsapp" — must
+        // still trip the guard.
+        let input = serde_json::json!({
+            "channel": "whatsapp",
+            "recipient": "999999@s.whatsapp.net",
+            "message": "hi",
+        });
+        let err = tool_channel_send(
+            &input,
+            Some(&kernel),
+            None,
+            Some("393760105565@s.whatsapp.net"),
+            Some("WhatsApp"),
+        )
+        .await
+        .expect_err("case-insensitive channel match must trip the guard");
+        assert!(
+            err.contains("Cross-chat dispatch is forbidden"),
+            "got: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_tool_channel_send_cross_chat_allows_different_channel() {
+        let kernel: Arc<dyn KernelHandle> = Arc::new(ApprovalKernel {
+            approval_requests: Arc::new(AtomicUsize::new(0)),
+            user_gate_override: None,
+        });
+        // Turn channel whatsapp; dispatching on telegram is *not* a
+        // cross-chat leak — must pass the guard (will fail later for
+        // unrelated reasons, but NOT with the cross-chat error).
+        let input = serde_json::json!({
+            "channel": "telegram",
+            "recipient": "@someone_else",
+            "message": "fyi",
+        });
+        let result = tool_channel_send(
+            &input,
+            Some(&kernel),
+            None,
+            Some("393760105565@s.whatsapp.net"),
+            Some("whatsapp"),
+        )
+        .await;
+        let err_msg = result.unwrap_err();
+        assert!(
+            !err_msg.contains("Cross-chat dispatch is forbidden"),
+            "different-channel dispatch must NOT trip the guard, got: {err_msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_tool_channel_send_cross_chat_guard_skipped_without_peer_scope() {
+        let kernel: Arc<dyn KernelHandle> = Arc::new(ApprovalKernel {
+            approval_requests: Arc::new(AtomicUsize::new(0)),
+            user_gate_override: None,
+        });
+        // sender_id None = external MCP client / cron / automation
+        // trigger — guard must be skipped.
+        let input = serde_json::json!({
+            "channel": "whatsapp",
+            "recipient": "999999@s.whatsapp.net",
+            "message": "hi",
+        });
+        let result = tool_channel_send(&input, Some(&kernel), None, None, Some("whatsapp")).await;
+        let err_msg = result.unwrap_err();
+        assert!(
+            !err_msg.contains("Cross-chat dispatch is forbidden"),
+            "guard must not fire without sender_id, got: {err_msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_tool_channel_send_cross_chat_guard_allows_matching_recipient() {
+        let kernel: Arc<dyn KernelHandle> = Arc::new(ApprovalKernel {
+            approval_requests: Arc::new(AtomicUsize::new(0)),
+            user_gate_override: None,
+        });
+        // recipient == expected_peer on same channel = legitimate
+        // reply, must pass the guard.
+        let input = serde_json::json!({
+            "channel": "whatsapp",
+            "recipient": "393760105565@s.whatsapp.net",
+            "message": "ok",
+        });
+        let result = tool_channel_send(
+            &input,
+            Some(&kernel),
+            None,
+            Some("393760105565@s.whatsapp.net"),
+            Some("whatsapp"),
+        )
+        .await;
+        let err_msg = result.unwrap_err();
+        assert!(
+            !err_msg.contains("Cross-chat dispatch is forbidden"),
+            "matching recipient must NOT trip the guard, got: {err_msg}"
         );
     }
 
