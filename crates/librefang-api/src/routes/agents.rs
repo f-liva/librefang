@@ -2263,17 +2263,41 @@ pub async fn send_message_stream(
         },
     };
 
+    // Build sender context from the request body BEFORE handing off to the
+    // kernel. The session resolver uses this to derive
+    // `SessionId::for_sender_scope(agent, channel, chat_id)` so per-chat
+    // isolation holds — without it, every inbound (DM, group, stranger)
+    // collapses onto the agent's global `Persistent` session pointer and
+    // contexts cross-pollinate. The non-streaming sibling `send_message`
+    // builds this; the streaming variant historically did not — fixed here
+    // for the 2026-05-19 cross-chat leak between owner DM and the family
+    // group on a single shared session blob.
+    let sender_context = request_sender_context(&req);
+
     let kernel_handle: Arc<dyn KernelHandle> = state.kernel.clone() as Arc<dyn KernelHandle>;
-    let (rx, handle) = match state
-        .kernel
-        .send_message_streaming_with_routing_and_session_override(
-            agent_id,
-            &req.message,
-            Some(kernel_handle),
-            session_id_override,
-        )
-        .await
-    {
+    let (rx, handle) = match if let Some(sender) = sender_context.as_ref() {
+        state
+            .kernel
+            .send_message_streaming_with_sender_context_routing_thinking_and_session(
+                agent_id,
+                &req.message,
+                Some(kernel_handle),
+                sender,
+                None,
+                session_id_override,
+            )
+            .await
+    } else {
+        state
+            .kernel
+            .send_message_streaming_with_routing_and_session_override(
+                agent_id,
+                &req.message,
+                Some(kernel_handle),
+                session_id_override,
+            )
+            .await
+    } {
         Ok(pair) => pair,
         Err(e) => {
             tracing::warn!("Streaming message failed for agent {id}: {e}");
