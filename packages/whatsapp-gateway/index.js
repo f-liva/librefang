@@ -3428,6 +3428,22 @@ async function sendImage(to, imageUrl, caption) {
   });
 }
 
+// Magic-byte sniff for audio buffers. Caller (or upstream TTS) may produce
+// MP3, M4A, etc.; sending MP3 bytes labelled `audio/ogg; codecs=opus` is the
+// root cause of "Unsupported content type in Web mode" on Beeper /
+// mautrix-whatsapp. WhatsApp PTT (voice-note bubble) REQUIRES Ogg/Opus.
+function detectAudioMime(buf) {
+  if (!Buffer.isBuffer(buf) || buf.length < 4) return 'application/octet-stream';
+  const head4 = buf.slice(0, 4).toString('ascii');
+  if (head4 === 'OggS') return 'audio/ogg; codecs=opus';
+  if (head4 === 'RIFF') return 'audio/wav';
+  if (head4 === 'fLaC') return 'audio/flac';
+  if (buf.slice(0, 3).toString('ascii') === 'ID3') return 'audio/mpeg';
+  if (buf[0] === 0xff && (buf[1] & 0xe0) === 0xe0) return 'audio/mpeg'; // MPEG frame sync
+  if (buf.length >= 8 && buf.slice(4, 8).toString('ascii') === 'ftyp') return 'audio/mp4';
+  return 'application/octet-stream';
+}
+
 async function sendAudio(to, audioUrl, ptt = true) {
   if (!sock || connStatus !== 'connected') {
     throw new Error('WhatsApp not connected');
@@ -3460,8 +3476,16 @@ async function sendAudio(to, audioUrl, ptt = true) {
     request(audioUrl);
   });
 
-  // ptt: true sends as a voice note (push-to-talk bubble); false sends as audio file
-  const audioMsg = { audio: buffer, mimetype: 'audio/ogg; codecs=opus', ptt };
+  const detectedMime = detectAudioMime(buffer);
+  const isOggOpus = detectedMime === 'audio/ogg; codecs=opus';
+  const effectivePtt = ptt && isOggOpus;
+  if (ptt && !isOggOpus) {
+    console.warn(
+      `[sendAudio] PTT requested but buffer detected as ${detectedMime}; ` +
+      `downgrading to audio file. Fix upstream encoder to produce Ogg/Opus.`
+    );
+  }
+  const audioMsg = { audio: buffer, mimetype: detectedMime, ptt: effectivePtt };
 
   const sent = await sock.sendMessage(jid, audioMsg);
   dbSaveMessage({
@@ -3821,6 +3845,7 @@ process.on('SIGTERM', () => gracefulShutdown('SIGTERM'));
 
 // Export for testing
 module.exports = {
+  detectAudioMime,
   markdownToWhatsApp,
   wrapStrangerInbound,
   extractNotifyOwner,
