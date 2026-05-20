@@ -1,4 +1,5 @@
 # syntax=docker/dockerfile:1
+# cache-bust: 2026-05-20T10:30:00Z — rebuild after cross-chat image-leak triage (chat 120957, msg 355211)
 
 # Stage 1: Build React dashboard
 FROM node:20-alpine AS dashboard-builder
