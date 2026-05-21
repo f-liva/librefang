@@ -4461,6 +4461,7 @@ dependencies = [
  "librefang-runtime-oauth",
  "librefang-runtime-wasm",
  "librefang-skills",
+ "librefang-testing",
  "librefang-types",
  "once_cell",
  "parking_lot",

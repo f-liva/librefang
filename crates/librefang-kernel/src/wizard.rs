@@ -202,6 +202,7 @@ impl SetupWizard {
             max_history_messages: None,
             max_concurrent_invocations: None,
             cache_context: false,
+            owner_notify_gate: librefang_types::agent::OwnerNotifyGateConfig::default(),
         };
 
         let skills_to_install: Vec<String> = intent

@@ -194,6 +194,13 @@ impl AuxClient {
                 "openai:gpt-4o-mini".to_string(),
                 "openrouter:anthropic/claude-3-5-sonnet".to_string(),
             ],
+            // Owner-notification triage (#5471 backport): cheap
+            // classification task, shares the haiku-class chain.
+            AuxTask::OwnerNotifyTriage => vec![
+                "openrouter:anthropic/claude-3-5-haiku".to_string(),
+                "anthropic:haiku".to_string(),
+                "openai:gpt-4o-mini".to_string(),
+            ],
         }
     }
 

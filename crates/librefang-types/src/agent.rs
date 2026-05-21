@@ -937,6 +937,51 @@ pub struct AgentManifest {
     /// on the next message.
     #[serde(default)]
     pub cache_context: bool,
+    /// Owner-notification triage gate (#5471 — backport on custom).
+    #[serde(default)]
+    pub owner_notify_gate: OwnerNotifyGateConfig,
+}
+
+/// Owner-notification triage gate (#5471) per-agent configuration.
+///
+/// When enabled, the agent loop runs a cheap auxiliary-LLM classification
+/// BEFORE the primary turn for every inbound message whose `sender_user_id`
+/// is NOT in [`OwnerNotifyGateConfig::owner_user_ids`]. The classifier
+/// decides whether the request lies outside the agent's autonomous-reply
+/// envelope and the owner should be notified via the `notify_owner` tool
+/// before / instead of replying.
+///
+/// Default disabled (opt-in). Configurable in `agent.toml`:
+/// ```toml
+/// [owner_notify_gate]
+/// enabled = true
+/// owner_user_ids = ["393511083257@s.whatsapp.net", "393511083257@lid"]
+/// ```
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct OwnerNotifyGateConfig {
+    /// Master switch. When `false`, the gate is a no-op.
+    pub enabled: bool,
+    /// Sender IDs (channel-qualified) recognised as the owner; skipped
+    /// from the gate. Matched verbatim (case-sensitive) against the
+    /// `sender_user_id` metadata field on the agent turn.
+    pub owner_user_ids: Vec<String>,
+}
+
+impl OwnerNotifyGateConfig {
+    /// `true` when the gate should run for an inbound message from
+    /// `sender_user_id`. Returns `false` when the gate is disabled,
+    /// when `sender_user_id` is `None` / empty, or when it matches a
+    /// configured owner entry.
+    pub fn should_evaluate(&self, sender_user_id: Option<&str>) -> bool {
+        if !self.enabled {
+            return false;
+        }
+        match sender_user_id {
+            None | Some("") => false,
+            Some(id) => !self.owner_user_ids.iter().any(|owner| owner == id),
+        }
+    }
 }
 
 /// Access mode for a named workspace.
@@ -1041,6 +1086,7 @@ impl Default for AgentManifest {
             channel_overrides: None,
             max_history_messages: None,
             cache_context: false,
+            owner_notify_gate: OwnerNotifyGateConfig::default(),
         }
     }
 }

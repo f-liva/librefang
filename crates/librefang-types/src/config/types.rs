@@ -1035,6 +1035,8 @@ pub enum AuxTask {
     Vision,
     /// Browser-tool vision-driven page understanding.
     BrowserVision,
+    /// Owner-notification triage gate (#5471 — backport on custom).
+    OwnerNotifyTriage,
 }
 
 impl AuxTask {
@@ -1046,6 +1048,7 @@ impl AuxTask {
             AuxTask::Search => "search",
             AuxTask::Vision => "vision",
             AuxTask::BrowserVision => "browser_vision",
+            AuxTask::OwnerNotifyTriage => "owner_notify_triage",
         }
     }
 }
