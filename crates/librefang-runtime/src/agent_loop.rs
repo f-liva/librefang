@@ -3296,11 +3296,16 @@ pub async fn run_agent_loop(
     };
 
     // #5471 — Owner-notification triage gate.
-    let combined_prefix: Option<String> = if manifest
+    let gate_should_eval = manifest
         .owner_notify_gate
-        .should_evaluate(sender_user_id.as_deref())
-    {
+        .should_evaluate(sender_user_id.as_deref());
+    let combined_prefix: Option<String> = if gate_should_eval {
         if let Some(aux) = opts.aux_client.as_deref() {
+            tracing::info!(
+                agent = %manifest.name,
+                sender_user_id = ?sender_user_id,
+                "owner_notify_gate: evaluating (gate enabled, non-owner sender, aux available)"
+            );
             let display = manifest
                 .metadata
                 .get("sender_display_name")
@@ -3308,7 +3313,15 @@ pub async fn run_agent_loop(
             let verdict =
                 crate::owner_notify_gate::evaluate_stranger_request(user_message, display, aux)
                     .await;
-            match crate::owner_notify_gate::render_guidance_block(&verdict) {
+            let rendered = crate::owner_notify_gate::render_guidance_block(&verdict);
+            tracing::info!(
+                agent = %manifest.name,
+                notify_owner = verdict.notify_owner,
+                category = %verdict.category,
+                guidance_block_injected = rendered.is_some(),
+                "owner_notify_gate: verdict folded into combined_prefix"
+            );
+            match rendered {
                 Some(block) => Some(match combined_prefix {
                     Some(prefix) => format!("{prefix}{block}\n\n"),
                     None => format!("{block}\n\n"),
@@ -3316,9 +3329,20 @@ pub async fn run_agent_loop(
                 None => combined_prefix,
             }
         } else {
+            tracing::info!(
+                agent = %manifest.name,
+                sender_user_id = ?sender_user_id,
+                "owner_notify_gate: enabled + non-owner sender but aux_client is None — skipping"
+            );
             combined_prefix
         }
     } else {
+        tracing::debug!(
+            agent = %manifest.name,
+            enabled = manifest.owner_notify_gate.enabled,
+            sender_user_id = ?sender_user_id,
+            "owner_notify_gate: should_evaluate=false — skipping"
+        );
         combined_prefix
     };
 
@@ -4782,11 +4806,16 @@ pub async fn run_agent_loop_streaming(
     };
 
     // #5471 — Owner-notification triage gate.
-    let combined_prefix: Option<String> = if manifest
+    let gate_should_eval = manifest
         .owner_notify_gate
-        .should_evaluate(sender_user_id.as_deref())
-    {
+        .should_evaluate(sender_user_id.as_deref());
+    let combined_prefix: Option<String> = if gate_should_eval {
         if let Some(aux) = opts.aux_client.as_deref() {
+            tracing::info!(
+                agent = %manifest.name,
+                sender_user_id = ?sender_user_id,
+                "owner_notify_gate: evaluating (gate enabled, non-owner sender, aux available)"
+            );
             let display = manifest
                 .metadata
                 .get("sender_display_name")
@@ -4794,7 +4823,15 @@ pub async fn run_agent_loop_streaming(
             let verdict =
                 crate::owner_notify_gate::evaluate_stranger_request(user_message, display, aux)
                     .await;
-            match crate::owner_notify_gate::render_guidance_block(&verdict) {
+            let rendered = crate::owner_notify_gate::render_guidance_block(&verdict);
+            tracing::info!(
+                agent = %manifest.name,
+                notify_owner = verdict.notify_owner,
+                category = %verdict.category,
+                guidance_block_injected = rendered.is_some(),
+                "owner_notify_gate: verdict folded into combined_prefix"
+            );
+            match rendered {
                 Some(block) => Some(match combined_prefix {
                     Some(prefix) => format!("{prefix}{block}\n\n"),
                     None => format!("{block}\n\n"),
@@ -4802,9 +4839,20 @@ pub async fn run_agent_loop_streaming(
                 None => combined_prefix,
             }
         } else {
+            tracing::info!(
+                agent = %manifest.name,
+                sender_user_id = ?sender_user_id,
+                "owner_notify_gate: enabled + non-owner sender but aux_client is None — skipping"
+            );
             combined_prefix
         }
     } else {
+        tracing::debug!(
+            agent = %manifest.name,
+            enabled = manifest.owner_notify_gate.enabled,
+            sender_user_id = ?sender_user_id,
+            "owner_notify_gate: should_evaluate=false — skipping"
+        );
         combined_prefix
     };
 

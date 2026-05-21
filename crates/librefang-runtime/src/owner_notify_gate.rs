@@ -31,7 +31,7 @@
 use librefang_llm_driver::CompletionRequest;
 use librefang_types::config::AuxTask;
 use librefang_types::message::Message;
-use tracing::{debug, warn};
+use tracing::{info, warn};
 
 use crate::aux_client::AuxClient;
 
@@ -128,12 +128,23 @@ pub async fn evaluate_stranger_request(
     aux_client: &AuxClient,
 ) -> TriageVerdict {
     let trimmed = user_message.trim();
+    let sender_display = sender_display_name.unwrap_or("Unknown sender");
+    info!(
+        sender_display = %sender_display,
+        msg_len = trimmed.len(),
+        "owner_notify_triage: gate entered"
+    );
     if trimmed.is_empty() {
-        debug!("owner_notify_triage: empty inbound message, skipping gate");
+        info!("owner_notify_triage: empty inbound message, skipping gate");
         return TriageVerdict::skip("empty inbound message");
     }
 
     let resolution = aux_client.resolve(AuxTask::OwnerNotifyTriage);
+    info!(
+        used_primary = resolution.used_primary,
+        chain_len = resolution.resolved.len(),
+        "owner_notify_triage: aux chain resolved"
+    );
     let driver = resolution.driver;
     // When the chain resolved to the primary driver (no aux configured)
     // the `resolved` list is empty and `model` must be left empty so the
@@ -144,8 +155,8 @@ pub async fn evaluate_stranger_request(
         .map(|(_, m)| m.clone())
         .unwrap_or_default();
 
-    let display = sender_display_name.unwrap_or("Unknown sender");
-    let user_payload = format!("Sender display name: {display}\n\nInbound message:\n{trimmed}");
+    let user_payload =
+        format!("Sender display name: {sender_display}\n\nInbound message:\n{trimmed}");
 
     let request = CompletionRequest {
         model,
@@ -169,7 +180,17 @@ pub async fn evaluate_stranger_request(
     };
 
     match driver.complete(request).await {
-        Ok(resp) => parse_verdict(&resp.text()),
+        Ok(resp) => {
+            let v = parse_verdict(&resp.text());
+            info!(
+                notify_owner = v.notify_owner,
+                category = %v.category,
+                origin = ?v.origin,
+                guidance_len = v.guidance.len(),
+                "owner_notify_triage: aux verdict"
+            );
+            v
+        }
         Err(err) => {
             warn!(
                 error = %err,
