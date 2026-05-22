@@ -45,6 +45,20 @@ const LEAK_LINE_PREFIXES: &[&str] = &[
     "ho già inoltrato",
     "ho gia' inoltrato",
     "l'ho fatto presente",
+    // "proprietario" / "padrone" / "datore" synonyms for "Signore"
+    "il proprietario è stato notificato",
+    "il proprietario e' stato notificato",
+    "il proprietario è stato avvisato",
+    "il proprietario e' stato avvisato",
+    "ho notificato il proprietario",
+    "ho avvisato il proprietario",
+    "proprietario notificato",
+    "il padrone è stato notificato",
+    "il padrone e' stato notificato",
+    "ho notificato il padrone",
+    "il datore è stato notificato",
+    "il datore e' stato notificato",
+    "ho notificato il datore",
 ];
 
 /// Used when the entire response collapses to nothing after sanitization.
@@ -70,21 +84,141 @@ const NEUTRAL_FALLBACK: &str = "Va bene. 🎩";
 /// single-line mixed response, the sanitizer keeps it untouched (acceptable
 /// fallback: the leak survives but the chat doesn't break).
 pub fn sanitize_stranger_response(text: &str) -> String {
-    let kept: Vec<&str> = text
+    // Per line:
+    // - if originally blank → preserve as empty string (keeps user's spacing)
+    // - else sanitize at sentence level; if result is empty/blank → drop the
+    //   whole line so we don't leave gaps where leak lines used to be
+    let kept: Vec<String> = text
         .split('\n')
-        .filter(|line| !is_leak_line(line))
+        .filter_map(|line| {
+            if line.trim().is_empty() {
+                Some(String::new())
+            } else {
+                let s = sanitize_line(line);
+                if s.trim().is_empty() {
+                    None
+                } else {
+                    Some(s)
+                }
+            }
+        })
         .collect();
 
     let joined = kept.join("\n");
-    let trimmed = joined.trim();
-
-    if trimmed.is_empty() {
+    if joined.trim().is_empty() {
         NEUTRAL_FALLBACK.to_string()
     } else {
-        // Preserve any trailing newline if the original had one and the
-        // result is non-empty.
         joined
     }
+}
+
+/// Within a single line, split into sentence-like fragments on terminators
+/// followed by whitespace + uppercase start, and drop any fragment whose
+/// trimmed lowercase prefix matches a leak pattern.
+fn sanitize_line(line: &str) -> String {
+    if is_leak_line(line) {
+        return String::new();
+    }
+    if line.trim().is_empty() {
+        return line.to_string();
+    }
+
+    let sentences = split_into_sentences(line);
+    let kept: Vec<&str> = sentences
+        .iter()
+        .copied()
+        .filter(|s| !is_leak_sentence(s))
+        .collect();
+
+    if kept.len() == sentences.len() {
+        // No sentence dropped → return original line untouched (preserve
+        // any quirky whitespace the LLM produced).
+        return line.to_string();
+    }
+
+    // Rebuild line from kept sentences. Each sentence retains its own
+    // terminator, so a single space between them yields natural prose.
+    kept.iter()
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty())
+        .collect::<Vec<&str>>()
+        .join(" ")
+}
+
+/// Split a single line into sentence-like substrings.
+///
+/// A sentence boundary is one of `.`, `!`, `?` followed by one or more
+/// ASCII whitespace characters and an uppercase letter (Latin set,
+/// including common Italian accented capitals). This heuristic avoids
+/// splitting on abbreviations like "Sig. Federico" when "Federico"
+/// starts with uppercase — that case stays one fragment because it
+/// is rare in stranger replies and harmless to keep grouped.
+fn split_into_sentences(line: &str) -> Vec<&str> {
+    let bytes = line.as_bytes();
+    let mut starts: Vec<usize> = vec![0];
+
+    let mut i = 0;
+    while i < bytes.len() {
+        let c = bytes[i];
+        if matches!(c, b'.' | b'!' | b'?') {
+            // Scan whitespace after terminator
+            let mut j = i + 1;
+            while j < bytes.len() && (bytes[j] == b' ' || bytes[j] == b'\t') {
+                j += 1;
+            }
+            if j < bytes.len() && is_sentence_start_byte(&bytes[j..]) && j > i + 1 {
+                // Boundary: next sentence starts at j
+                starts.push(j);
+                i = j;
+                continue;
+            }
+        }
+        i += 1;
+    }
+
+    let mut out: Vec<&str> = Vec::with_capacity(starts.len());
+    for w in 0..starts.len() {
+        let start = starts[w];
+        let end = starts.get(w + 1).copied().unwrap_or(bytes.len());
+        out.push(&line[start..end]);
+    }
+    out
+}
+
+/// Returns true if the byte slice begins with a character that looks
+/// like the start of a new sentence (uppercase Latin, including common
+/// Italian accented capitals encoded as 2-byte UTF-8).
+fn is_sentence_start_byte(bytes: &[u8]) -> bool {
+    if bytes.is_empty() {
+        return false;
+    }
+    let b0 = bytes[0];
+    // ASCII uppercase A-Z
+    if b0.is_ascii_uppercase() {
+        return true;
+    }
+    // Common Italian accented uppercase letters in UTF-8 (2-byte prefix
+    // 0xC3 followed by 0x80-0x9E covers À..Ý etc.)
+    if bytes.len() >= 2 && b0 == 0xC3 {
+        let b1 = bytes[1];
+        // 0x80..=0x9E covers uppercase Latin-1 supplement
+        if (0x80..=0x9E).contains(&b1) {
+            return true;
+        }
+    }
+    false
+}
+
+/// Returns true if the sentence (after trim + lowercase) starts with
+/// any known leak prefix.
+fn is_leak_sentence(s: &str) -> bool {
+    let lc = s.trim().to_lowercase();
+    if lc.is_empty() {
+        return false;
+    }
+    LEAK_LINE_PREFIXES
+        .iter()
+        .any(|prefix| lc.starts_with(prefix))
 }
 
 /// Returns true if `line` (after trim + lowercase) starts with any of the
@@ -191,11 +325,54 @@ mod tests {
     }
 
     #[test]
-    fn keeps_mixed_inline_status_when_no_newline() {
-        // Single-line mixed: the leak survives but chat doesn't break.
-        // Documented limitation — see module docs.
+    fn drops_inline_leak_sentence_after_natural_one() {
         let input = "Buon pomeriggio! Risposta inviata a Federico.";
         let out = sanitize_stranger_response(input);
+        assert_eq!(out, "Buon pomeriggio!");
+    }
+
+    #[test]
+    fn drops_proprietario_synonym_inline() {
+        let input = "Non riesco a recuperare il JID del contatto. Il proprietario è stato notificato con successo della richiesta.";
+        let out = sanitize_stranger_response(input);
+        assert_eq!(out, "Non riesco a recuperare il JID del contatto.");
+    }
+
+    #[test]
+    fn drops_proprietario_padrone_datore_variants() {
+        for v in &[
+            "Il proprietario è stato notificato.",
+            "Il padrone è stato notificato.",
+            "Ho notificato il proprietario.",
+            "Ho avvisato il proprietario.",
+            "Il datore è stato notificato.",
+        ] {
+            let input = format!("Ciao. {v}");
+            let out = sanitize_stranger_response(&input);
+            assert_eq!(out, "Ciao.", "failed for variant: {v}");
+        }
+    }
+
+    #[test]
+    fn keeps_natural_inline_when_no_leak() {
+        let input = "Buon pomeriggio! Come posso aiutarLa?";
+        let out = sanitize_stranger_response(input);
+        assert_eq!(out, input);
+    }
+
+    #[test]
+    fn keeps_lowercase_continuation_grouped() {
+        // No split on "Sig. Federico" — lowercase after dot keeps fragment whole
+        let input = "Salve Sig. federico, ho ricevuto.";
+        let out = sanitize_stranger_response(input);
+        assert_eq!(out, input);
+    }
+
+    #[test]
+    fn handles_accented_uppercase_start() {
+        let input = "Ho controllato. È disponibile.";
+        let out = sanitize_stranger_response(input);
+        // No leak → unchanged
         assert_eq!(out, input);
     }
 
