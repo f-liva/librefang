@@ -665,6 +665,66 @@ struct ClaudeStreamEvent {
     /// The CLI sets this when the result is an error (auth failure, etc.).
     #[serde(default)]
     is_error: bool,
+    /// Per-event error tag emitted by the CLI when the upstream Anthropic
+    /// API rejects the call (e.g. `"rate_limit"`, `"authentication_failed"`).
+    /// Present on `"assistant"` events that carry an Anthropic error body.
+    #[serde(default)]
+    error: Option<String>,
+    /// HTTP-style status code from the upstream API (e.g. 429 for
+    /// rate-limit, 401 for auth). Present on `"result"` events when
+    /// `is_error == true`.
+    #[serde(default)]
+    api_error_status: Option<u16>,
+    /// Nested message envelope present on `"assistant"` events. The
+    /// streaming CLI doesn't emit a flat `content` string here — text
+    /// lives in `message.content[].text`. Parsed manually in the
+    /// streaming loop so we can surface error responses (notably the
+    /// "You've hit your session limit · resets HH:MMam (UTC)"
+    /// rate-limit message) that otherwise vanish into full_text=empty.
+    #[serde(default)]
+    message: Option<ClaudeStreamAssistantMessage>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ClaudeStreamAssistantMessage {
+    #[serde(default)]
+    content: Vec<ClaudeStreamContentBlock>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ClaudeStreamContentBlock {
+    #[serde(default)]
+    r#type: String,
+    #[serde(default)]
+    text: Option<String>,
+}
+
+impl ClaudeStreamEvent {
+    /// Extract any plain-text payload from the event regardless of
+    /// whether the CLI delivered it via the top-level `content` field
+    /// (legacy / non-streaming envelope) or via the nested
+    /// `message.content[].text` blocks (streaming `"assistant"` events).
+    fn extracted_text(&self) -> Option<String> {
+        if let Some(c) = &self.content {
+            if !c.is_empty() {
+                return Some(c.clone());
+            }
+        }
+        let msg = self.message.as_ref()?;
+        let mut out = String::new();
+        for block in &msg.content {
+            if block.r#type == "text" {
+                if let Some(t) = &block.text {
+                    out.push_str(t);
+                }
+            }
+        }
+        if out.is_empty() {
+            None
+        } else {
+            Some(out)
+        }
+    }
 }
 
 /// Check if CLI response text looks like an auth or rate-limit error that
@@ -688,14 +748,23 @@ fn detect_cli_error_in_text(text: &str) -> Option<LlmError> {
     }
     // Rate-limit / quota exhaustion
     if lower.contains("hit your limit")
+        || lower.contains("hit your session limit")
         || lower.contains("out of extra usage")
         || lower.contains("rate limit")
         || lower.contains("too many requests")
         || (lower.contains("resets") && lower.contains("utc"))
+        || lower.contains("[api_error_status=429]")
     {
         return Some(LlmError::RateLimited {
             retry_after_ms: 5 * 60 * 1000,
             message: Some(text.to_string()),
+        });
+    }
+    // Auth / quota over-cap structured hint
+    if lower.contains("[api_error_status=401]") || lower.contains("[api_error_status=403]") {
+        return Some(LlmError::Api {
+            status: 401,
+            message: text.to_string(),
         });
     }
     None
@@ -1206,14 +1275,26 @@ impl LlmDriver for ClaudeCodeDriver {
 
                             match etype {
                                 "content" | "text" | "assistant" | "content_block_delta" => {
-                                    if let Some(ref content) = event.content {
-                                        full_text.push_str(content);
-                                        if !should_suppress(content) {
-                                            let _ = tx
-                                                .send(StreamEvent::TextDelta {
-                                                    text: content.clone(),
-                                                })
-                                                .await;
+                                    // The streaming CLI emits assistant text two ways:
+                                    // (a) legacy flat `content: "..."`,
+                                    // (b) modern `message.content[].text`. Read both via
+                                    // `extracted_text` so rate-limit responses like
+                                    // "You've hit your session limit · resets HH:MMam (UTC)",
+                                    // which the CLI sends as an assistant event with
+                                    // `error: "rate_limit"`, populate full_text and reach
+                                    // the post-loop classifier.
+                                    let content = event.extracted_text();
+                                    // If this assistant event is tagged as an upstream
+                                    // error (rate_limit / authentication_failed / …) we
+                                    // suppress the user-facing TextDelta — the post-loop
+                                    // classifier will convert it to LlmError so the
+                                    // rotation driver can fail over.
+                                    let is_error_event =
+                                        event.error.as_deref().is_some_and(|s| !s.is_empty());
+                                    if let Some(text) = content {
+                                        full_text.push_str(&text);
+                                        if !is_error_event && !should_suppress(&text) {
+                                            let _ = tx.send(StreamEvent::TextDelta { text }).await;
                                         }
                                     }
                                 }
@@ -1231,6 +1312,20 @@ impl LlmDriver for ClaudeCodeDriver {
                                                     })
                                                     .await;
                                             }
+                                        }
+                                    }
+                                    // Tag full_text with an explicit "[api_error_status=N]"
+                                    // hint when the CLI reports an upstream HTTP error
+                                    // status. The post-loop classifier already matches on
+                                    // lexical patterns ("resets ... utc", "rate limit"),
+                                    // but appending the structured code makes the 429
+                                    // detection robust against future wording changes
+                                    // in the CLI's user-facing error strings.
+                                    if let Some(status) = event.api_error_status {
+                                        if status >= 400 {
+                                            full_text.push_str(&format!(
+                                                "\n[api_error_status={status}]"
+                                            ));
                                         }
                                     }
                                     if let Some(usage) = event.usage {
