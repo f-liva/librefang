@@ -3432,7 +3432,7 @@ pub async fn run_agent_loop(
     }
 
     let mut total_usage = TokenUsage::default();
-    let final_response;
+    let mut final_response;
     // Accumulate text content from intermediate tool_use iterations. A turn
     // that yields a tool_use response may also carry user-facing text (e.g.
     // "Looking that up for you..." before a memory_store call). Without this
@@ -3996,6 +3996,30 @@ pub async fn run_agent_loop(
                     &accumulated_text,
                 );
                 final_response = text.clone();
+
+                // Stranger-channel response sanitizer.
+                // Strip cross-channel status leak patterns ("Risposta inviata",
+                // "Ho notificato il Signore", "Il messaggio è stato recapitato",
+                // etc.) when the sender is not the owner. Runtime-level
+                // enforcement of the boundary the AGENTS.md prompt fails to
+                // hold in practice.
+                if manifest
+                    .owner_notify_gate
+                    .should_evaluate(sender_user_id.as_deref())
+                {
+                    let original_len = final_response.len();
+                    final_response = crate::stranger_response_sanitizer::sanitize_stranger_response(
+                        &final_response,
+                    );
+                    if final_response.len() != original_len {
+                        tracing::info!(
+                            agent = %manifest.name,
+                            original_len,
+                            sanitized_len = final_response.len(),
+                            "stranger_response_sanitizer: dropped leak pattern lines"
+                        );
+                    }
+                }
 
                 return finalize_successful_end_turn(
                     FinalizeEndTurnContext {
@@ -4942,7 +4966,7 @@ pub async fn run_agent_loop_streaming(
     }
 
     let mut total_usage = TokenUsage::default();
-    let final_response;
+    let mut final_response;
     // Accumulated text from intermediate tool_use iterations — see the
     // matching declaration in run_agent_loop for full rationale.
     let mut accumulated_text = String::new();
@@ -5537,6 +5561,30 @@ pub async fn run_agent_loop_streaming(
                     &accumulated_text,
                 );
                 final_response = text.clone();
+
+                // Stranger-channel response sanitizer.
+                // Strip cross-channel status leak patterns ("Risposta inviata",
+                // "Ho notificato il Signore", "Il messaggio è stato recapitato",
+                // etc.) when the sender is not the owner. Runtime-level
+                // enforcement of the boundary the AGENTS.md prompt fails to
+                // hold in practice.
+                if manifest
+                    .owner_notify_gate
+                    .should_evaluate(sender_user_id.as_deref())
+                {
+                    let original_len = final_response.len();
+                    final_response = crate::stranger_response_sanitizer::sanitize_stranger_response(
+                        &final_response,
+                    );
+                    if final_response.len() != original_len {
+                        tracing::info!(
+                            agent = %manifest.name,
+                            original_len,
+                            sanitized_len = final_response.len(),
+                            "stranger_response_sanitizer: dropped leak pattern lines"
+                        );
+                    }
+                }
 
                 signal_response_complete(&stream_tx).await;
 

@@ -73,6 +73,7 @@ pub use silent_response::{is_silent_response, SilentReason};
 pub mod shell_bleed;
 pub mod stderr_log;
 pub mod str_utils;
+pub mod stranger_response_sanitizer;
 pub mod subprocess_sandbox;
 pub mod tool_budget;
 pub mod tool_classifier;
