@@ -3299,6 +3299,15 @@ pub async fn run_agent_loop(
     let gate_should_eval = manifest
         .owner_notify_gate
         .should_evaluate(sender_user_id.as_deref());
+    tracing::info!(
+        agent = %manifest.name,
+        enabled = manifest.owner_notify_gate.enabled,
+        sender_user_id = ?sender_user_id,
+        owner_user_ids_count = manifest.owner_notify_gate.owner_user_ids.len(),
+        gate_should_eval,
+        aux_client_present = opts.aux_client.is_some(),
+        "owner_notify_gate: dispatch decision"
+    );
     let combined_prefix: Option<String> = if gate_should_eval {
         if let Some(aux) = opts.aux_client.as_deref() {
             tracing::info!(
@@ -3337,7 +3346,7 @@ pub async fn run_agent_loop(
             combined_prefix
         }
     } else {
-        tracing::debug!(
+        tracing::info!(
             agent = %manifest.name,
             enabled = manifest.owner_notify_gate.enabled,
             sender_user_id = ?sender_user_id,
@@ -4833,6 +4842,15 @@ pub async fn run_agent_loop_streaming(
     let gate_should_eval = manifest
         .owner_notify_gate
         .should_evaluate(sender_user_id.as_deref());
+    tracing::info!(
+        agent = %manifest.name,
+        enabled = manifest.owner_notify_gate.enabled,
+        sender_user_id = ?sender_user_id,
+        owner_user_ids_count = manifest.owner_notify_gate.owner_user_ids.len(),
+        gate_should_eval,
+        aux_client_present = opts.aux_client.is_some(),
+        "owner_notify_gate: dispatch decision"
+    );
     let combined_prefix: Option<String> = if gate_should_eval {
         if let Some(aux) = opts.aux_client.as_deref() {
             tracing::info!(
@@ -4871,7 +4889,7 @@ pub async fn run_agent_loop_streaming(
             combined_prefix
         }
     } else {
-        tracing::debug!(
+        tracing::info!(
             agent = %manifest.name,
             enabled = manifest.owner_notify_gate.enabled,
             sender_user_id = ?sender_user_id,
