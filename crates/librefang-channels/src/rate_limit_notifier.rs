@@ -15,6 +15,27 @@ use crate::message_journal::parse_defer_marker;
 use chrono::{DateTime, Utc};
 use chrono_tz::Tz;
 
+/// Default user-facing notification template. Used when the operator has
+/// not customized it via `LIBREFANG_RATE_LIMIT_NOTIFY_TEMPLATE`. Matches
+/// the text shape historically declared under
+/// `[agents.defaults.rate_limit_notify].template` in config.toml.
+///
+/// Supported placeholders:
+/// * `{reset_time}` — clock time when the upstream quota window resets,
+///   rendered in the box's configured timezone (see [`box_tz`]).
+pub const DEFAULT_TEMPLATE: &str =
+    "⏸️ Limite quota raggiunto. Reset alle {reset_time}. Ti rispondo dopo.";
+
+/// Read the active notification template. Looks first at
+/// `LIBREFANG_RATE_LIMIT_NOTIFY_TEMPLATE`; falls back to
+/// [`DEFAULT_TEMPLATE`].
+fn active_template() -> String {
+    std::env::var("LIBREFANG_RATE_LIMIT_NOTIFY_TEMPLATE")
+        .ok()
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| DEFAULT_TEMPLATE.to_string())
+}
+
 /// IANA timezone used to render the reset clock time. LibreFang's box
 /// runs in Europe/Rome (`[system] timezone` in config.toml); we hardcode
 /// it here because the channels crate currently has no path to the live
@@ -44,9 +65,8 @@ pub fn build_rate_limit_notify_text(err_str: &str, now: DateTime<Utc>) -> Option
     // Render in the box-local timezone (Europe/Rome assumed for this
     // deployment). Fall back to UTC if the named TZ can't be parsed.
     let reset_local = render_local_time(reset_at);
-    Some(format!(
-        "⏸️ Limite quota raggiunto. Ti rispondo dopo {reset_local}."
-    ))
+    let template = active_template();
+    Some(template.replace("{reset_time}", &reset_local))
 }
 
 /// Render the given UTC time as HH:MM in the box's configured
@@ -100,11 +120,37 @@ mod tests {
 
     #[test]
     fn env_var_overrides_default_tz() {
+        // Tests share process env; clear template override that sibling
+        // tests may have set when running in parallel.
+        std::env::remove_var("LIBREFANG_RATE_LIMIT_NOTIFY_TEMPLATE");
         std::env::set_var("LIBREFANG_TZ", "America/New_York");
         let err = "Rate limited [rate_limit_defer_ms]=300000";
         let out = build_rate_limit_notify_text(err, fixed_now()).expect("expected Some");
         // 09:05 UTC = 05:05 EDT (May = DST active)
         assert!(out.contains("05:05"), "expected EDT 05:05, got: {out}");
         std::env::set_var("LIBREFANG_TZ", "Europe/Rome");
+    }
+
+    #[test]
+    fn env_var_overrides_template() {
+        std::env::set_var("LIBREFANG_TZ", "Europe/Rome");
+        std::env::set_var(
+            "LIBREFANG_RATE_LIMIT_NOTIFY_TEMPLATE",
+            "Limite raggiunto. Reset alle {reset_time}.",
+        );
+        let err = "Rate limited [rate_limit_defer_ms]=300000";
+        let out = build_rate_limit_notify_text(err, fixed_now()).expect("expected Some");
+        assert_eq!(out, "Limite raggiunto. Reset alle 11:05.");
+        std::env::remove_var("LIBREFANG_RATE_LIMIT_NOTIFY_TEMPLATE");
+    }
+
+    #[test]
+    fn template_without_placeholder_renders_verbatim() {
+        std::env::set_var("LIBREFANG_TZ", "Europe/Rome");
+        std::env::set_var("LIBREFANG_RATE_LIMIT_NOTIFY_TEMPLATE", "Riprovo dopo.");
+        let err = "Rate limited [rate_limit_defer_ms]=300000";
+        let out = build_rate_limit_notify_text(err, fixed_now()).expect("expected Some");
+        assert_eq!(out, "Riprovo dopo.");
+        std::env::remove_var("LIBREFANG_RATE_LIMIT_NOTIFY_TEMPLATE");
     }
 }
