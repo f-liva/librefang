@@ -59,6 +59,17 @@ const LEAK_LINE_PREFIXES: &[&str] = &[
     "il datore è stato notificato",
     "il datore e' stato notificato",
     "ho notificato il datore",
+    // Bypass attempts where the LLM substitutes the owner's first name
+    // (e.g. "Federico") for the role word ("Signore"). Keep this list
+    // narrow to the actual owner's first name for this deployment.
+    "ho notificato federico",
+    "ho avvisato federico",
+    "federico è stato notificato",
+    "federico e' stato notificato",
+    "ho inoltrato a federico",
+    "ho girato a federico",
+    "ho passato a federico",
+    "ho trasmesso a federico",
 ];
 
 /// Used when the entire response collapses to nothing after sanitization.
