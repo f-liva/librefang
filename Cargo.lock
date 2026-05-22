@@ -4101,6 +4101,7 @@ dependencies = [
  "bytes",
  "cbc 0.2.0",
  "chrono",
+ "chrono-tz",
  "criterion",
  "dashmap",
  "futures",

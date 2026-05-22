@@ -5,6 +5,7 @@
 
 use crate::coalescing::{CoalesceKey, CoalesceOnBusy, CoalesceRuntimeConfig, CoalescingDispatcher};
 use crate::formatter;
+use crate::rate_limit_notifier::build_rate_limit_notify_text;
 use crate::rate_limiter::ChannelRateLimiter;
 use crate::router::AgentRouter;
 use crate::sanitizer::{InputSanitizer, SanitizeResult};
@@ -2413,6 +2414,44 @@ async fn send_lifecycle_reaction(
     let _ = adapter.send_reaction(user, message_id, &reaction).await;
 }
 
+/// If `err_str` carries the LLM rate-limit defer marker, send a short
+/// user-facing notice ("⏸️ Limite quota raggiunto. Ti rispondo dopo HH:MM.")
+/// to the sender so they know the message was received and is on hold,
+/// not silently ignored. Otherwise no-op.
+///
+/// Best-effort: any adapter send failure is logged at warn and swallowed
+/// so it cannot break the deferral path.
+async fn maybe_notify_rate_limit(
+    adapter: &dyn ChannelAdapter,
+    user: &ChannelUser,
+    thread_id: Option<&str>,
+    err_str: Option<&str>,
+) {
+    let Some(err) = err_str else { return };
+    let Some(text) = build_rate_limit_notify_text(err, chrono::Utc::now()) else {
+        return;
+    };
+    let content = ChannelContent::Text(text);
+    let result = if let Some(tid) = thread_id {
+        adapter.send_in_thread(user, content, tid).await
+    } else {
+        adapter.send(user, content).await
+    };
+    if let Err(e) = result {
+        warn!(
+            adapter = adapter.name(),
+            user = %user.platform_id,
+            "rate_limit_notifier: failed to deliver pause notice: {e}"
+        );
+    } else {
+        info!(
+            adapter = adapter.name(),
+            user = %user.platform_id,
+            "rate_limit_notifier: pause notice delivered"
+        );
+    }
+}
+
 /// On stale cached agent IDs, re-resolve the channel default by name and retry once.
 async fn try_reresolution(
     error: &str,
@@ -3863,6 +3902,15 @@ async fn dispatch_message(
                                 thread_id,
                             )
                             .await;
+                        if !kernel_ok {
+                            maybe_notify_rate_limit(
+                                adapter,
+                                &message.sender,
+                                thread_id,
+                                kernel_err_str.as_deref(),
+                            )
+                            .await;
+                        }
                         if let Some(j) = journal {
                             j.record_outcome(
                                 &message.platform_message_id,
@@ -3933,6 +3981,15 @@ async fn dispatch_message(
                                     thread_id,
                                 )
                                 .await;
+                            if !kernel_ok {
+                                maybe_notify_rate_limit(
+                                    adapter,
+                                    &message.sender,
+                                    thread_id,
+                                    err_str.as_deref(),
+                                )
+                                .await;
+                            }
                             if let Some(j) = journal {
                                 j.record_outcome(&message.platform_message_id, kernel_ok, err_str)
                                     .await;
@@ -3959,6 +4016,13 @@ async fn dispatch_message(
                                 thread_id,
                             )
                             .await;
+                        maybe_notify_rate_limit(
+                            adapter,
+                            &message.sender,
+                            thread_id,
+                            Some(err_str.as_str()),
+                        )
+                        .await;
                         if let Some(j) = journal {
                             j.record_outcome(&message.platform_message_id, false, Some(err_str))
                                 .await;
@@ -4037,6 +4101,9 @@ async fn dispatch_message(
                 thread_id,
             )
             .await;
+        if !success {
+            maybe_notify_rate_limit(adapter, &message.sender, thread_id, err_str.as_deref()).await;
+        }
         if let Some(j) = journal {
             j.record_outcome(&message.platform_message_id, success, err_str)
                 .await;
