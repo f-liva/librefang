@@ -1174,25 +1174,56 @@ pub fn resolve_attachments(
 /// kernel adds the user's text message, so the LLM receives:
 /// `[..., User(attach_blocks), User(text)]`. session_repair will merge
 /// those two consecutive user-role messages into one for the wire format.
+/// Compute the session ID that the kernel will use for an inbound message,
+/// mirroring the kernel's resolution order so attachment injection lands in
+/// the right session bucket.
+///
+/// Priority (highest first):
+/// 1. Explicit `session_id` from the request body (multi-tab / multi-session UIs).
+/// 2. Channel-derived deterministic ID when a `sender_id`+`channel_type` pair is
+///    present — mirrors `SessionId::for_channel(agent, "channel[:chat_id]")` used
+///    inside the kernel's `send_message_with_session_override` path.
+/// 3. Agent's default canonical session.
+fn resolve_attach_session_id(
+    agent_id: AgentId,
+    req: &MessageRequest,
+    kernel: &LibreFangKernel,
+) -> librefang_types::agent::SessionId {
+    // 1. Explicit override wins
+    if let Some(s) = req.session_id.as_deref() {
+        if let Ok(id) = s.parse::<uuid::Uuid>() {
+            return librefang_types::agent::SessionId(id);
+        }
+    }
+
+    // 2. Channel-derived (mirrors kernel logic)
+    if req.sender_id.is_some() {
+        let channel = req.channel_type.as_deref().unwrap_or("api");
+        if !channel.is_empty() && channel != "api" {
+            return librefang_types::agent::SessionId::for_channel(agent_id, channel);
+        }
+    }
+
+    // 3. Default canonical session
+    kernel
+        .agent_registry()
+        .get(agent_id)
+        .map(|e| e.session_id)
+        .unwrap_or_else(librefang_types::agent::SessionId::new)
+}
+
 pub fn inject_attachments_into_session(
     kernel: &LibreFangKernel,
     agent_id: AgentId,
     attachment_blocks: Vec<librefang_types::message::ContentBlock>,
+    session_id: librefang_types::agent::SessionId,
 ) {
     use librefang_types::message::{Message, MessageContent, Role};
 
-    let entry = match kernel.agent_registry().get(agent_id) {
-        Some(e) => e,
-        None => {
-            tracing::warn!(agent_id = ?agent_id, "Cannot inject attachments: agent not found in registry");
-            return;
-        }
-    };
-
-    let mut session = match kernel.memory_substrate().get_session(entry.session_id) {
+    let mut session = match kernel.memory_substrate().get_session(session_id) {
         Ok(Some(s)) => s,
         _ => librefang_memory::session::Session {
-            id: entry.session_id,
+            id: session_id,
             agent_id,
             messages: Vec::new(),
             context_window_tokens: 0,
@@ -1226,7 +1257,7 @@ pub fn inject_attachments_into_session(
     if let Err(e) = kernel.memory_substrate().save_session(&session) {
         tracing::warn!(
             agent_id = ?agent_id,
-            session_id = ?entry.session_id,
+            session_id = ?session_id,
             block_count,
             error = %e,
             "Failed to save session with attachment blocks"
@@ -1234,7 +1265,7 @@ pub fn inject_attachments_into_session(
     } else {
         tracing::info!(
             agent_id = ?agent_id,
-            session_id = ?entry.session_id,
+            session_id = ?session_id,
             block_count,
             block_kinds = ?block_kinds,
             total_messages_after,
@@ -1465,7 +1496,8 @@ pub async fn send_message(
     if !req.attachments.is_empty() {
         let image_blocks = resolve_attachments(&req.attachments);
         if !image_blocks.is_empty() {
-            inject_attachments_into_session(&state.kernel, agent_id, image_blocks);
+            let sid = resolve_attach_session_id(agent_id, &req, &state.kernel);
+            inject_attachments_into_session(&state.kernel, agent_id, image_blocks, sid);
         }
     }
 
@@ -2246,7 +2278,8 @@ pub async fn send_message_stream(
     if !req.attachments.is_empty() {
         let image_blocks = resolve_attachments(&req.attachments);
         if !image_blocks.is_empty() {
-            inject_attachments_into_session(&state.kernel, agent_id, image_blocks);
+            let sid = resolve_attach_session_id(agent_id, &req, &state.kernel);
+            inject_attachments_into_session(&state.kernel, agent_id, image_blocks, sid);
         }
     }
 
