@@ -1184,7 +1184,7 @@ pub fn resolve_attachments(
 ///    present — mirrors `SessionId::for_channel(agent, "channel[:chat_id]")` used
 ///    inside the kernel's `send_message_with_session_override` path.
 /// 3. Agent's default canonical session.
-fn resolve_attach_session_id(
+pub(crate) fn resolve_attach_session_id(
     agent_id: AgentId,
     req: &MessageRequest,
     kernel: &LibreFangKernel,

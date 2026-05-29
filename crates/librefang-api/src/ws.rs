@@ -870,10 +870,19 @@ async fn handle_text_message(
                     let image_blocks = crate::routes::resolve_attachments(&refs);
                     if !image_blocks.is_empty() {
                         has_images = true;
+                        let sid = explicit_session.unwrap_or_else(|| {
+                            state
+                                .kernel
+                                .agent_registry()
+                                .get(agent_id)
+                                .map(|e| e.session_id)
+                                .unwrap_or_else(librefang_types::agent::SessionId::new)
+                        });
                         crate::routes::inject_attachments_into_session(
                             &state.kernel,
                             agent_id,
                             image_blocks,
+                            sid,
                         );
                     }
                 }
