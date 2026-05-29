@@ -1666,17 +1666,28 @@ pub async fn send_message(
 
 fn request_sender_context(req: &MessageRequest) -> Option<SenderContext> {
     let sender_id = req.sender_id.as_ref()?;
+
+    // Parse channel_type to extract base channel and chat_id (format: "channel:chat_id")
+    // e.g., "whatsapp:191856289808491@s.whatsapp.net" -> channel="whatsapp", chat_id="191856289808491@s.whatsapp.net"
+    let (channel, chat_id) = if let Some(ct) = req.channel_type.as_ref() {
+        if let Some((base, id)) = ct.split_once(':') {
+            (base.to_string(), Some(id.to_string()))
+        } else {
+            (ct.clone(), None)
+        }
+    } else {
+        ("api".to_string(), None)
+    };
+
     Some(SenderContext {
-        channel: req
-            .channel_type
-            .clone()
-            .unwrap_or_else(|| "api".to_string()),
+        channel,
         user_id: sender_id.clone(),
         display_name: req.sender_name.clone().unwrap_or_else(|| sender_id.clone()),
         is_group: req.is_group,
         was_mentioned: req.was_mentioned,
         thread_id: None,
         account_id: None,
+        chat_id,
         // Phase 2 §C — forward the optional group participant roster from the
         // gateway POST body so the addressee guard can fire downstream. Empty
         // when the caller (Telegram, direct API) doesn't populate it; the
